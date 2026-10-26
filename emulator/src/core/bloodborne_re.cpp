@@ -4741,6 +4741,31 @@ constexpr u32 BbscDreamStateMap = 0x15000000;
 bool BbscHostDreamStateReady();
 void ApplyBbscHostDreamState(std::string_view why);
 void RestoreBbscOwnDreamState(std::string_view why);
+bool BbscEventFlag(u32 flag); // SprjEventFlagMan read, see the Hunter's Dream section
+
+// ---- The opening guard (2026-10-26, bbport build) -------------------------------------------------
+// Test 2026-10-26 (two new characters): the host died in Iosefka's clinic (the opening death) and
+// the guest followed it into the HOST's Hunter's Dream - no first-visit cutscene for the guest,
+// the messengers' first weapons, the pistol and the notebook could not be taken there, and back
+// home shared progress OR-ed the host's opening into the guest's world (the clinic door opened
+// from the inside before its time). Both wait now until our OWN world is past the opening:
+//   6603 - set by every Dream story cutscene event (m21_00 12100000 / 12100002 / 12100180, with
+//          6600/6601/6602/6604; tools/gamedata/emevd.py)
+//   9401 - the clinic lamp (m24_01's lamp event 7000 runs with it; common 7200/9400/9404)
+// Either one on = past the opening. Read from the live table: a guest's own Dream groups are back
+// whenever it is outside the host's Dream, and at the home merge its own world is back.
+// SHADPS4_BBSC_OPENING_GUARD=0 turns it off.
+bool BbscOpeningGuardEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SHADPS4_BBSC_OPENING_GUARD");
+        return v == nullptr || std::string_view{v} != "0";
+    }();
+    return enabled;
+}
+
+bool BbscOwnOpeningDone() {
+    return !BbscOpeningGuardEnabled() || BbscEventFlag(6603) || BbscEventFlag(9401);
+}
 
 // Host side: say where we are, so a guest that is somewhere else can come to us.
 void TickBbscFollowBroadcast() {
@@ -5058,6 +5083,19 @@ void TickBbscFollowHost() {
     if (world_wait_map != host.packed_map) {
         world_wait_map = host.packed_map;
         world_wait_since_ms = now;
+    }
+    if (host.packed_map == BbscDreamStateMap && !BbscOwnOpeningDone()) {
+        static s64 opening_told_ms = 0;
+        if (opening_told_ms == 0 || now - opening_told_ms > 60'000) {
+            opening_told_ms = now;
+            LOG_INFO(Debug, "BBSC warp together: the host went to its Hunter's Dream, but our own "
+                            "first Dream has not happened yet (flags 6603/9401 off) - not following");
+            BBSC_TIMELINE("FOLLOW", "warp together: not following the host into its Hunter's Dream "
+                                    "- our own first Dream has not happened yet");
+            BbscAnnounce(u"Your own first Hunter's Dream comes first.\nThe host's Dream is skipped.",
+                         "opening: host's Dream skipped");
+        }
+        return;
     }
     const bool dream_wait = host.packed_map == BbscDreamStateMap && BbscDreamEnabled() &&
                             !BbscHostDreamStateReady() &&
@@ -10829,6 +10867,19 @@ std::pair<s64, size_t> MergeBbscSharedProgress(std::string_view when) {
     if (flags.empty() && groups.empty()) {
         return {-1, 0};
     }
+    if (!BbscOwnOpeningDone()) {
+        // See "The opening guard": the host's opening (clinic doors, its first Dream) must not
+        // land in a world that has not played it.
+        LOG_INFO(Debug, "BBSC shared progress ({}): skipped - our own world is still in the opening "
+                        "(flags 6603/9401 off); {} boss flag(s) and {} group(s) from the host dropped",
+                 when, flags.size(), groups.size());
+        BBSC_TIMELINE("WORLD", "shared progress ({}): skipped - our own world is still in the opening",
+                      when);
+        std::scoped_lock lock{bbsc_progress_mutex};
+        bbsc_progress_host_flags.clear();
+        bbsc_progress_groups.clear();
+        return {-1, 0};
+    }
     if (!bbsc_progress_backed_up) {
         bbsc_progress_backed_up = BackupBbscSaves();
     }
@@ -12940,6 +12991,18 @@ bool SaveBbscRoleLines() {
     // The table is filled by a static initializer; an all-zero column means it has not run yet.
     const bool filled = std::ranges::any_of(bbsc_role_lines.host, [](u32 id) { return id != 0; });
     bbsc_role_lines.saved = filled;
+    if (filled) {
+        // 2026-10-26: the host saw "?ActionEventInfo?" when a guest left after a follow into the
+        // Dream - a line id 0 in some column. Every role's u32 columns +0x28..+0x7C, once, to
+        // find which column a leave reads.
+        for (size_t role = 0; role < RoleCount; ++role) {
+            std::string row;
+            for (size_t col = 0x28; col < RoleStride; col += 4) {
+                row += fmt::format(" {:x}", ReadValue<u32>(BbscRoleLine(role, col), 0));
+            }
+            LOG_INFO(Debug, "BBSC co-op lines: role {:#x} columns +0x28..+0x7c:{}", role, row);
+        }
+    }
     return filled;
 }
 
