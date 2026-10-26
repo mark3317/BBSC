@@ -768,4 +768,21 @@ void InstallHttpWrappers() {
              ok ? "wrapped" : "NOT wrapped - an import slot was never filled");
 }
 
+// For an emulator that repeats the guest's sign post itself (the bbport launcher's emulator,
+// "fast sign" in its http.cpp - BBSC's own emulator does the same in its own http code): the
+// sign's body with the host's map written in once connect-first knows it. Returns the new length
+// (0: nothing to change, or OUT is too small); the emulator finds this export in bbsc.dll.
+extern "C" __declspec(dllexport) u64 BbscRewriteSummonBody(const char* in, u64 in_len, char* out,
+                                                            u64 out_cap) {
+    if (in == nullptr || out == nullptr) {
+        return 0;
+    }
+    std::string body(in, static_cast<size_t>(in_len));
+    if (!RewriteAreaId(body) || body.size() > out_cap) {
+        return 0;
+    }
+    std::memcpy(out, body.data(), body.size());
+    return body.size();
+}
+
 } // namespace BbscMod
