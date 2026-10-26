@@ -4730,6 +4730,11 @@ bool BbscWarpTogetherEnabled() {
 
 // BBSC's own on-screen notices (the game's co-op banner), see BbscAnnounce.
 void BbscAnnounce(const char16_t* text, std::string_view what);
+// BBSC's texts in the game's language (English or Russian), see "Custom co-op messages".
+bool BbscRussian();
+inline const char16_t* BbscL(const char16_t* english, const char16_t* russian) {
+    return BbscRussian() ? russian : english;
+}
 // The co-op lines while warping together, see TickBbscRejoinLines.
 void ArmBbscRejoinLines(bool guest, u32 target_map, s64 for_ms);
 constexpr s64 BbscHostRejoinLinesMs = 90'000;  // host: until the guest has caught up
@@ -5092,7 +5097,8 @@ void TickBbscFollowHost() {
                             "first Dream has not happened yet (flags 6603/9401 off) - not following");
             BBSC_TIMELINE("FOLLOW", "warp together: not following the host into its Hunter's Dream "
                                     "- our own first Dream has not happened yet");
-            BbscAnnounce(u"Your own first Hunter's Dream comes first.\nThe host's Dream is skipped.",
+            BbscAnnounce(BbscL(u"Your own first Hunter's Dream comes first.\nThe host's Dream is skipped.",
+                               u"Сначала ваш собственный первый Сон Охотника.\nСон хоста пропущен."),
                          "opening: host's Dream skipped");
         }
         return;
@@ -6385,8 +6391,10 @@ bool RecoverBbscOwnWorldFile(const BbscSaveSlot& slot) {
                        "(crash or quit as a guest) - putting our own back",
                 slot.user, slot.slot);
     if (RestoreBbscOwnWorld("after a crash") != 0) {
-        BbscAnnounce(u"Your own world was put back\n(the game had closed while you were a guest).\n"
-                     u"Rest at a lamp or reload to see it.",
+        BbscAnnounce(BbscL(u"Your own world was put back\n(the game had closed while you were a guest).\n"
+                           u"Rest at a lamp or reload to see it.",
+                           u"Ваш мир восстановлен\n(игра закрылась, пока вы были гостем).\n"
+                           u"Отдохните у лампы или перезагрузитесь, чтобы увидеть его."),
                      "own world restored after a crash");
     }
     return true;
@@ -7626,16 +7634,16 @@ bool BbscRespawnInPlace(std::string_view why) {
     bbsc_inplace_respawn_ms = SteadyNowMs();
     BbscRestockFromStorage(why);
     if (where == "host's last lamp") {
-        BbscAnnounceAfterCurtain(u"You respawned at the host's lamp.",
+        BbscAnnounceAfterCurtain(BbscL(u"You respawned at the host's lamp.", u"Вы возродились у лампы хоста."),
                                  "respawn at the host's lamp");
     } else if (where == "partner") {
-        BbscAnnounceAfterCurtain(u"You respawned next to the host.",
+        BbscAnnounceAfterCurtain(BbscL(u"You respawned next to the host.", u"Вы возродились рядом с хостом."),
                                  "respawn beside the host");
     } else if (where == "last lamp") {
-        BbscAnnounceAfterCurtain(u"You respawned at the lamp.",
+        BbscAnnounceAfterCurtain(BbscL(u"You respawned at the lamp.", u"Вы возродились у лампы."),
                                  "respawn at the lamp");
     } else {
-        BbscAnnounceAfterCurtain(u"You respawned.", "respawn");
+        BbscAnnounceAfterCurtain(BbscL(u"You respawned.", u"Вы возродились."), "respawn");
     }
     return true;
 }
@@ -7786,7 +7794,8 @@ void TickBbscHostDeathNotice() {
         last_notice_ms = now;
         LOG_INFO(Debug, "BBSC host death notice: host copy {:#x} - hp {}, dead flag {}", chr, hp,
                  dead_flag);
-        BbscAnnounce(u"The host died.\nThey will respawn at the lamp.",
+        BbscAnnounce(BbscL(u"The host died.\nThey will respawn at the lamp.",
+                           u"Хост погиб.\nОн возродится у лампы."),
                      "host died");
     }
 }
@@ -10504,7 +10513,7 @@ void TickBbscBossRewards() {
         const auto goods = std::ranges::find_if(BbscBossGoodsLots,
                                                 [lot](const auto& g) { return g.lot == lot; });
         if (goods != BbscBossGoodsLots.end() && GiveBbscBossGoods(*goods)) {
-            BbscAnnounce(u"Boss reward added to your items.", "boss reward");
+            BbscAnnounce(BbscL(u"Boss reward added to your items.", u"Награда за босса добавлена в ваши предметы."), "boss reward");
             LOG_INFO(Debug, "BBSC boss drop: event {} - item lot {} given to the guest directly ({})",
                      event, lot, taken ? "repeat lot, flag already set" : "first kill");
             BBSC_TIMELINE("BOSS", "boss drop: event {} - item lot {} given to the guest directly ({})",
@@ -10779,7 +10788,7 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
     static s64 notice_ms = 0;
     if (slot >= 0 && SteadyNowMs() - notice_ms > 15'000) {
         notice_ms = SteadyNowMs();
-        BbscAnnounce(u"An item was added to your items.", "enemy drop");
+        BbscAnnounce(BbscL(u"An item was added to your items.", u"Предмет добавлен в ваши предметы."), "enemy drop");
     }
 }
 
@@ -11225,14 +11234,16 @@ void TickBbscSharedProgress() {
     if (at_load && bosses == 0 && bits == 0) {
         LOG_INFO(Debug, "BBSC shared progress: the merge made during the home load is all there");
         BBSC_TIMELINE("WORLD", "shared progress: the merge made during the home load is all there");
-        BbscAnnounce(u"Shared progress saved:\nthe host's progress is now in your world.",
+        BbscAnnounce(BbscL(u"Shared progress saved:\nthe host's progress is now in your world.",
+                           u"Общий прогресс сохранён:\nпрогресс хоста теперь в вашем мире."),
                      "shared progress merged at the home load");
         return;
     }
     // Test 2026-10-07: merged into a map that was already running, Cleric Beast's bar came up
     // and doors stayed shut until the game was reloaded - the map's events had read the old flags.
     // They are saved all the same; the next load (a lamp, a death, the title) shows them.
-    BbscAnnounce(u"Shared progress saved.\nRest at a lamp to see all of it.",
+    BbscAnnounce(BbscL(u"Shared progress saved.\nRest at a lamp to see all of it.",
+                       u"Общий прогресс сохранён.\nОтдохните у лампы, чтобы увидеть всё."),
                  "shared progress merged after the load");
 }
 
@@ -12775,6 +12786,12 @@ struct BbscMessage {
 constexpr BbscMessage BbscMessages[] = {
 #include "bbsc_messages.inc"
 };
+// 2026-10-26 (bbport build): the same texts in Russian (tools/gamedata/gen_messages_ru.py), used
+// when the game runs in Russian - the game's own lines around them are Russian then too.
+constexpr BbscMessage BbscMessagesRu[] = {
+#include "bbsc_messages_ru.inc"
+};
+static_assert(std::size(BbscMessagesRu) == std::size(BbscMessages));
 
 bool BbscMessagesEnabled() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_MESSAGES");
@@ -12821,6 +12838,67 @@ u64 FindBbscMessageSlot(u32 category, u32 id, u64* fmg_out) {
     return 0;
 }
 
+// The game's language as BBSC sees it: BBSC_LANGUAGE=ru / en if set, else Russian when the game's
+// loaded event texts (category 30) are Cyrillic. Looked at again when the message repository
+// changes (the game reloads it on a language change).
+bool BbscRussian() {
+    static int forced = [] {
+        const char* v = std::getenv("BBSC_LANGUAGE");
+        const std::string_view lang = v != nullptr ? v : "";
+        return lang == "ru" ? 1 : lang == "en" ? 0 : -1;
+    }();
+    if (forced >= 0) {
+        return forced == 1;
+    }
+    static u64 seen_fmg = 0;
+    static bool russian = false;
+    if (image_base == 0) {
+        return false;
+    }
+    const u64 repo = ReadValue<u64>(image_base + MsgRepositoryPointerOffset, 0);
+    const u64 versions = ReadablePointer(repo, 0x10) ? ReadValue<u64>(repo, 0x08) : 0;
+    const u64 categories = ReadablePointer(versions, 0x08) ? ReadValue<u64>(versions, 0x00) : 0;
+    const u64 fmg = categories != 0 && ReadablePointer(categories, 31 * sizeof(u64))
+                        ? ReadValue<u64>(categories, 30 * sizeof(u64))
+                        : 0;
+    if (fmg == 0 || fmg == seen_fmg || !ReadablePointer(fmg, 0x30)) {
+        return russian;
+    }
+    u64 table = ReadValue<u64>(fmg, 0x18);
+    if (table < 0x1000'0000) {
+        table += fmg;
+    }
+    const s32 strings = ReadValue<s32>(fmg, 0x10); // +0x10 string count
+    size_t cyrillic = 0;
+    size_t latin = 0;
+    for (s32 i = 0; i < std::min(strings, 400) && ReadablePointer(table + i * 8, 8); ++i) {
+        const u64 offset = ReadValue<u64>(table, i * 8);
+        if (offset == 0) {
+            continue;
+        }
+        const u64 text = offset < 0x1000'0000 ? fmg + offset : offset;
+        for (size_t c = 0; c < 40 && ReadablePointer(text + c * 2, 2); ++c) {
+            const u16 ch = ReadValue<u16>(text, c * 2);
+            if (ch == 0) {
+                break;
+            }
+            cyrillic += ch >= 0x0400 && ch <= 0x04FF;
+            latin += (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+        }
+    }
+    if (cyrillic + latin < 50) {
+        return russian; // not filled in yet: look again next time
+    }
+    seen_fmg = fmg;
+    const bool now = cyrillic > latin;
+    if (now != russian) {
+        LOG_INFO(Debug, "BBSC texts: {} (the game's texts: {} Cyrillic / {} Latin letters)",
+                 now ? "Russian" : "English", cyrillic, latin);
+    }
+    russian = now;
+    return russian;
+}
+
 void TickBbscMessages() {
     static s64 last_ms = 0;
     static size_t logged = 0;
@@ -12831,7 +12909,10 @@ void TickBbscMessages() {
     last_ms = now;
     size_t changed = 0;
     size_t in_place = 0;
-    for (const auto& message : BbscMessages) {
+    const std::span<const BbscMessage> table =
+        BbscRussian() ? std::span<const BbscMessage>{BbscMessagesRu}
+                      : std::span<const BbscMessage>{BbscMessages};
+    for (const auto& message : table) {
         if (message.category == 30 && (message.id == 105199 || message.id == 105299)) {
             continue; // the boss battle line, see TickBbscBossLine
         }
@@ -12908,15 +12989,33 @@ void TickBbscBossLine() {
     } else if (own != -1) {
         boss = own;
     }
-    if (boss != written_for) {
+    const bool russian = BbscRussian();
+    static bool written_russian = false;
+    if (boss != written_for || russian != written_russian) {
         written_for = boss;
+        written_russian = russian;
         const char* name = boss != -1 ? BbscBossNameById(boss) : nullptr;
         const std::string text = name != nullptr
                                      ? fmt::format("The host started the battle against\n{}.", name)
                                      : std::string{"The host started a boss battle."};
         bbsc_boss_line_text = {};
-        for (size_t i = 0; i < text.size() && i + 1 < bbsc_boss_line_text.size(); ++i) {
-            bbsc_boss_line_text[i] = static_cast<unsigned char>(text[i]);
+        if (russian) {
+            // The game fills in the boss's own (Russian) name: the bar's name id is an NpcName id.
+            std::u16string ru = name != nullptr ? u"Хост начал битву с боссом:\n<?npcNameId@"
+                                                : u"Хост начал битву с боссом.";
+            if (name != nullptr) {
+                for (const char c : std::to_string(boss)) {
+                    ru += static_cast<char16_t>(c);
+                }
+                ru += u"?>.";
+            }
+            for (size_t i = 0; i < ru.size() && i + 1 < bbsc_boss_line_text.size(); ++i) {
+                bbsc_boss_line_text[i] = ru[i];
+            }
+        } else {
+            for (size_t i = 0; i < text.size() && i + 1 < bbsc_boss_line_text.size(); ++i) {
+                bbsc_boss_line_text[i] = static_cast<unsigned char>(text[i]);
+            }
         }
         if (name != nullptr) {
             LOG_INFO(Debug, "BBSC boss line: \"{}\" (boss {})", name, boss);
@@ -14084,13 +14183,14 @@ struct BbscKitItem {
     u16 icon;
     s32 sort_id;
     const char16_t* name;
+    const char16_t* name_ru;
 };
 constexpr BbscKitItem BbscKit[] = {
-    {4016, 200, 71, 240010, u"Hunt Bell"},       // Beckoning Bell (SpEffect 9000: search)
-    {4121, 205, 37, 240011, u"Kin Bell"},        // Small Resonant Bell (9005: cooperator sign)
-    {11201, 225, 70, 240012, u"Bloodlust Bell"}, // Sinister Resonant Bell (9025: invader sign)
-    {4313, 0, 7, 240013, u"Duel Bell"},          // own row, see PrepareBbscDuelBell
-    {11251, 111, 9, 240014, u"Parting Blank"},   // Silencing Blank (SpEffect 7: leave)
+    {4016, 200, 71, 240010, u"Hunt Bell", u"Колокол охоты"},       // Beckoning Bell (SpEffect 9000: search)
+    {4121, 205, 37, 240011, u"Kin Bell", u"Колокол родства"},      // Small Resonant Bell (9005: cooperator sign)
+    {11201, 225, 70, 240012, u"Bloodlust Bell", u"Колокол кровожадности"}, // Sinister Resonant Bell (9025: invader sign)
+    {4313, 0, 7, 240013, u"Duel Bell", u"Колокол дуэли"},          // own row, see PrepareBbscDuelBell
+    {11251, 111, 9, 240014, u"Parting Blank", u"Прощальный бланк"}, // Silencing Blank (SpEffect 7: leave)
 };
 constexpr u32 BbscHiddenVanilla[] = {200, 205, 225, 111};
 constexpr size_t GoodsRowSize = 108;
@@ -14656,7 +14756,7 @@ void TickBbscDuelBellGive() {
     using Fits = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* code, s32 count);
     using Add = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* key, s32 count);
     static std::u16string notice;
-    notice = u"BBSC items added:";
+    notice = BbscL(u"BBSC items added:", u"Добавлены предметы BBSC:");
     size_t given = 0;
     for (const BbscKitItem* item : missing) {
         alignas(16) static u32 code = 0;
@@ -14682,7 +14782,7 @@ void TickBbscDuelBellGive() {
         if (now_there) {
             ++given;
             notice += given == 1 ? u"\n" : u", ";
-            notice += item->name;
+            notice += BbscL(item->name, item->name_ru);
         }
     }
     if (given != 0) {
@@ -15026,8 +15126,9 @@ void SetBbscPvp(bool on, std::string_view why) {
         return;
     }
     LOG_INFO(Debug, "BBSC PvP: {} ({})", on ? "ON - hunters can harm each other" : "off", why);
-    BbscAnnounce(on ? u"PvP is ON.\nPlayers can hurt each other."
-                    : u"PvP is OFF.",
+    BbscAnnounce(on ? BbscL(u"PvP is ON.\nPlayers can hurt each other.",
+                            u"PvP включено.\nИгроки могут ранить друг друга.")
+                    : BbscL(u"PvP is OFF.", u"PvP выключено."),
                  on ? "pvp on" : "pvp off");
 }
 
@@ -15099,7 +15200,7 @@ void TickBbscPvp() {
                      want ? "on" : "off");
         } else {
             LOG_INFO(Debug, "BBSC PvP: Duel Bell rung outside co-op (session state {})", state);
-            BbscAnnounce(u"PvP needs another player in your game.", "pvp alone");
+            BbscAnnounce(BbscL(u"PvP needs another player in your game.", u"Для PvP нужен ещё один игрок в вашей игре."), "pvp alone");
         }
     }
     bell_was = bell;
