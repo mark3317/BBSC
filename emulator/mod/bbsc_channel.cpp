@@ -223,6 +223,9 @@ bool OpenSocket() {
     OrbisSockaddrIn bind_to{};
     bind_to.sin_len = sizeof(bind_to);
     bind_to.sin_family = OrbisAfInet;
+    // The PS4's own UDP port for P2P (3658). Newer emulators (the bbport launcher's) refuse a
+    // datagram bind without it (EADDRNOTAVAIL); older ones ignore it.
+    bind_to.sin_port = static_cast<u16>((3658 >> 8) | (3658 << 8));
     bind_to.sin_vport = static_cast<u16>((ChannelVport >> 8) | (ChannelVport << 8));
     if (const s32 r = bind(s, &bind_to, sizeof(bind_to)); r < 0) {
         LOG_WARNING(Mod, "P2P channel: bind to vport {} failed ({:#x}) - retrying", ChannelVport,
