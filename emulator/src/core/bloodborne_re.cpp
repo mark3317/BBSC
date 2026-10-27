@@ -10889,6 +10889,7 @@ std::mutex bbsc_progress_mutex;
 std::vector<u32> bbsc_progress_host_flags;                         // guest: host's boss flags seen
 std::map<u32, std::array<u8, BbscWorldGroupBytes>> bbsc_progress_groups; // guest: kind 1, OR-ed
 bool bbsc_progress_was_guest = false;
+void ApplyBbscTalkJournal(std::string_view when, bool finish); // "A guest's own quests"
 s64 bbsc_progress_left_ms = 0;  // when we stopped being a guest
 s64 bbsc_progress_home_ms = 0;  // home and settled since
 bool bbsc_progress_merged_at_load = false; // merged during the trip home (checked once settled)
@@ -11251,6 +11252,7 @@ void TickBbscSharedProgress() {
     bbsc_progress_merged_at_load = false;
     RestoreBbscOwnWorld("before the shared progress merge");
     const auto [bosses, bits] = MergeBbscSharedProgress("after the home load");
+    ApplyBbscTalkJournal("after the home load", true);
     {
         std::scoped_lock lock{bbsc_progress_mutex};
         bbsc_progress_host_flags.clear();
@@ -11297,6 +11299,7 @@ void ApplyBbscSharedProgressAtLoad() {
     }
     RestoreBbscOwnWorldAtLoad(); // our own world first, then the host's progress on top
     const auto [bosses, bits] = MergeBbscSharedProgress("during the home load");
+    ApplyBbscTalkJournal("during the home load", false);
     bbsc_progress_merged_at_load = bosses >= 0;
 }
 
@@ -12086,12 +12089,92 @@ void InstallBbscCinematicHook() {
                     "fast/slow, wheel speed, Z/X zoom, , . roll, [ ] glide", Look);
 }
 
+// ---- A guest's own quests (2026-10-27) ----------------------------------------------------------
+// Each player keeps their own quests: a guest's talk scripts read and write the guest's own story
+// flags. But in the host's world the host's per-map NPC groups (kind 6/7, "World state when warping
+// together") overwrite the guest's every second, and the trip home puts the guest's own map groups
+// back - so of a talk in the host's world only the global part (story flags below 100000) reached
+// the guest's own world: half a quest step (Arianna "gone" by her global flag, nothing told by her
+// map flags). Now every flag a talk script sets while the guest is in the host's world goes into a
+// journal, and the trip home writes the journal into the guest's own world after its own flags are
+// back (with the shared progress), so the whole step lands at home. A talk script sets its flags
+// while the talk update steps it (0x0204C6D9 calls the state machine 0x02044C80 for each talk
+// record); the flags go through SprjEventFlagMan::SetFlag 0x013CFCC0.
+bool bbsc_in_talk_step = false; // game thread only
+u32 bbsc_talk_step_id = 0;
+std::mutex bbsc_talk_journal_mutex;
+std::map<u32, u8> bbsc_talk_journal; // flag -> last value, from talks in the host's world
+
+void PS4_SYSV_ABI BbscTalkStepBeginHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    bbsc_in_talk_step = true;
+    bbsc_talk_step_id = 0;
+    // RBX = the talk record + 0x28; +0x10 is its condition evaluator, the talk id at +0x10.
+    if (registers != nullptr && ReadablePointer(registers->rbx - 0x28, 0x28)) {
+        const u64 condition = ReadValue<u64>(registers->rbx - 0x28, 0x10);
+        if (ReadablePointer(condition, 0x14)) {
+            bbsc_talk_step_id = ReadValue<u32>(condition, 0x10);
+        }
+    }
+}
+
+void PS4_SYSV_ABI BbscTalkStepEndHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+    bbsc_in_talk_step = false;
+}
+
+void NoteBbscTalkFlag(u32 flag, u8 value) {
+    if (!bbsc_in_talk_step || !BbscGuestInHostWorld()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
+        const auto it = bbsc_talk_journal.find(flag);
+        if (it != bbsc_talk_journal.end() && it->second == value) {
+            return;
+        }
+        if (bbsc_talk_journal.size() >= 4096) {
+            return;
+        }
+        bbsc_talk_journal[flag] = value;
+    }
+    LOG_INFO(Debug, "BBSC own quests: talk t{} set flag {} = {} in the host's world - kept for our "
+                    "own world", bbsc_talk_step_id, flag, value);
+    BBSC_TIMELINE("QUEST", "talk t{} set flag {} = {} (kept for our own world)", bbsc_talk_step_id,
+                  flag, value);
+}
+
+// Writes the journal into our own world (after it is back); the journal is kept until `finish`.
+void ApplyBbscTalkJournal(std::string_view when, bool finish) {
+    std::map<u32, u8> journal;
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
+        journal = bbsc_talk_journal;
+        if (finish) {
+            bbsc_talk_journal.clear();
+        }
+    }
+    if (journal.empty() || image_base == 0 ||
+        ReadValue<u64>(image_base + 0x0553B0D8, 0) == 0 ||
+        ReadValue<u64>(image_base + EventFlagManPointerOffset, 0) == 0) {
+        return;
+    }
+    using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+    const auto set = reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0);
+    for (const auto& [flag, value] : journal) {
+        set(0, flag, value);
+    }
+    LOG_INFO(Debug, "BBSC own quests ({}): {} flag(s) our talks set in the host's world written into "
+                    "our own world", when, journal.size());
+    BBSC_TIMELINE("QUEST", "{}: {} flag(s) of our talks in the host's world are now in our own world",
+                  when, journal.size());
+}
+
 // Research 2026-10-27 (quest flags of a guest's talks): every event flag set, in a session, once
 // per flag / value / caller.
 void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr) {
         return;
     }
+    NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
     const s32 state = GetSessionState();
     if (state != 3 && state != 6) {
         return;
@@ -12125,6 +12208,16 @@ void InstallBbscResearchHooks() {
         !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x013CFCC0),
                               std::span<const u8>{Prologue}, 0, BbscResearchSetFlagHook)) {
         LOG_ERROR(Debug, "BBSC research: SetEventFlag hook failed");
+    }
+    static constexpr std::array<u8, 7> StepBegin{0x48, 0x8B, 0xB5, 0x20, 0xFF, 0xFF, 0xFF};
+    static constexpr std::array<u8, 7> StepEnd{0x44, 0x3B, 0xA5, 0x44, 0xFF, 0xFF, 0xFF};
+    if (image_base == 0 ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x0204C6D2),
+                              std::span<const u8>{StepBegin}, 0, BbscTalkStepBeginHook) ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x0204C6E3),
+                              std::span<const u8>{StepEnd}, 0, BbscTalkStepEndHook)) {
+        LOG_ERROR(Debug, "BBSC own quests: talk step hooks failed - talks in the host's world stay "
+                         "half-kept");
     }
 }
 
