@@ -11232,13 +11232,25 @@ bool SkipBbscOthersTalkGift(s32 lot) {
     return true;
 }
 
+bool BbscEventActionNotOurs(u64 caller_offset); // see "Talk-driven events are each player's own"
+s64 BbscCurrentEventRunId();
+
 void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || !bbsc_popup_hook_ready) {
         return;
     }
-    if (SkipBbscOthersTalkGift(static_cast<s32>(registers->rsi))) {
-        bbsc_award_skip = 1;
-        return;
+    {
+        const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+        const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
+        if (BbscEventActionNotOurs(caller_offset)) {
+            bbsc_award_skip = 1;
+            LOG_INFO(Debug, "BBSC talk gifts: item lot {} from event {} follows the other player's "
+                            "talk - not ours",
+                     static_cast<s32>(registers->rsi), BbscCurrentEventRunId());
+            BBSC_TIMELINE("ITEMS", "talk gift lot {} skipped: the other player's talk",
+                          static_cast<s32>(registers->rsi));
+            return;
+        }
     }
     if (!BbscGuestInHostWorld()) {
         return;
@@ -12774,12 +12786,142 @@ void ApplyBbscTalkJournal(std::string_view when, bool finish) {
 
 // Research 2026-10-27 (quest flags of a guest's talks): every event flag set, in a session, once
 // per flag / value / caller.
+// ---- Talk-driven events are each player's own (2026-10-27) -------------------------------------
+// Test: the host talked to Eileen, and on the guest event 12410801 (waits on 1360 + 72410540, the
+// host's "first greeting done") moved the guest's Eileen on - without 72410540 ever being on in the
+// guest's table (the NPC flag guard saw no change): the other player's event actions run here too
+// (the game's event sync). Same at Iosefka's: the guest's talk ran 9100 on the host (reset of
+// 72410310 + the vial). So an event that reacts to a talk's flag (BbscTalkEventTriggers: every
+// event with a flag condition on a flag a talk script sets, literal or through its init, and no
+// death condition - kills stay shared; tools: esd + emevd scan) acts here only when one of those
+// flags is on as OUR value (bbsc_npc_own: set by our own game). Else its flag sets on NPC quest
+// flag sets and its item awards are skipped. Decided at the event's first 2003 instruction (the bank
+// 2003 handler 0x017C0420, RSI = the running event) and kept for that run (2 s).
+struct BbscTalkEventTrigger {
+    s64 event;
+    u32 flag;
+};
+constexpr std::array<BbscTalkEventTrigger, 236> BbscTalkEventTriggers{{
+    {7200, 72200100}, {9040, 9042}, {9040, 9045}, {9040, 9047}, {9040, 9048}, {9040, 9049},
+    {9040, 9050}, {9040, 9051}, {9040, 9052}, {9040, 9054}, {9040, 9055}, {9040, 9056},
+    {9040, 9057}, {9040, 9058}, {9040, 9059}, {9040, 9060}, {9040, 9061}, {9040, 9062},
+    {9040, 9063}, {9040, 9064}, {9040, 9066}, {9040, 9067}, {9040, 9069}, {9040, 9071},
+    {9040, 9072}, {9040, 9073}, {9040, 9074}, {9040, 9075}, {9040, 9077}, {9100, 72400398},
+    {9100, 72400489}, {9100, 72410310}, {9100, 72410359}, {9700, 72100121}, {9701, 72100123}, {9702, 72100125},
+    {9703, 72100128}, {9710, 72100110}, {9720, 72400520}, {9780, 73200326}, {12100110, 72100116}, {12100110, 72100117},
+    {12100112, 72100100}, {12100113, 72100100}, {12100116, 72100108}, {12100123, 72100112}, {12100123, 72100114}, {12100161, 72100117},
+    {12100165, 72100136}, {12100180, 72100130}, {12101022, 12101023}, {12101024, 12101025}, {12101026, 12101027}, {12101028, 12101029},
+    {12101802, 72100131}, {12105043, 12105044}, {12105060, 72100140}, {12105070, 72100141}, {12105070, 72100142}, {12105070, 72100143},
+    {12105070, 72100144}, {12105070, 72100145}, {12105070, 72100146}, {12105070, 72100147}, {12105070, 72100148}, {12105070, 72100149},
+    {12105070, 72100150}, {12105070, 72100151}, {12105070, 72100152}, {12105070, 72100153}, {12105070, 72100154}, {12105070, 72100155},
+    {12105210, 70000100}, {12107100, 72100420}, {12107100, 72100421}, {12107100, 72100422}, {12107100, 72100423}, {12107100, 72100424},
+    {12107100, 72100425}, {12107100, 72100426}, {12107200, 72100300}, {12107200, 72100301}, {12107200, 72100302}, {12107200, 72100303},
+    {12107200, 72100304}, {12107200, 72100305}, {12107200, 72100306}, {12107200, 72100307}, {12107200, 72100308}, {12107200, 72100309},
+    {12300703, 72300307}, {12300705, 72300305}, {12304400, 72400461}, {12304500, 72400461}, {12400401, 72400440}, {12400403, 72400441},
+    {12400500, 72400350}, {12400500, 72400900}, {12400523, 72400510}, {12400524, 72400511}, {12400525, 72400499}, {12400566, 72400970},
+    {12400567, 72400971}, {12400591, 72400465}, {12400624, 72400934}, {12400624, 72400935}, {12400624, 72400936}, {12400624, 72400937},
+    {12400624, 72400938}, {12400650, 72400520}, {12400650, 72400524}, {12400658, 72400526}, {12400701, 72400300}, {12400708, 72400316},
+    {12400708, 72400317}, {12400708, 72400318}, {12400708, 72400319}, {12400732, 72400981}, {12400840, 70000052}, {12400840, 70000053},
+    {12400840, 70000054}, {12400840, 70000072}, {12400840, 70000073}, {12400840, 72400513}, {12400900, 72400380}, {12400901, 72400380},
+    {12400901, 72400394}, {12410652, 72410320}, {12410657, 72410326}, {12410662, 72410331}, {12410662, 72410332}, {12410662, 72410338},
+    {12410662, 72410339}, {12410662, 72410340}, {12410662, 72410341}, {12410662, 72410342}, {12410662, 72410343}, {12410668, 72410336},
+    {12410676, 72410329}, {12410701, 72410407}, {12410701, 72410415}, {12410703, 72410413}, {12410704, 72410403}, {12410705, 72410404},
+    {12410706, 72410405}, {12410715, 72410412}, {12410721, 72410421}, {12410731, 72410305}, {12410732, 72410309}, {12410736, 72410301},
+    {12410738, 72410311}, {12410742, 72410390}, {12410743, 72410391}, {12410750, 72410382}, {12410750, 72410392}, {12410762, 72410504},
+    {12410763, 72410514}, {12410785, 72410530}, {12410801, 72410540}, {12410808, 72410545}, {12410830, 72400486}, {12410850, 70000050},
+    {12410850, 70000051}, {12410850, 70000070}, {12410850, 70000071}, {12414401, 72400461}, {12414500, 72400461}, {12420500, 72500326},
+    {12500012, 72500329}, {12500013, 72500339}, {12500014, 72500337}, {12500019, 72500333}, {12500051, 72500357}, {12600701, 72600300},
+    {12604960, 72600300}, {12604960, 72600302}, {12604970, 72600300}, {12604970, 72600302}, {12604980, 72600306}, {12700704, 72700451},
+    {12700705, 72700450}, {12700901, 72700304}, {12700901, 72700306}, {12700906, 72700321}, {12700906, 72700322}, {12700908, 72700330},
+    {12800902, 72800312}, {12800903, 72800314}, {12800904, 72800315}, {12800905, 72800316}, {12906746, 72900001}, {13200103, 73200327},
+    {13200105, 73200321}, {13200107, 73200324}, {13200121, 73200300}, {13400940, 73400403}, {13400940, 73400512}, {13400940, 73400513},
+    {13400944, 73400510}, {13400944, 73400512}, {13400950, 73400403}, {13400950, 73400513}, {13400951, 73400422}, {13400951, 73400423},
+    {13400953, 73400430}, {13400953, 73400431}, {13400980, 73400424}, {13500943, 73500411}, {13500945, 73500602}, {13500949, 73500505},
+    {13500950, 73400403}, {13500950, 73500602}, {13500951, 73500621}, {13500952, 73400403}, {13500953, 73500630}, {13500960, 73500301},
+    {13500960, 73500309}, {13500965, 73500318}, {13500968, 73500326}, {13500980, 73500910}, {13500980, 73500911}, {13500980, 73500945},
+    {13500980, 73500946}, {13500994, 6000}, {13501920, 73500321}, {13501920, 73500322}, {13501940, 73500320}, {13600942, 73600310},
+    {13600942, 73600314}, {13600943, 73600300}, {13600950, 73400403}, {13600950, 73500602}, {13600950, 73600501}, {13600951, 73600520},
+    {13600952, 73600530}, {13600956, 73600521}
+}};
+constexpr u64 BbscEventBank2003Begin = 0x017C0420;
+constexpr u64 BbscEventBank2003End = 0x017C1C80;
+struct BbscEventRun {
+    u64 instance = 0;
+    s64 event = -1;
+    s64 since_ms = 0;
+    bool ours = true;
+};
+BbscEventRun bbsc_event_run; // game thread
+u8 bbsc_setflag_skip = 0;
+
+bool BbscTalkEventIsOurs(s64 event) {
+    const auto first = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
+                                                &BbscTalkEventTrigger::event);
+    if (first == BbscTalkEventTriggers.end() || first->event != event) {
+        return true; // not a talk-driven event
+    }
+    std::scoped_lock lock{bbsc_npc_own_mutex};
+    bool known = false;
+    for (auto it = first; it != BbscTalkEventTriggers.end() && it->event == event; ++it) {
+        const auto own = bbsc_npc_own.find(it->flag);
+        if (own == bbsc_npc_own.end()) {
+            continue;
+        }
+        known = true;
+        if (own->second != 0) {
+            return true;
+        }
+    }
+    return !known; // none of its triggers is ours (or none is kept: the game's own way)
+}
+
+void PS4_SYSV_ABI BbscEventBank2003Hook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || !bbsc_npc_own_active) {
+        bbsc_event_run = {};
+        return;
+    }
+    const u64 instance = registers->rsi;
+    const s64 now = SteadyNowMs();
+    if (bbsc_event_run.instance == instance && now - bbsc_event_run.since_ms < 2'000) {
+        return;
+    }
+    bbsc_event_run.instance = instance;
+    bbsc_event_run.since_ms = now;
+    bbsc_event_run.event = ReadablePointer(instance, 0xC0) ? BbscEventIdOf(instance) : -1;
+    bbsc_event_run.ours = bbsc_event_run.event <= 0 || BbscTalkEventIsOurs(bbsc_event_run.event);
+    if (!bbsc_event_run.ours) {
+        const bool inline_args = ReadablePointer(instance, 0xC0) && ReadValue<u64>(instance, 0xB8) != 0;
+        LOG_INFO(Debug, "BBSC own NPC quests: event {} follows the other player's talk - its flags "
+                        "and items are not ours (inline args {}, session state {})",
+                 bbsc_event_run.event, inline_args, GetSessionState());
+        BBSC_TIMELINE("QUEST", "event {} follows the other player's talk: skipped",
+                      bbsc_event_run.event);
+    }
+}
+
+s64 BbscCurrentEventRunId() {
+    return bbsc_event_run.event;
+}
+
+// From an event's 2003 instruction now (the caller is the bank 2003 handler), and not ours.
+bool BbscEventActionNotOurs(u64 caller_offset) {
+    return bbsc_npc_own_active && !bbsc_event_run.ours && caller_offset >= BbscEventBank2003Begin &&
+           caller_offset < BbscEventBank2003End;
+}
+
 void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr) {
         return;
     }
     const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
     const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
+    if (BbscEventActionNotOurs(caller_offset)) { // every flag of a talk-driven event not ours
+        bbsc_setflag_skip = 1;
+        LOG_INFO(Debug, "BBSC own NPC quests: event {} would set flag {} = {} - not ours, skipped",
+                 bbsc_event_run.event, static_cast<u32>(registers->rsi),
+                 static_cast<u8>(registers->rdx));
+        return;
+    }
     NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx),
                      caller_offset);
     NoteBbscNpcOwnFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
@@ -12815,7 +12957,8 @@ void InstallBbscResearchHooks() {
     static constexpr std::array<u8, 6> Prologue{0x41, 0x89, 0xD0, 0x8B, 0x4F, 0x1C};
     if (image_base == 0 ||
         !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x013CFCC0),
-                              std::span<const u8>{Prologue}, 0, BbscResearchSetFlagHook)) {
+                              std::span<const u8>{Prologue}, 0, BbscResearchSetFlagHook,
+                              &bbsc_setflag_skip)) {
         LOG_ERROR(Debug, "BBSC research: SetEventFlag hook failed");
     }
     static constexpr std::array<u8, 7> StepBegin{0x48, 0x8B, 0xB5, 0x20, 0xFF, 0xFF, 0xFF};
@@ -12849,6 +12992,12 @@ void InstallBbscResearchHooks() {
                              &bbsc_award_skip);
     if (!bbsc_popup_hook_ready) {
         LOG_ERROR(Debug, "BBSC guest award: hooks failed - a guest's awards keep the stuck popup");
+    }
+    if (image_base == 0 ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscEventBank2003Begin),
+                              std::span<const u8>{AwardPrologue}, 0, BbscEventBank2003Hook)) {
+        LOG_ERROR(Debug, "BBSC own NPC quests: event hook failed - the other player's talk events "
+                         "act here too");
     }
 
 }
