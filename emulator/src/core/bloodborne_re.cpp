@@ -10141,6 +10141,12 @@ constexpr std::array<BbscDreamTalk, 10> BbscDreamGuestTalks{{
 // 12410850 Central Yharnam (four windows), 12410750 Central Yharnam (one door, t241316). The talk
 // that follows is the guest's talk script, as with every other NPC.
 constexpr std::array<s64, 3> BbscGuestKnockEvents{12400840, 12410850, 12410750};
+// NPC gifts by flag (2026-10-27, the Little Girl's music box): a talk sets the gift's global flag
+// (9067) and common event 9040 (one slot per gift: flag 9042..9077 -> item lot) waits on it behind
+// "the player is the host" (4[03] 15, 10000, 0), then AwardItemLot. The guest's copy stopped there,
+// so a gift talked out in the host's world never came - and at home the journal's flag made the
+// home copy end at once (it ends on a flag already set). Now the guest's copy gives it right away.
+constexpr std::array<s64, 1> BbscGuestGiftEvents{9040};
 
 constexpr std::array<s64, 21> BbscDreamGuestEvents{
     12100020, 12100112, 12100113, 12100114, 12100115, 12100116, 12100117, 12100123,
@@ -11341,7 +11347,8 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
     bool allowed = known != bbsc_dream_type_conditions.end();
     if (event > 0) {
         allowed = std::ranges::find(BbscDreamGuestEvents, event) != BbscDreamGuestEvents.end() ||
-                  std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end();
+                  std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end() ||
+                  std::ranges::find(BbscGuestGiftEvents, event) != BbscGuestGiftEvents.end();
         if (allowed && known == bbsc_dream_type_conditions.end()) {
             bbsc_dream_type_conditions[bbsc_dream_type_next] = condition;
             bbsc_dream_type_next = (bbsc_dream_type_next + 1) % bbsc_dream_type_conditions.size();
