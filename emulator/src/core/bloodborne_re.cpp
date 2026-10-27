@@ -10141,12 +10141,32 @@ constexpr std::array<BbscDreamTalk, 10> BbscDreamGuestTalks{{
 // 12410850 Central Yharnam (four windows), 12410750 Central Yharnam (one door, t241316). The talk
 // that follows is the guest's talk script, as with every other NPC.
 constexpr std::array<s64, 3> BbscGuestKnockEvents{12400840, 12410850, 12410750};
-// NPC gifts by flag (2026-10-27, the Little Girl's music box): a talk sets the gift's global flag
-// (9067) and common event 9040 (one slot per gift: flag 9042..9077 -> item lot) waits on it behind
-// "the player is the host" (4[03] 15, 10000, 0), then AwardItemLot. The guest's copy stopped there,
-// so a gift talked out in the host's world never came - and at home the journal's flag made the
-// home copy end at once (it ends on a flag already set). Now the guest's copy gives it right away.
-constexpr std::array<s64, 1> BbscGuestGiftEvents{9040};
+// Events a guest's copy runs as the host's in the host's world (2026-10-27, "the guest's own
+// quests"). Of the 728 events behind "the player is the host" (4[03] x, 10000, 0) in all of the
+// game's scripts (tools: emevd scan with the game's own common.emedf names) these 128 do nothing
+// but the player's own things: event flags of the story / NPC quests (below 100000, plus their
+// map NPC states) and item pickups (kind 5), item awards (2003[04] / [36] / [43]), trophies,
+// messages, sounds, a save. None of them touches the world (characters, objects, warps,
+// cutscenes, boss kills, items taken away, map flags of kind 1). They read the guest's own flags,
+// so a quest step that follows a talk stays the guest's own, and one that follows a death (an NPC
+// killed, Simon's Bowblade, the Orphanage Key, Brador's / Yamamura's drops) or an item (badge ->
+// shop lines, 6680.. / 9910) happens for the guest too. Gifts by flag: common 9040 (31 gifts: the
+// music box, Eileen's Bold Hunter's Marks, badges, ...), 9100 (Iosefka's vial, Adella's, Arianna's
+// blood, ...), 12400403, 12700906, 13400980, 13501940, 13600943.
+constexpr std::array<s64, 128> BbscGuestGiftEvents{
+    5500, 6680, 6681, 6682, 6683, 6684, 6685, 6686, 6687, 6688, 6689, 6690, 6691, 6692, 6693,
+    6694, 6695, 6696, 6697, 9040, 9100, 9181, 9182, 9186, 9198, 9360, 9410, 9480, 9722, 9723,
+    9781, 9910, 12100020, 12100330, 12100450, 12101010, 12300190, 12400403, 12400410, 12400501,
+    12400521, 12400561, 12400592, 12400594, 12400611, 12400612, 12400622, 12400624, 12400625,
+    12400627, 12400629, 12400630, 12400657, 12400780, 12400800, 12400903, 12410011, 12410160,
+    12410325, 12410630, 12410701, 12410703, 12410731, 12410741, 12410744, 12410745, 12410761,
+    12410762, 12410763, 12410785, 12410786, 12410801, 12410803, 12410804, 12410805, 12410812,
+    12410813, 12410814, 12410831, 12410900, 12420700, 12700500, 12700701, 12700710, 12700720,
+    12700903, 12700904, 12700906, 12700908, 12701000, 12701001, 12701002, 12800601, 12800901,
+    12805030, 12900260, 12906726, 12907620, 13200106, 13200960, 13400100, 13400900, 13400910,
+    13400953, 13400980, 13400990, 13405155, 13405211, 13500900, 13500910, 13500942, 13500953,
+    13500963, 13500980, 13500999, 13501140, 13501810, 13501920, 13501940, 13505900, 13505901,
+    13600000, 13600900, 13600943, 13600954, 13605762, 13605900, 13605910};
 
 constexpr std::array<s64, 21> BbscDreamGuestEvents{
     12100020, 12100112, 12100113, 12100114, 12100115, 12100116, 12100117, 12100123,
@@ -16477,6 +16497,7 @@ void ApplyBbscBellsAnywhere(const GuestRegisterSnapshot* registers) {
 
 void OnBbscCutsceneRequestHook(u64 offset, const GuestRegisterSnapshot& registers); // below
 void TickBbscCutsceneReplay();                                                    // below
+void TickBbscSharedKeyItems();                                                    // below
 
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
@@ -16543,6 +16564,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscStrandedGuest();
         TickBbscBossLine();
         TickBbscCutsceneReplay();
+        TickBbscSharedKeyItems();
         TickBbscProgressBroadcast();
         TickBbscOwnWorld();
         TickBbscEchoCounter();
@@ -17380,6 +17402,115 @@ void OnBbscCutscenePacket(const void* data, std::size_t size) {
     if (bbsc_cutscene_queue.size() < 8) {
         bbsc_cutscene_queue.push_back(packet);
     }
+}
+
+namespace {
+// ---- Shared keys and hunter badges (2026-10-27) ------------------------------------------------
+// Keys and hunter badges are the party's: a badge opens lines in the Messengers' shop (common 6680..
+// / 9910 read the badges a player owns), a key opens its doors at home too. The host sends the keys
+// and badges it owns ("SHAD" 0x29 + u32 bits of BbscSharedKeyItems + u32 sequence) every 3 seconds;
+// a guest takes into its inventory the ones it does not own yet - at once, so it can buy the new
+// lines in the session. Inventory lookup 0x014D9E80(player + 0x328, type, id) -> slot or -1,
+// AddItem 0x014CDFD0(player + 0x1D0, type, id, count, 1, 1, 0); goods are type 0x40000000.
+constexpr std::array<u32, 21> BbscSharedKeyItems{
+    4000, 4006, 4009, 4010, 4012, 4013, 4015, 4018, 4019, 4020,       // keys
+    4110, 4111, 4112, 4113, 4114, 4115, 4116, 4117, 4118, 4119, 4120}; // hunter badges
+constexpr u8 BbscKeyItemsType = 0x29;
+constexpr u32 BbscGoodsType = 0x40000000;
+std::atomic<u32> bbsc_host_key_items{0};
+std::atomic<u32> bbsc_host_key_items_sequence{0};
+
+#pragma pack(push, 1)
+struct BbscKeyItemsPacket {
+    u8 magic[4] = {'S', 'H', 'A', 'D'};
+    u8 type = BbscKeyItemsType;
+    u32 items = 0;
+    u32 sequence = 0;
+};
+#pragma pack(pop)
+
+u64 BbscPlayerGameData() {
+    const u64 game_data = ReadValue<u64>(image_base + 0x0553B130, 0);
+    const u64 player = ReadablePointer(game_data, 0x10) ? ReadValue<u64>(game_data, 8) : 0;
+    return ReadablePointer(player, 0x3B8) ? player : 0;
+}
+
+bool BbscOwnsGoods(u64 player, u32 id) {
+    using Lookup = s32 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id);
+    const auto lookup = reinterpret_cast<Lookup>(image_base + 0x014D9E80);
+    return lookup(player + 0x328, BbscGoodsType, id) >= 0;
+}
+
+void TickBbscSharedKeyItems() {
+    if (image_base == 0) {
+        return;
+    }
+    const s32 state = GetSessionState();
+    static s64 last_sent_ms = 0;
+    static u32 last_applied = 0;
+    if (state == 3) {
+        last_applied = 0;
+        const s64 now = SteadyNowMs();
+        if (now - last_sent_ms < 3'000) {
+            return;
+        }
+        last_sent_ms = now;
+        const u64 player = BbscPlayerGameData();
+        if (player == 0) {
+            return;
+        }
+        BbscKeyItemsPacket packet{};
+        for (size_t i = 0; i < BbscSharedKeyItems.size(); ++i) {
+            if (BbscOwnsGoods(player, BbscSharedKeyItems[i])) {
+                packet.items |= 1u << i;
+            }
+        }
+        static u32 sequence = 0;
+        packet.sequence = ++sequence;
+        Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet, sizeof(packet));
+        return;
+    }
+    if (state != 6) {
+        last_applied = 0;
+        return;
+    }
+    const u32 items = bbsc_host_key_items.load();
+    if (items == 0 || (items & ~last_applied) == 0) {
+        return;
+    }
+    const u64 player = BbscPlayerGameData();
+    if (player == 0) {
+        return;
+    }
+    using AddItem = u64 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id, s32 count, u32, u32, u32);
+    const auto add = reinterpret_cast<AddItem>(image_base + 0x014CDFD0);
+    for (size_t i = 0; i < BbscSharedKeyItems.size(); ++i) {
+        const u32 bit = 1u << i;
+        if ((items & bit) == 0 || (last_applied & bit) != 0) {
+            continue;
+        }
+        const u32 id = BbscSharedKeyItems[i];
+        if (!BbscOwnsGoods(player, id)) {
+            add(player + 0x1D0, BbscGoodsType, id, 1, 1, 1, 0);
+            const bool now_owned = BbscOwnsGoods(player, id);
+            LOG_INFO(Debug, "BBSC shared keys: the host's key item {} is now ours too ({})", id,
+                     now_owned ? "in the inventory" : "AddItem did not take it");
+            BBSC_TIMELINE("KEYS", "the host's key item {} given to us ({})", id,
+                          now_owned ? "ok" : "not taken");
+        }
+        last_applied |= bit;
+    }
+}
+} // namespace
+
+void OnBbscKeyItemsPacket(const void* data, std::size_t size) {
+    if (data == nullptr || size < sizeof(BbscKeyItemsPacket)) {
+        return;
+    }
+    BbscKeyItemsPacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    bbsc_host_key_items.store(packet.items);
+    bbsc_host_key_items_sequence.store(packet.sequence);
 }
 
 namespace {

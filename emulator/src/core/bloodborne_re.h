@@ -48,6 +48,8 @@ void OnBbscProgressPacket(const std::uint32_t* flags, std::size_t count);
 void OnBbscHostBossPacket(std::int32_t boss);
 // BBSC cutscenes: the host's cutscene request ("SHAD" 0x28, a whole packet). Relay thread; queued.
 void OnBbscCutscenePacket(const void* data, std::size_t size);
+// BBSC shared keys and badges: the host's owned ones ("SHAD" 0x29). Relay thread; only stored.
+void OnBbscKeyItemsPacket(const void* data, std::size_t size);
 void NoteBbscRelayHost(std::uint32_t sender, std::uint32_t packed_map, float x, float y, float z);
 std::uint32_t GetBbscRelayHost();
 // The relay sender of a host that rang our sign (aimed placement, mod): a joining guest takes that

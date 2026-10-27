@@ -57,6 +57,7 @@ constexpr u8 ScaleType = 0x24;  // "SHAD" 0x24 + 5 x u16 the host's scaling perc
 constexpr u8 PvpType = 0x25;    // "SHAD" 0x25 + u8 kind (0 host state, 1 guest asks) + u8 on + u32
 constexpr u8 ProgressType = 0x26; // "SHAD" 0x26 + u8 count + count x u32 the host's boss flags
 constexpr u8 HostBossType = 0x27; // "SHAD" 0x27 + s32 the boss on the host's boss bar (-1 none)
+constexpr u8 KeyItemsType = 0x29; // "SHAD" 0x29 + u32 the host's keys and badges + u32 sequence
 constexpr u8 CutsceneType = 0x28; // "SHAD" 0x28 + the host's cutscene request (bloodborne_re.cpp)
 constexpr u8 PeersType = 0x7F; // server -> client: "N other players are connected", 1 byte count
 // Every frame since 2026-10-06: "SHAD" 0x40 + u32 sender + u32 session (the host's sender id, 0 = in
@@ -332,6 +333,10 @@ void Dispatch(const std::vector<u8>& wrapped) {
             std::int32_t boss = -1;
             std::memcpy(&boss, frame.data() + 5, 4);
             Core::Bloodborne::OnBbscHostBossPacket(boss);
+        }
+    } else if (frame[4] == KeyItemsType) {
+        if (from_our_host()) {
+            Core::Bloodborne::OnBbscKeyItemsPacket(frame.data(), frame.size());
         }
     } else if (frame[4] == CutsceneType) {
         if (from_our_host()) {
