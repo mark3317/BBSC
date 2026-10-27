@@ -10774,6 +10774,8 @@ s32 AddBbscCarriedGoods(u32 goods, s32 count) {
     return slot >= 0 && BbscInventoryHas(carried, code) ? slot : -1;
 }
 
+bool bbsc_popup_hook_ready = false; // see "Awards to a guest in the host's world"
+
 void GiveBbscGuestDrop(s32 lot, u32 name) {
     static std::mt19937 rng{static_cast<u32>(SteadyNowMs())};
     const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
@@ -10817,6 +10819,18 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
                  lot, pick + 1, flag);
         return;
     }
+    if (category != 4 && bbsc_popup_hook_ready) {
+        // 2026-10-27: the award works for a guest once its popup is dropped (see "Awards to a
+        // guest in the host's world"); it rolls the lot again, as for any player.
+        const u64 item_man = ReadValue<u64>(image_base + 0x0553D6E0, 0);
+        if (item_man != 0) {
+            using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+            reinterpret_cast<AwardItemLot>(image_base + 0x017DDC50)(item_man, lot, 0);
+            LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - lot {} (category {}) awarded",
+                     name, lot, category);
+            return;
+        }
+    }
     if (category != 4) {
         static const std::array<std::string_view, 5> kinds{"weapon", "attire", "", "", "goods"};
         const std::string_view kind = category == 8    ? "blood gem"
@@ -10851,59 +10865,46 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
 }
 
 // ---- Awards to a guest in the host's world (2026-10-27) -----------------------------------------
-// The events a guest now runs as the host's (BbscGuestGiftEvents) award item lots (2003[04]) - and
-// a lot through the award 0x017DDC50 shows the game's item popup, which on a guest is never closed
-// (2026-10-11 boss lots, 2026-10-19 drops). So while a guest is in the host's world the award is
-// taken over (entry hook, skip): a lot of goods only (keys, badges, gifts) goes straight into the
-// carried items as the drops do (its get flag set, BBSC's notice); any other lot (weapons, attire,
-// gems, gestures) is kept and awarded once we are home - in our own world the award and its popup
-// work as for any host.
+// The events a guest now runs as the host's (BbscGuestGiftEvents), the boss rewards and the enemy
+// drops award item lots through 0x017DDC50 - and its item popup is never closed on a guest
+// (2026-10-11 boss lots, 2026-10-19 drops). The award itself works (the items are there); the popup
+// is queued for each item by 0x016D8850 (called from the give 0x017D89F0 at 0x017D9348 / 0x017D94C7,
+// the same queue as the talk's c1_65). So while a guest is in the host's world an award runs as
+// usual - weapons, attire, blood gems, runes, goods, get flags - and only its popups are dropped
+// (popup entry hook, skip); BBSC's own notice says what came instead. The flag is set at the
+// award's entry and cleared at the next game tick (the award runs on the game thread, at once).
+bool bbsc_guest_award_active = false;
+u8 bbsc_popup_skip = 0;
 std::mutex bbsc_home_award_mutex;
-std::vector<s32> bbsc_home_awards;
-u8 bbsc_award_skip = 0;
+std::vector<s32> bbsc_home_awards; // none now; the home pass stays for later use
 constexpr u64 BbscItemManPointer = 0x0553D6E0;
 constexpr u64 BbscAwardItemLot = 0x017DDC50;
+constexpr u64 BbscItemPopupQueue = 0x016D8850;
 
 void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
-    if (registers == nullptr || !BbscGuestInHostWorld()) {
+    if (registers == nullptr || !bbsc_popup_hook_ready || !BbscGuestInHostWorld()) {
         return;
     }
-    const s32 lot = static_cast<s32>(registers->rsi);
-    const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
-    const u64 row = table != 0 && lot > 0 ? BbscParamRow(table, static_cast<u32>(lot), ItemLotRowSize)
-                                           : 0;
-    if (row == 0) {
-        return; // not a lot we know: the game's own way
-    }
-    bool goods_only = true;
-    bool any = false;
-    for (u32 i = 0; i < 8; ++i) {
-        if (ReadValue<s32>(row, i * 4) <= 0) {
-            continue;
-        }
-        any = true;
-        goods_only = goods_only && ReadValue<u32>(row, 0x20 + i * 4) == 4;
-    }
-    bbsc_award_skip = 1;
-    if (!any) {
+    bbsc_guest_award_active = true;
+    LOG_INFO(Debug, "BBSC guest award: item lot {} awarded in the host's world (popup dropped)",
+             static_cast<s32>(registers->rsi));
+    BBSC_TIMELINE("ITEMS", "guest award: lot {}", static_cast<s32>(registers->rsi));
+}
+
+void PS4_SYSV_ABI BbscGuestPopupHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || !bbsc_guest_award_active || !BbscGuestInHostWorld()) {
         return;
     }
-    if (goods_only) {
-        LOG_INFO(Debug, "BBSC guest award: item lot {} (goods) - into the carried items, no popup", lot);
-        GiveBbscGuestDrop(lot, 0);
-        return;
+    bbsc_popup_skip = 1;
+    LOG_INFO(Debug, "BBSC guest award: item {:#x} x{} - the game's popup dropped",
+             static_cast<u32>(registers->rdx) | static_cast<u32>(registers->rcx),
+             static_cast<s32>(registers->r8));
+    static s64 notice_ms = 0;
+    if (SteadyNowMs() - notice_ms > 3'000) {
+        notice_ms = SteadyNowMs();
+        BbscAnnounce(BbscL(u"An item was added to your items.", u"Предмет добавлен в ваши предметы."),
+                     "guest award");
     }
-    {
-        std::scoped_lock lock{bbsc_home_award_mutex};
-        if (bbsc_home_awards.size() < 64) {
-            bbsc_home_awards.push_back(lot);
-        }
-    }
-    LOG_INFO(Debug, "BBSC guest award: item lot {} (not only goods) - kept for our own world", lot);
-    BBSC_TIMELINE("ITEMS", "guest award: lot {} kept until we are home", lot);
-    BbscAnnounce(BbscL(u"Reward will be given in your own world.",
-                       u"Награда будет выдана в вашем мире."),
-                 "home award");
 }
 
 void GiveBbscHomeAwards() {
@@ -12429,12 +12430,17 @@ void InstallBbscResearchHooks() {
         LOG_ERROR(Debug, "BBSC own quests: item hooks failed");
     }
     static constexpr std::array<u8, 6> AwardPrologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
-    if (image_base == 0 ||
-        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscAwardItemLot),
-                              std::span<const u8>{AwardPrologue}, 0, BbscGuestAwardHook,
-                              &bbsc_award_skip)) {
-        LOG_ERROR(Debug, "BBSC guest award: hook failed - a guest's awards show the stuck popup");
+    bbsc_popup_hook_ready =
+        image_base != 0 &&
+        InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscItemPopupQueue),
+                             std::span<const u8>{AwardPrologue}, 0, BbscGuestPopupHook,
+                             &bbsc_popup_skip) &&
+        InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscAwardItemLot),
+                             std::span<const u8>{AwardPrologue}, 0, BbscGuestAwardHook);
+    if (!bbsc_popup_hook_ready) {
+        LOG_ERROR(Debug, "BBSC guest award: hooks failed - a guest's awards keep the stuck popup");
     }
+
 }
 
 void InstallBbscDreamHooks() {
@@ -17524,6 +17530,7 @@ bool BbscOwnsGoods(u64 player, u32 id) {
 }
 
 void TickBbscSharedKeyItems() {
+    bbsc_guest_award_active = false; // see "Awards to a guest in the host's world"
     if (image_base == 0) {
         return;
     }
