@@ -12121,8 +12121,14 @@ void PS4_SYSV_ABI BbscTalkStepEndHook(u64 /*tag*/, const GuestRegisterSnapshot* 
     bbsc_in_talk_step = false;
 }
 
-void NoteBbscTalkFlag(u32 flag, u8 value) {
-    if (!bbsc_in_talk_step || !BbscGuestInHostWorld()) {
+// The talk scripts' SetEventFlag (ESD c1_11) calls SetFlag from the command dispatcher
+// 0x0203FFD0; this is the return address of that call (the talk step window above misses them:
+// the dispatcher also runs outside of 0x0204C6D9).
+constexpr u64 BbscTalkSetFlagReturnOffset = 0x02043F5C;
+
+void NoteBbscTalkFlag(u32 flag, u8 value, u64 caller_offset) {
+    if ((!bbsc_in_talk_step && caller_offset != BbscTalkSetFlagReturnOffset) ||
+        !BbscGuestInHostWorld()) {
         return;
     }
     {
@@ -12142,8 +12148,98 @@ void NoteBbscTalkFlag(u32 flag, u8 value) {
                   flag, value);
 }
 
+// Items of a guest's talks in the host's world. A talk gives an item with c1_65 (the "got item"
+// window, queued at 0x016D8850) next to c1_52 (into the inventory, AddItem 0x014CDFD0). Both are
+// logged; an item a talk meant to give (c1_65) that never reached the inventory is given at home,
+// so a quest flag the journal brings home ("gave the music box") never leaves the item behind.
+struct BbscTalkItem {
+    u32 type; // item category bits (0x40000000 = goods)
+    u32 id;
+    s32 count;
+    auto operator<=>(const BbscTalkItem&) const = default;
+};
+std::vector<BbscTalkItem> bbsc_talk_items_meant; // c1_65 in the host's world
+std::vector<BbscTalkItem> bbsc_talk_items_added; // AddItem in the host's world
+constexpr u64 BbscAddItemOffset = 0x014CDFD0;
+constexpr u64 BbscTalkItemWindowOffset = 0x020436E4; // c1_65: EDX type, R14D id, R8D count
+
+void PS4_SYSV_ABI BbscTalkItemWindowHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || !BbscGuestInHostWorld()) {
+        return;
+    }
+    const BbscTalkItem item{static_cast<u32>(registers->rdx), static_cast<u32>(registers->r14),
+                            static_cast<s32>(registers->r8)};
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
+        if (bbsc_talk_items_meant.size() < 256) {
+            bbsc_talk_items_meant.push_back(item);
+        }
+    }
+    LOG_INFO(Debug, "BBSC own quests: a talk gives item {:#x}/{} x{} in the host's world",
+             item.type, item.id, item.count);
+    BBSC_TIMELINE("QUEST", "talk gives item {:#x}/{} x{}", item.type, item.id, item.count);
+}
+
+void PS4_SYSV_ABI BbscAddItemHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || !BbscGuestInHostWorld()) {
+        return;
+    }
+    const BbscTalkItem item{static_cast<u32>(registers->rsi), static_cast<u32>(registers->rdx),
+                            static_cast<s32>(registers->rcx)};
+    const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
+        if (bbsc_talk_items_added.size() < 1024) {
+            bbsc_talk_items_added.push_back(item);
+        }
+    }
+    LOG_INFO(Debug, "BBSC own quests: item {:#x}/{} x{} into the inventory in the host's world "
+                    "(caller {:#x})",
+             item.type, item.id, item.count, caller >= image_base ? caller - image_base : caller);
+}
+
+void GiveBbscTalkItemsAtHome() {
+    std::vector<BbscTalkItem> meant;
+    std::vector<BbscTalkItem> added;
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
+        meant.swap(bbsc_talk_items_meant);
+        added.swap(bbsc_talk_items_added);
+    }
+    if (meant.empty()) {
+        return;
+    }
+    const u64 game_data = ReadValue<u64>(image_base + 0x0553B130, 0);
+    const u64 player = ReadablePointer(game_data, 0x10) ? ReadValue<u64>(game_data, 8) : 0;
+    if (!ReadablePointer(player, 0x1D8)) {
+        LOG_ERROR(Debug, "BBSC own quests: no player game data - {} talk item(s) not given",
+                  meant.size());
+        return;
+    }
+    using AddItem = u64 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id, s32 count, u32, u32, u32);
+    const auto add = reinterpret_cast<AddItem>(image_base + BbscAddItemOffset);
+    for (const auto& item : meant) {
+        const bool reached = std::ranges::any_of(added, [&](const BbscTalkItem& a) {
+            return a.type == item.type && a.id == item.id;
+        });
+        if (reached || item.count <= 0) {
+            continue;
+        }
+        for (s32 i = 0; i < std::min(item.count, 99); ++i) {
+            add(player + 0x1D0, item.type, item.id, 1, 1, 1, 0);
+        }
+        LOG_INFO(Debug, "BBSC own quests: item {:#x}/{} x{} of a talk in the host's world given at "
+                        "home",
+                 item.type, item.id, item.count);
+        BBSC_TIMELINE("QUEST", "item {:#x}/{} x{} given at home", item.type, item.id, item.count);
+    }
+}
+
 // Writes the journal into our own world (after it is back); the journal is kept until `finish`.
 void ApplyBbscTalkJournal(std::string_view when, bool finish) {
+    if (finish) {
+        GiveBbscTalkItemsAtHome();
+    }
     std::map<u32, u8> journal;
     {
         std::scoped_lock lock{bbsc_talk_journal_mutex};
@@ -12174,15 +12270,16 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
     if (registers == nullptr) {
         return;
     }
-    NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
+    const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+    const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
+    NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx),
+                     caller_offset);
     const s32 state = GetSessionState();
     if (state != 3 && state != 6) {
         return;
     }
     const u32 flag = static_cast<u32>(registers->rsi);
     const u8 value = static_cast<u8>(registers->rdx);
-    const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
-    const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
     static std::mutex mutex;
     static std::vector<std::tuple<u32, u8, u64>> seen;
     {
@@ -12218,6 +12315,16 @@ void InstallBbscResearchHooks() {
                               std::span<const u8>{StepEnd}, 0, BbscTalkStepEndHook)) {
         LOG_ERROR(Debug, "BBSC own quests: talk step hooks failed - talks in the host's world stay "
                          "half-kept");
+    }
+    // AddItem 0x014CDFD0: PUSH RBP / MOV RBP, RSP / PUSH R15. c1_65: LEA RBX, [RBP - 0x2A8].
+    static constexpr std::array<u8, 6> AddItemPrologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+    static constexpr std::array<u8, 7> ItemWindow{0x48, 0x8D, 0x9D, 0x58, 0xFD, 0xFF, 0xFF};
+    if (image_base == 0 ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscAddItemOffset),
+                              std::span<const u8>{AddItemPrologue}, 0, BbscAddItemHook) ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscTalkItemWindowOffset),
+                              std::span<const u8>{ItemWindow}, 0, BbscTalkItemWindowHook)) {
+        LOG_ERROR(Debug, "BBSC own quests: item hooks failed");
     }
 }
 
