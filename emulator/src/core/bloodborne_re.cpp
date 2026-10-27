@@ -10520,6 +10520,8 @@ void TickBbscBossGoodsCheck() {
 }
 
 // Game tick: award the queued boss lots, once each.
+void ShowBbscItemPopup(u32 type, u32 id, s32 count, std::string_view what); // see below
+
 void TickBbscBossRewards() {
     std::vector<s64> due;
     {
@@ -10573,7 +10575,7 @@ void TickBbscBossRewards() {
         const auto goods = std::ranges::find_if(BbscBossGoodsLots,
                                                 [lot](const auto& g) { return g.lot == lot; });
         if (goods != BbscBossGoodsLots.end() && GiveBbscBossGoods(*goods)) {
-            BbscAnnounce(BbscL(u"Boss reward added to your items.", u"Награда за босса добавлена в ваши предметы."), "boss reward");
+            ShowBbscItemPopup(0x40000000u, goods->goods, goods->count, "boss reward");
             LOG_INFO(Debug, "BBSC boss drop: event {} - item lot {} given to the guest directly ({})",
                      event, lot, taken ? "repeat lot, flag already set" : "first kill");
             BBSC_TIMELINE("BOSS", "boss drop: event {} - item lot {} given to the guest directly ({})",
@@ -10776,6 +10778,42 @@ s32 AddBbscCarriedGoods(u32 goods, s32 count) {
     return slot >= 0 && BbscInventoryHas(carried, code) ? slot : -1;
 }
 
+// The game's own "item get" window for an item BBSC gave (2026-10-27, user: the game's window, not
+// BBSC's notice; to see whether a guest's window still never closes). Queued as a talk's c1_65 does
+// at 0x020436F4: 0x016D8850([0x0553B1C0], &handle (a 0), type, id, count, 0), then the handle's
+// release 0x01A8BC00. Types: 0 weapon, 0x10000000 attire, 0x20000000 accessory, 0x40000000 goods.
+// SHADPS4_BBSC_ITEM_POPUP=0 shows BBSC's notice instead.
+bool BbscItemPopupEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_ITEM_POPUP");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+void ShowBbscItemPopup(u32 type, u32 id, s32 count, std::string_view what) {
+    const u64 queue = image_base != 0 ? ReadValue<u64>(image_base + 0x0553B1C0, 0) : 0;
+    if (!BbscItemPopupEnabled() || queue == 0) {
+        static s64 notice_ms = 0;
+        if (SteadyNowMs() - notice_ms > 3'000) {
+            notice_ms = SteadyNowMs();
+            BbscAnnounce(BbscL(u"An item was added to your items.",
+                               u"Предмет добавлен в ваши предметы."),
+                         what);
+        }
+        return;
+    }
+    using Queue = u64 PS4_SYSV_ABI (*)(u64 queue, void* handle, u32 type, u32 id, s32 count, u32);
+    using Release = void PS4_SYSV_ABI (*)(void* handle);
+    alignas(16) static u8 handle[32]{};
+    std::memset(handle, 0, sizeof(handle));
+    reinterpret_cast<Queue>(image_base + 0x016D8850)(queue, handle, type, id, count, 0);
+    reinterpret_cast<Release>(image_base + 0x01A8BC00)(handle);
+    LOG_INFO(Debug, "BBSC item popup: {:#x} id {} x{} ({}) - the game's window queued", type, id,
+             count, what);
+    BBSC_TIMELINE("ITEMS", "item popup: id {} x{} ({})", id, count, what);
+}
+
 bool bbsc_popup_hook_ready = false; // see "Awards to a guest in the host's world"
 std::mutex bbsc_home_award_mutex;
 std::vector<s32> bbsc_home_awards; // lots a guest gets once home (blood gems, runes)
@@ -10851,9 +10889,7 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
         BBSC_TIMELINE("ITEMS", "guest drop: {} {} from lot {} {}", category == 0 ? "weapon" : "attire",
                       item, lot, there ? "added" : "not taken");
         if (there) {
-            BbscAnnounce(BbscL(u"An item was added to your items.",
-                               u"Предмет добавлен в ваши предметы."),
-                         "guest item");
+            ShowBbscItemPopup(type, static_cast<u32>(item), count, "guest item");
         }
         return;
     }
@@ -10885,10 +10921,8 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
                        : std::string{"did not fit (carried items full)"});
     BBSC_TIMELINE("ITEMS", "guest drop: goods {} x{} from lot {} {}", item, count, lot,
                   slot >= 0 ? "added" : "did not fit");
-    static s64 notice_ms = 0;
-    if (slot >= 0 && SteadyNowMs() - notice_ms > 15'000) {
-        notice_ms = SteadyNowMs();
-        BbscAnnounce(BbscL(u"An item was added to your items.", u"Предмет добавлен в ваши предметы."), "enemy drop");
+    if (slot >= 0) {
+        ShowBbscItemPopup(0x40000000u, static_cast<u32>(item), count, name != 0 ? "enemy drop" : "award");
     }
 }
 
@@ -17672,6 +17706,9 @@ void TickBbscSharedKeyItems() {
         if (!BbscOwnsGoods(player, id)) {
             add(player + 0x1D0, BbscGoodsType, id, 1, 1, 1, 0);
             const bool now_owned = BbscOwnsGoods(player, id);
+            if (now_owned) {
+                ShowBbscItemPopup(BbscGoodsType, id, 1, "shared key item");
+            }
             LOG_INFO(Debug, "BBSC shared keys: the host's key item {} is now ours too ({})", id,
                      now_owned ? "in the inventory" : "AddItem did not take it");
             BBSC_TIMELINE("KEYS", "the host's key item {} given to us ({})", id,
