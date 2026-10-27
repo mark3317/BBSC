@@ -13101,6 +13101,29 @@ bool SaveBbscRoleLines() {
             }
             LOG_INFO(Debug, "BBSC co-op lines: role {:#x} columns +0x28..+0x7c:{}", role, row);
         }
+        // 2026-10-27: the host still saw "?ActionEventInfo?" whenever a guest left (its Blank or
+        // the host's kick): the leaving member's role has line id 0 in a banner column (roles 0
+        // and 0x12..0x14 have 0 at +0x28..+0x4c where the cooperator role 7 has a line). Those
+        // zeros get the cooperator's line; +0x30 / +0x34 stay with TickBbscRejoinLines.
+        constexpr size_t CooperatorRole = 7;
+        u32 filled_lines = 0;
+        for (size_t col = 0x28; col <= 0x4C; col += 4) {
+            if (col == RoleGuestLine || col == RoleHostLine) {
+                continue;
+            }
+            const u32 fallback = ReadValue<u32>(BbscRoleLine(CooperatorRole, col), 0);
+            if (fallback == 0 || fallback == 0xFFFFFFFFu) {
+                continue;
+            }
+            for (size_t role = 0; role < RoleCount; ++role) {
+                if (ReadValue<u32>(BbscRoleLine(role, col), 0) == 0) {
+                    WriteValue<u32>(BbscRoleLine(role, col), 0, fallback);
+                    ++filled_lines;
+                }
+            }
+        }
+        LOG_INFO(Debug, "BBSC co-op lines: {} empty line id(s) got the cooperator's "
+                        "line (no \"?ActionEventInfo?\")", filled_lines);
     }
     return filled;
 }
@@ -14330,7 +14353,10 @@ void StartBbscDuelBell() {
             if (goods == 0 || effects == 0 || BbscKitParamsReady()) {
                 continue;
             }
-            if (PrepareBbscDuelBellIn({goods}, {effects}, "game's own tables", false)) {
+            // 2026-10-27 (BBport): the copy scan takes ~3 minutes in BBport, and the Duel Bell did
+            // nothing until it finished (the ready flag came only from there) - the game's own
+            // tables publish the effect rows now; the scan still writes every copy.
+            if (PrepareBbscDuelBellIn({goods}, {effects}, "game's own tables", true)) {
                 bbsc_kit_rows_ready.store(true, std::memory_order_release);
                 LOG_INFO(Debug, "BBSC kit: bells ready from the game's own tables after {} ms "
                                 "(goods {:#x}, SpEffect {:#x}) - every copy follows from the scan",
@@ -14345,11 +14371,13 @@ void StartBbscDuelBell() {
         }
     }}.detach();
     std::thread{[started_ms] {
-        for (int attempt = 0; attempt < 36 && !bbsc_duel_bell_ready; ++attempt) {
+        for (int attempt = 0; attempt < 36; ++attempt) {
             if (attempt != 0) {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
             }
-            PrepareBbscDuelBell();
+            if (PrepareBbscDuelBell()) {
+                break; // every copy written (the game's own tables may have published first)
+            }
         }
         if (bbsc_duel_bell_ready) {
             BBSC_TIMELINE("KIT", "every bell table copy ready after {} ms",
