@@ -12634,11 +12634,13 @@ void PS4_SYSV_ABI BbscTalkStepEndHook(u64 /*tag*/, const GuestRegisterSnapshot* 
 // the dispatcher also runs outside of 0x0204C6D9).
 constexpr u64 BbscTalkSetFlagReturnOffset = 0x02043F5C;
 
-void NoteBbscTalkFlag(u32 flag, u8 value, u64 caller_offset) {
+void NoteBbscTalkFlag(u32 flag, u8 value, u64 caller_offset, bool talk_event) {
     if (!BbscGuestInHostWorld()) {
         return;
     }
-    const bool talk = bbsc_in_talk_step || caller_offset == BbscTalkSetFlagReturnOffset;
+    // talk_event (2026-10-27): a flag of one of OUR talk-driven events (an Eileen step after our
+    // talk) - a map flag of it would be lost on the trip home otherwise.
+    const bool talk = bbsc_in_talk_step || caller_offset == BbscTalkSetFlagReturnOffset || talk_event;
     {
         std::scoped_lock lock{bbsc_talk_journal_mutex};
         // A flag a talk set and something else (the gift event resetting its trigger) set again:
@@ -12854,6 +12856,12 @@ struct BbscEventRun {
 BbscEventRun bbsc_event_run; // game thread
 u8 bbsc_setflag_skip = 0;
 
+bool IsBbscTalkDrivenEvent(s64 event) {
+    const auto it = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
+                                             &BbscTalkEventTrigger::event);
+    return it != BbscTalkEventTriggers.end() && it->event == event;
+}
+
 bool BbscTalkEventIsOurs(s64 event) {
     const auto first = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
                                                 &BbscTalkEventTrigger::event);
@@ -12922,8 +12930,12 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
                  static_cast<u8>(registers->rdx));
         return;
     }
+    const bool talk_event = bbsc_npc_own_active && bbsc_event_run.ours &&
+                            caller_offset >= BbscEventBank2003Begin &&
+                            caller_offset < BbscEventBank2003End &&
+                            IsBbscTalkDrivenEvent(bbsc_event_run.event);
     NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx),
-                     caller_offset);
+                     caller_offset, talk_event);
     NoteBbscNpcOwnFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
     if (caller_offset == BbscTalkSetFlagReturnOffset) {
         NoteBbscLocalTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
