@@ -10133,6 +10133,15 @@ constexpr std::array<BbscDreamTalk, 10> BbscDreamGuestTalks{{
 //   workshop  12100450 workshop-tool flags, 12105210 the workbench's repair request (70000100)
 //   messengers 12100020 adornment unlocks, 12101020/12101021 first weapons, 12101022/24/26/28
 //             notebook and bells, 12105043 Insight messengers, 12105060/62/64/70 adornments
+// Knocking on doors and windows (2026-10-27, "the guest cannot even knock at Arianna's door"): the
+// knock is a map event, not the talk script - action button 6030 on the door, then the flag the
+// door's talk script waits on ("normal talk" once it is on). Every such event first waits on
+// "character 10000 has type 0", so a guest never got the prompt. Templates (tools/gamedata, every
+// map): 12400840 Cathedral Ward (Arianna, 72400513, and the five lantern houses 700000xx),
+// 12410850 Central Yharnam (four windows), 12410750 Central Yharnam (one door, t241316). The talk
+// that follows is the guest's talk script, as with every other NPC.
+constexpr std::array<s64, 3> BbscGuestKnockEvents{12400840, 12410850, 12410750};
+
 constexpr std::array<s64, 21> BbscDreamGuestEvents{
     12100020, 12100112, 12100113, 12100114, 12100115, 12100116, 12100117, 12100123,
     12100146, 12100165, 12100450, 12101022, 12101024, 12101026, 12101028, 12105043,
@@ -10247,6 +10256,13 @@ void PS4_SYSV_ABI BbscDreamTalkHook(u64 /*tag*/, const GuestRegisterSnapshot* re
         const u32 map_area = talk / 10'000;
         if (map_area == 21 || map_area == 29 || map_area == 10 || talk % 1000 < 100 ||
             !BbscGuestInHostWorld()) {
+            static std::vector<u32> kept;
+            if (BbscGuestInHostWorld() && kept.size() < 256 &&
+                std::ranges::find(kept, talk) == kept.end()) {
+                kept.push_back(talk);
+                LOG_INFO(Debug, "BBSC research: talk t{} stays closed to the guest (filter)", talk);
+                BBSC_TIMELINE("RESEARCH", "talk t{} stays closed to the guest (filter)", talk);
+            }
             return;
         }
         WriteValue<u8>(condition, 0x25, 0);
@@ -11321,7 +11337,8 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
     auto known = std::ranges::find(bbsc_dream_type_conditions, condition);
     bool allowed = known != bbsc_dream_type_conditions.end();
     if (event > 0) {
-        allowed = std::ranges::find(BbscDreamGuestEvents, event) != BbscDreamGuestEvents.end();
+        allowed = std::ranges::find(BbscDreamGuestEvents, event) != BbscDreamGuestEvents.end() ||
+                  std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end();
         if (allowed && known == bbsc_dream_type_conditions.end()) {
             bbsc_dream_type_conditions[bbsc_dream_type_next] = condition;
             bbsc_dream_type_next = (bbsc_dream_type_next + 1) % bbsc_dream_type_conditions.size();
@@ -11330,6 +11347,15 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
         }
     }
     if (!allowed) {
+        // Research 2026-10-27 (guests and NPCs / windows): which events wait on "the player is the
+        // host" for the guest, once per event.
+        static std::vector<s64> refused;
+        if (event > 0 && refused.size() < 512 && std::ranges::find(refused, event) == refused.end()) {
+            refused.push_back(event);
+            LOG_INFO(Debug, "BBSC research: event {} waits on the host's player type - not for the "
+                            "guest (map {:#x})", event, GetCurrentPackedMap());
+            BBSC_TIMELINE("RESEARCH", "event {} waits on the host's player type (guest)", event);
+        }
         return;
     }
     WriteValue<u8>(condition, 0x10, static_cast<u8>(ReadValue<u8>(condition, 0x10) | 1));
@@ -12060,12 +12086,55 @@ void InstallBbscCinematicHook() {
                     "fast/slow, wheel speed, Z/X zoom, , . roll, [ ] glide", Look);
 }
 
+// Research 2026-10-27 (quest flags of a guest's talks): every event flag set, in a session, once
+// per flag / value / caller.
+void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr) {
+        return;
+    }
+    const s32 state = GetSessionState();
+    if (state != 3 && state != 6) {
+        return;
+    }
+    const u32 flag = static_cast<u32>(registers->rsi);
+    const u8 value = static_cast<u8>(registers->rdx);
+    const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+    const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
+    static std::mutex mutex;
+    static std::vector<std::tuple<u32, u8, u64>> seen;
+    {
+        std::scoped_lock lock{mutex};
+        const auto key = std::make_tuple(flag, value, caller_offset);
+        if (seen.size() >= 4096 || std::ranges::find(seen, key) != seen.end()) {
+            return;
+        }
+        seen.push_back(key);
+    }
+    LOG_INFO(Debug, "BBSC research: flag {} = {} (caller {:#x}, session state {}, map {:#x})",
+             flag, value, caller_offset, state, GetCurrentPackedMap());
+    BBSC_TIMELINE("RESEARCH", "flag {} = {} (caller {:#x}, state {})", flag, value, caller_offset,
+                  state);
+}
+
+void InstallBbscResearchHooks() {
+    // SprjEventFlagMan::SetFlag 0x013CFCC0(man, flag, value), a leaf: MOV R8D, EDX / MOV ECX,
+    // [RDI + 0x1C]. Every flag the events, the talk scripts and the game set (0x0132E5A0, used by
+    // BBSC, is one caller among ~40).
+    static constexpr std::array<u8, 6> Prologue{0x41, 0x89, 0xD0, 0x8B, 0x4F, 0x1C};
+    if (image_base == 0 ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x013CFCC0),
+                              std::span<const u8>{Prologue}, 0, BbscResearchSetFlagHook)) {
+        LOG_ERROR(Debug, "BBSC research: SetEventFlag hook failed");
+    }
+}
+
 void InstallBbscDreamHooks() {
     if (image_base == 0 || !BbscDreamEnabled()) {
         return;
     }
     static constexpr std::array<u8, 5> TalkSite{0x4A, 0x8B, 0x7C, 0xE9, 0x18};
     static constexpr std::array<u8, 6> TypeCheckPrologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+    InstallBbscResearchHooks();
     const bool talk = InstallGuestCodeHook(
         reinterpret_cast<void*>(image_base + TalkClientCheckedOffset), std::span<const u8>{TalkSite},
         0, BbscDreamTalkHook);
