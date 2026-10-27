@@ -3307,6 +3307,7 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why);
 void LogBbscHostWorldFlagsDiff(u32 packed_map, std::string_view why);
 void ApplyBbscGuestLootView(u32 packed_map, std::string_view why); // see "Guest loot view"
 void KeepBbscOwnWorldGroup(u32 key, const u8* live); // see "Own world journal"
+void KeepBbscGuestTalkBits(u32 key, const u8* before, u8* live); // see "A guest's own quests"
 void KeepBbscOwnTimeBits();                           // see "Time of night in the host's world"
 void ApplyBbscHostTime(std::string_view why);
 void KeepBbscHomeSpot();                              // see "Back home where we were"
@@ -5581,6 +5582,7 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
                 changed += live[b] != snap.groups[i][b] ? 1 : 0;
             }
             std::memcpy(live, snap.groups[i].data(), BbscWorldGroupBytes);
+            KeepBbscGuestTalkBits(key, before.data(), live);
             if (snap.map == BbscDreamStateMap) {
                 keep_own_dream_messengers(key, before.data(), live);
             }
@@ -10775,6 +10777,8 @@ s32 AddBbscCarriedGoods(u32 goods, s32 count) {
 }
 
 bool bbsc_popup_hook_ready = false; // see "Awards to a guest in the host's world"
+std::mutex bbsc_home_award_mutex;
+std::vector<s32> bbsc_home_awards; // lots a guest gets once home (blood gems, runes)
 
 void GiveBbscGuestDrop(s32 lot, u32 name) {
     static std::mt19937 rng{static_cast<u32>(SteadyNowMs())};
@@ -10819,31 +10823,55 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
                  lot, pick + 1, flag);
         return;
     }
-    if (category != 4 && bbsc_popup_hook_ready) {
-        // 2026-10-27: the award works for a guest once its popup is dropped (see "Awards to a
-        // guest in the host's world"); it rolls the lot again, as for any player.
-        const u64 item_man = ReadValue<u64>(image_base + 0x0553D6E0, 0);
-        if (item_man != 0) {
-            using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
-            reinterpret_cast<AwardItemLot>(image_base + 0x017DDC50)(item_man, lot, 0);
-            LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - lot {} (category {}) awarded",
-                     name, lot, category);
+    if (category == 0 || category == 1) {
+        // 2026-10-27 (user: every reward at once in the host's world): weapons (0) and attire (1)
+        // go straight into the items as a talk's c1_52 puts them, AddItem 0x014CDFD0(player data +
+        // 0x1D0, type 0 / 0x10000000, id, count, 1, 1, 0) - the award's popup is never closed on a
+        // guest, and the award in the host's world does not reach our inventory.
+        const u64 holder = ReadValue<u64>(image_base + 0x0553B130, 0);
+        const u64 player = ReadablePointer(holder, 0x10) ? ReadValue<u64>(holder, 0x08) : 0;
+        if (!ReadablePointer(player, 0x3B8)) {
             return;
         }
+        const u32 type = category == 0 ? 0u : 0x10000000u;
+        using AddItem = u64 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id, s32 count, u32, u32,
+                                             u32);
+        using Lookup = s32 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id);
+        reinterpret_cast<AddItem>(image_base + 0x014CDFD0)(player + 0x1D0, type,
+                                                            static_cast<u32>(item), count, 1, 1, 0);
+        const bool there = reinterpret_cast<Lookup>(image_base + 0x014D9E80)(
+                               player + 0x328, type, static_cast<u32>(item)) >= 0;
+        if (there && flag > 0) {
+            using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+            reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, static_cast<u32>(flag), 1);
+        }
+        LOG_INFO(Debug, "BBSC guest drop: {} {} x{} from lot {} {}",
+                 category == 0 ? "weapon" : "attire", item, count, lot,
+                 there ? "put into the items" : "not taken by AddItem");
+        BBSC_TIMELINE("ITEMS", "guest drop: {} {} from lot {} {}", category == 0 ? "weapon" : "attire",
+                      item, lot, there ? "added" : "not taken");
+        if (there) {
+            BbscAnnounce(BbscL(u"An item was added to your items.",
+                               u"Предмет добавлен в ваши предметы."),
+                         "guest item");
+        }
+        return;
     }
     if (category != 4) {
-        static const std::array<std::string_view, 5> kinds{"weapon", "attire", "", "", "goods"};
-        const std::string_view kind = category == 8    ? "blood gem"
-                                      : category == 15 ? "category 15 item"
-                                      : category < kinds.size() && !kinds[category].empty()
-                                          ? kinds[category]
-                                          : "item";
-        LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) dropped a {} (id {}, lot {}) - not given "
-                        "to a guest (the game's item popup would stay on screen)",
-                 name, kind, item, lot);
-        BBSC_TIMELINE("ITEMS", "guest drop: a {} (id {}, lot {}) not given - the game's item popup "
-                               "would stay on screen",
-                      kind, item, lot);
+        // Blood gems and runes (8), category 15: only the award makes them; it runs at home, where
+        // its popup works as for any host.
+        {
+            std::scoped_lock lock{bbsc_home_award_mutex};
+            if (bbsc_home_awards.size() < 64) {
+                bbsc_home_awards.push_back(lot);
+            }
+        }
+        LOG_INFO(Debug, "BBSC guest drop: a {} (id {}, lot {}) - awarded once we are home",
+                 category == 8 ? "blood gem / rune" : "category 15 item", item, lot);
+        BBSC_TIMELINE("ITEMS", "guest drop: lot {} (category {}) kept until home", lot, category);
+        BbscAnnounce(BbscL(u"Reward will be given in your own world.",
+                           u"Награда будет выдана в вашем мире."),
+                     "home award");
         return;
     }
     const s32 slot = AddBbscCarriedGoods(static_cast<u32>(item), count);
@@ -10874,9 +10902,8 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
 // (popup entry hook, skip); BBSC's own notice says what came instead. The flag is set at the
 // award's entry and cleared at the next game tick (the award runs on the game thread, at once).
 bool bbsc_guest_award_active = false;
+u8 bbsc_award_skip = 0;
 u8 bbsc_popup_skip = 0;
-std::mutex bbsc_home_award_mutex;
-std::vector<s32> bbsc_home_awards; // none now; the home pass stays for later use
 constexpr u64 BbscItemManPointer = 0x0553D6E0;
 constexpr u64 BbscAwardItemLot = 0x017DDC50;
 constexpr u64 BbscItemPopupQueue = 0x016D8850;
@@ -10885,10 +10912,13 @@ void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* r
     if (registers == nullptr || !bbsc_popup_hook_ready || !BbscGuestInHostWorld()) {
         return;
     }
-    bbsc_guest_award_active = true;
-    LOG_INFO(Debug, "BBSC guest award: item lot {} awarded in the host's world (popup dropped)",
-             static_cast<s32>(registers->rsi));
-    BBSC_TIMELINE("ITEMS", "guest award: lot {}", static_cast<s32>(registers->rsi));
+    // Test 2026-10-27 (Iosefka's vial): the award in the host's world gave the guest nothing (no
+    // popup queued either) - so it is taken over: the lot is rolled and given as a drop is.
+    const s32 lot = static_cast<s32>(registers->rsi);
+    bbsc_award_skip = 1;
+    LOG_INFO(Debug, "BBSC guest award: item lot {} in the host's world - given by BBSC", lot);
+    BBSC_TIMELINE("ITEMS", "guest award: lot {}", lot);
+    GiveBbscGuestDrop(lot, 0);
 }
 
 void PS4_SYSV_ABI BbscGuestPopupHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
@@ -12206,6 +12236,39 @@ bool bbsc_in_talk_step = false; // game thread only
 u32 bbsc_talk_step_id = 0;
 std::mutex bbsc_talk_journal_mutex;
 std::map<u32, u8> bbsc_talk_journal; // flag -> last value, from talks in the host's world
+bool bbsc_talk_journal_written = false; // the home load wrote it already (once per trip)
+
+// The guest's own talk state in the host's world (2026-10-27, Iosefka's vial: the host's talk set
+// 72410310 in the host's table, the world sync wrote it into ours and our copy of common 9100 gave
+// us the vial a second time). The world sync keeps our own bits of (a) every flag our talks set in
+// this session (the journal) and (b) the map flags the NPC gift events wait on (the inits of 9100,
+// 12400403, 12700906, 13400980, 13501920, 13501940, 13600943; the other gifts wait on story flags,
+// which the sync never writes).
+constexpr std::array<u32, 12> BbscGuestGiftTriggerFlags{
+    72410359, 72410310, 72400398, 72400489, 72400441, 72700321,
+    72700322, 73400424, 73500320, 73500321, 73500322, 73600300};
+
+void KeepBbscGuestTalkBits(u32 key, const u8* before, u8* live) {
+    const auto keep = [&](u32 flag) {
+        if (flag / 1000 != key) {
+            return;
+        }
+        const u32 bit = flag % 1000;
+        if (bit / 8 >= BbscWorldGroupBytes) {
+            return;
+        }
+        const u8 mask = static_cast<u8>(0x80u >> (bit % 8));
+        live[bit / 8] = static_cast<u8>((live[bit / 8] & ~mask) | (before[bit / 8] & mask));
+    };
+    for (const u32 flag : BbscGuestGiftTriggerFlags) {
+        keep(flag);
+    }
+    std::scoped_lock lock{bbsc_talk_journal_mutex};
+    for (auto it = bbsc_talk_journal.lower_bound(key * 1000);
+         it != bbsc_talk_journal.end() && it->first / 1000 == key; ++it) {
+        keep(it->first);
+    }
+}
 
 void PS4_SYSV_ABI BbscTalkStepBeginHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     bbsc_in_talk_step = true;
@@ -12229,12 +12292,17 @@ void PS4_SYSV_ABI BbscTalkStepEndHook(u64 /*tag*/, const GuestRegisterSnapshot* 
 constexpr u64 BbscTalkSetFlagReturnOffset = 0x02043F5C;
 
 void NoteBbscTalkFlag(u32 flag, u8 value, u64 caller_offset) {
-    if ((!bbsc_in_talk_step && caller_offset != BbscTalkSetFlagReturnOffset) ||
-        !BbscGuestInHostWorld()) {
+    if (!BbscGuestInHostWorld()) {
         return;
     }
+    const bool talk = bbsc_in_talk_step || caller_offset == BbscTalkSetFlagReturnOffset;
     {
         std::scoped_lock lock{bbsc_talk_journal_mutex};
+        // A flag a talk set and something else (the gift event resetting its trigger) set again:
+        // the journal keeps the last value, so home does not see the trigger on again.
+        if (!talk && !bbsc_talk_journal.contains(flag)) {
+            return;
+        }
         const auto it = bbsc_talk_journal.find(flag);
         if (it != bbsc_talk_journal.end() && it->second == value) {
             return;
@@ -12346,9 +12414,15 @@ void ApplyBbscTalkJournal(std::string_view when, bool finish) {
     std::map<u32, u8> journal;
     {
         std::scoped_lock lock{bbsc_talk_journal_mutex};
-        journal = bbsc_talk_journal;
+        // Written once per trip home: a second write would set a gift's trigger again after the
+        // home copy of the gift event had reset it (Iosefka's vial twice, 2026-10-27).
+        if (!bbsc_talk_journal_written) {
+            journal = bbsc_talk_journal;
+        }
+        bbsc_talk_journal_written = !finish && !journal.empty() ? true : bbsc_talk_journal_written;
         if (finish) {
             bbsc_talk_journal.clear();
+            bbsc_talk_journal_written = false;
         }
     }
     if (journal.empty() || image_base == 0 ||
@@ -12436,7 +12510,8 @@ void InstallBbscResearchHooks() {
                              std::span<const u8>{AwardPrologue}, 0, BbscGuestPopupHook,
                              &bbsc_popup_skip) &&
         InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscAwardItemLot),
-                             std::span<const u8>{AwardPrologue}, 0, BbscGuestAwardHook);
+                             std::span<const u8>{AwardPrologue}, 0, BbscGuestAwardHook,
+                             &bbsc_award_skip);
     if (!bbsc_popup_hook_ready) {
         LOG_ERROR(Debug, "BBSC guest award: hooks failed - a guest's awards keep the stuck popup");
     }
@@ -17539,6 +17614,21 @@ void TickBbscSharedKeyItems() {
     static u32 last_applied = 0;
     if (state == 3) {
         last_applied = 0;
+        // Research 2026-10-27 (Iosefka's vial reached the host when the guest talked): the gift
+        // triggers in our table, logged on every change, next to the SetFlag research lines.
+        static std::array<s8, BbscGuestGiftTriggerFlags.size()> watched{};
+        static s64 watched_ms = 0;
+        if (SteadyNowMs() - watched_ms >= 250) {
+            watched_ms = SteadyNowMs();
+            for (size_t i = 0; i < BbscGuestGiftTriggerFlags.size(); ++i) {
+                const s8 on = BbscEventFlag(BbscGuestGiftTriggerFlags[i]) ? 1 : 0;
+                if (watched[i] != 0 && watched[i] - 1 != on) {
+                    LOG_INFO(Debug, "BBSC research: host flag {} is now {} (gift trigger watch)",
+                             BbscGuestGiftTriggerFlags[i], on);
+                }
+                watched[i] = static_cast<s8>(on + 1);
+            }
+        }
         const s64 now = SteadyNowMs();
         if (now - last_sent_ms < 3'000) {
             return;
