@@ -5490,30 +5490,8 @@ void KeepBbscNpcOwnBits(u32 key, const u8* before, u8* live) {
     }
 }
 
-void TickBbscNpcOwnQuests() {
-    const s32 state = GetSessionState();
-    // 3 host, 6 guest, 4 joining (a guest's first world write comes while joining).
-    const bool session = BbscOwnNpcQuestsEnabled() && image_base != 0 &&
-                         (state == 3 || state == 4 || state == 6);
-    if (!session) {
-        if (bbsc_npc_own_active) {
-            std::scoped_lock lock{bbsc_npc_own_mutex};
-            LOG_INFO(Debug, "BBSC own NPC quests: session over - {} flags were kept as ours",
-                     bbsc_npc_own.size());
-            bbsc_npc_own.clear();
-            bbsc_npc_own_active = false;
-        }
-        return;
-    }
-    if (ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0) == 0) {
-        return;
-    }
-    if (!bbsc_npc_own_active) {
-        bbsc_npc_own_active = true;
-        LOG_INFO(Debug, "BBSC own NPC quests: session (state {}) - {} NPC quest flags stay ours",
-                 state, BbscNpcQuestFlags.size());
-        BBSC_TIMELINE("QUEST", "own NPC quests on (state {})", state);
-    }
+// Puts back every NPC quest flag that is not our own value (game thread).
+void RevertBbscNpcOwnFlags() {
     u32 last_key = 0;
     u64 storage = 0;
     size_t reverted = 0;
@@ -5548,6 +5526,48 @@ void TickBbscNpcOwnQuests() {
         }
     }
     (void)reverted;
+}
+
+// Test 2026-10-27 (Eileen, guest): the host's 9074 came in and our 9040 copy saw it in the same
+// frame, before the game tick put it back - and the event ran out (gift lost for our own talk). So
+// the put-back runs once more at the start of each frame's event update (an event's step 0x012ECDC0,
+// the first one after our tick) and at a talk step: the other player's values are gone before our
+// events and talks look.
+bool bbsc_npc_pass_due = false;
+void PS4_SYSV_ABI BbscNpcPassHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+    if (!bbsc_npc_pass_due || !bbsc_npc_own_active) {
+        return;
+    }
+    bbsc_npc_pass_due = false;
+    RevertBbscNpcOwnFlags();
+}
+
+void TickBbscNpcOwnQuests() {
+    const s32 state = GetSessionState();
+    // 3 host, 6 guest, 4 joining (a guest's first world write comes while joining).
+    const bool session = BbscOwnNpcQuestsEnabled() && image_base != 0 &&
+                         (state == 3 || state == 4 || state == 6);
+    if (!session) {
+        if (bbsc_npc_own_active) {
+            std::scoped_lock lock{bbsc_npc_own_mutex};
+            LOG_INFO(Debug, "BBSC own NPC quests: session over - {} flags were kept as ours",
+                     bbsc_npc_own.size());
+            bbsc_npc_own.clear();
+            bbsc_npc_own_active = false;
+        }
+        return;
+    }
+    if (ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0) == 0) {
+        return;
+    }
+    if (!bbsc_npc_own_active) {
+        bbsc_npc_own_active = true;
+        LOG_INFO(Debug, "BBSC own NPC quests: session (state {}) - {} NPC quest flags stay ours",
+                 state, BbscNpcQuestFlags.size());
+        BBSC_TIMELINE("QUEST", "own NPC quests on (state {})", state);
+    }
+    RevertBbscNpcOwnFlags();
+    bbsc_npc_pass_due = true; // once more at the next event update (see below)
 }
 
 struct BbscWorldSnapshot {
@@ -12614,6 +12634,7 @@ void KeepBbscGuestTalkBits(u32 key, const u8* before, u8* live) {
 }
 
 void PS4_SYSV_ABI BbscTalkStepBeginHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BbscNpcPassHook(0, registers);
     bbsc_in_talk_step = true;
     bbsc_talk_step_id = 0;
     // RBX = the talk record + 0x28; +0x10 is its condition evaluator, the talk id at +0x10.
@@ -13010,6 +13031,11 @@ void InstallBbscResearchHooks() {
                               std::span<const u8>{AwardPrologue}, 0, BbscEventBank2003Hook)) {
         LOG_ERROR(Debug, "BBSC own NPC quests: event hook failed - the other player's talk events "
                          "act here too");
+    }
+    if (image_base == 0 ||
+        !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x012ECDC0),
+                              std::span<const u8>{AwardPrologue}, 0, BbscNpcPassHook)) {
+        LOG_ERROR(Debug, "BBSC own NPC quests: event update hook failed");
     }
 
 }
