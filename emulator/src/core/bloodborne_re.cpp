@@ -10942,8 +10942,90 @@ constexpr u64 BbscItemManPointer = 0x0553D6E0;
 constexpr u64 BbscAwardItemLot = 0x017DDC50;
 constexpr u64 BbscItemPopupQueue = 0x016D8850;
 
+// ---- Talk gifts are each player's own (2026-10-27) ---------------------------------------------
+// Test at Iosefka's door: whoever talked, both players got the vial - a talk's flags reach the
+// other player's table too (not through SetFlag 0x013CFCC0: the research hook never saw it there;
+// the game's own talk sync), and each player's copy of the gift event then gives its player the
+// gift. The user: a quest that follows a talk is each player's own, so its gifts are too. A gift
+// lot below comes from an event that waits on a flag the talk scripts set (all talk scripts' c1_11
+// / talk-group arguments x the inits of the gift events, tools: esd + emevd scan); in a session it
+// is given only to the player whose own talk set one of its flags in the last 20 s, else the award
+// is skipped and those flags are put back off (so our own talk can still give it).
+struct BbscTalkGift {
+    s32 lot;
+    u32 flag;
+};
+constexpr std::array<BbscTalkGift, 50> BbscTalkGifts{{
+    {17000, 9042},    {22000, 9045},    {24000, 9047},    {24010, 9048},    {24020, 9049},
+    {24030, 9050},    {24040, 9051},    {24050, 9052},    {26000, 9054},    {26010, 9055},
+    {26020, 9056},    {26030, 9057},    {27000, 9058},    {27010, 9059},    {27020, 9060},
+    {27030, 9061},    {27040, 9062},    {27050, 9063},    {27060, 9064},    {29000, 9066},
+    {30000, 9067},    {32000, 9069},    {33000, 9071},    {34000, 9072},    {34010, 9073},
+    {35000, 9074},    {35010, 9075},    {39010, 9077},    {24060, 72410359}, {23000, 72410310},
+    {32020, 72400398}, {28000, 72400489}, {37000, 72400441}, {43120, 72700321}, {43130, 72700322},
+    {43110, 72700330}, {43200, 73400430}, {43200, 73500630}, {43210, 73400431}, {43211, 73400424},
+    {43010, 73500321}, {43020, 73500322}, {43000, 73500320}, {43600, 73600300}, {43220, 73600530},
+    {23000, 9046},    {39000, 9076},    {17010, 9043},    {43200, 1710},    {43220, 1713},
+}};
+std::mutex bbsc_local_talk_mutex;
+std::unordered_map<u32, s64> bbsc_local_talk_ms; // flag -> when our own talk set it on
+
+void NoteBbscLocalTalkFlag(u32 flag, u8 value) {
+    if (value == 0) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_local_talk_mutex};
+    if (bbsc_local_talk_ms.size() > 4096) {
+        bbsc_local_talk_ms.clear();
+    }
+    bbsc_local_talk_ms[flag] = SteadyNowMs();
+}
+
+// True when the award of `lot` is another player's talk gift (and was skipped).
+bool SkipBbscOthersTalkGift(s32 lot) {
+    const s32 state = GetSessionState();
+    if (state != 3 && state != 6) {
+        return false; // alone: the game's own way
+    }
+    bool listed = false;
+    bool ours = false;
+    {
+        std::scoped_lock lock{bbsc_local_talk_mutex};
+        for (const auto& gift : BbscTalkGifts) {
+            if (gift.lot != lot) {
+                continue;
+            }
+            listed = true;
+            const auto it = bbsc_local_talk_ms.find(gift.flag);
+            ours = ours || (it != bbsc_local_talk_ms.end() && SteadyNowMs() - it->second < 20'000);
+        }
+    }
+    if (!listed || ours) {
+        return false;
+    }
+    using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+    const auto set = reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0);
+    for (const auto& gift : BbscTalkGifts) {
+        if (gift.lot == lot && gift.flag >= 9000 && gift.flag < 10000) {
+            set(0, gift.flag, 0); // a story gift flag: off again, for our own talk later
+        }
+    }
+    LOG_INFO(Debug, "BBSC talk gifts: item lot {} follows the other player's talk - not ours "
+                    "(session state {})",
+             lot, state);
+    BBSC_TIMELINE("ITEMS", "talk gift lot {} skipped: the other player's talk", lot);
+    return true;
+}
+
 void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
-    if (registers == nullptr || !bbsc_popup_hook_ready || !BbscGuestInHostWorld()) {
+    if (registers == nullptr || !bbsc_popup_hook_ready) {
+        return;
+    }
+    if (SkipBbscOthersTalkGift(static_cast<s32>(registers->rsi))) {
+        bbsc_award_skip = 1;
+        return;
+    }
+    if (!BbscGuestInHostWorld()) {
         return;
     }
     // Test 2026-10-27 (Iosefka's vial): the award in the host's world gave the guest nothing (no
@@ -12485,6 +12567,9 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
     const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
     NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx),
                      caller_offset);
+    if (caller_offset == BbscTalkSetFlagReturnOffset) {
+        NoteBbscLocalTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
+    }
     const s32 state = GetSessionState();
     if (state != 3 && state != 6) {
         return;
