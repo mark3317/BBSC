@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #ifdef _WIN32
 #include <process.h>
@@ -32,6 +33,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "common/logging/log.h"
@@ -335,6 +337,20 @@ constexpr auto Sites = std::to_array<TraceSite>({
     // Engine Lua event dispatch 0x01339870(lua_state, name): names every session event
     // (OnBeKickOut, OnRoomTimeOut, OnIrregularLeaveSession, OnJoinMutiplay, ...).
     {"BBSC.LuaEvent", 0x01339870, TraceKind::LuaSessionEvent, StandardR15Prologue, 6},
+    // BBSC cutscenes (research 2026-10-27): the cutscene ("remo") request 0x0131A9F0(?, cutscene
+    // id, flags, -1, -1, entity) - called by the event command (0x017C5585: args 0, 1, 2 of the
+    // instruction, entity 10000 = the event's own) and by the Lua RequestRemo / RequestRemoPlus.
+    // The event command handler 0x017C5xxx calls one of a family of cutscene requests, one per
+    // command variant; 0x0131A9F0 alone saw nothing at Amelia's skull (2026-10-27), so all of them.
+    {"BBSC.Remo.Request", 0x0131A9F0, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestB", 0x0131AD70, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestC", 0x0131B230, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestD", 0x0131B540, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestE", 0x0131BC10, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestF", 0x0131C170, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestG", 0x0131FBE0, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestH", 0x0131FF70, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Remo.RequestI", 0x01320300, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
     // CSMultiPlayMan::RemoveMember(member_id): sets the exit flag on that member's insert task.
     // Traced with caller chain to find what drops the guest on the host when the host dies.
     {"BBSC.RemoveMember", 0x01E54DB0, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
@@ -16183,6 +16199,9 @@ void ApplyBbscBellsAnywhere(const GuestRegisterSnapshot* registers) {
     }
 }
 
+void OnBbscCutsceneRequestHook(u64 offset, const GuestRegisterSnapshot& registers); // below
+void TickBbscCutsceneReplay();                                                    // below
+
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
@@ -16247,6 +16266,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscStuckLeaveLocks();
         TickBbscStrandedGuest();
         TickBbscBossLine();
+        TickBbscCutsceneReplay();
         TickBbscProgressBroadcast();
         TickBbscOwnWorld();
         TickBbscEchoCounter();
@@ -16333,6 +16353,34 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (healing_fountain_host_availability_hook_installed &&
         site.offset == HealingFountainAvailabilityOffset) {
         ApplyHealingFountainHostAvailability(*registers);
+    }
+    if (site.name.starts_with("BBSC.Remo.")) {
+        // Who asked for which cutscene, on which side (research for cutscenes at the same time):
+        // the six integer arguments, two stack ones, and 32 bytes behind rcx / r8 when they point.
+        const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+        const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
+        const auto stack = [registers](u64 off) {
+            return ReadablePointer(registers->rsp + off, 8) ? ReadValue<u64>(registers->rsp, off) : 0;
+        };
+        const auto behind = [](u64 pointer) {
+            if (pointer < 0x10000 || !ReadablePointer(pointer, 32)) {
+                return std::string{};
+            }
+            std::string bytes = " [";
+            for (u64 i = 0; i < 32; i += 4) {
+                bytes += fmt::format("{}{:x}", i ? " " : "", ReadValue<u32>(pointer, i));
+            }
+            return bytes + "]";
+        };
+        const std::string line = fmt::format(
+            "cutscene request {}: rsi {} rdx {:#x} rcx {:#x}{} r8 {:#x}{} r9 {:#x} stack {:#x} {:#x} "
+            "(rdi {:#x}, caller {:#x}, session state {}, map {:#x})",
+            site.name.substr(10), static_cast<s32>(registers->rsi), registers->rdx, registers->rcx,
+            behind(registers->rcx), registers->r8, behind(registers->r8), registers->r9, stack(8),
+            stack(16), registers->rdi, caller_offset, GetSessionState(), GetCurrentPackedMap());
+        LOG_INFO(Debug, "BBSC {}", line);
+        BBSC_TIMELINE("CUTSCENE", "{}", line);
+        OnBbscCutsceneRequestHook(site.offset, *registers);
     }
     if (site.kind == TraceKind::LuaSessionEvent) {
         // Only session-relevant Lua events; the dispatcher also runs gameplay events.
@@ -16935,6 +16983,174 @@ bool BbscConnectFirstPlacementFresh() {
            BbscConnectFirstTimeoutMs;
 }
 
+} // namespace
+
+// ---- Cutscenes for everyone (2026-10-27) ---------------------------------------------------------
+// The host's cutscenes play for its guests at the same time. Every cutscene the game plays goes
+// through one of six requests, one per event command variant (0x017C5xxx, the event command handler;
+// variant A is also Lua's RequestRemo): (unused, s32 cutscene id, u32 playback flags, rcx, r8, r9,
+// three stack arguments). rcx is a pointer for some variants (the packed map of the variant that
+// moves the player, a local of the handler) and a number for others. The host sends the request
+// as it was made ("SHAD" 0x28, below) and the guest makes the same request in the same map; entity
+// 10000 is "the player", so the guest's own hunter takes the host's place in it. World state is the
+// host's alone: the guest plays the scene only (its world follows the host through time of night,
+// world flags and shared progress). SHADPS4_BBSC_CUTSCENES=0 keeps cutscenes to each player.
+namespace { // reopens the file's own anonymous namespace (forward declarations there)
+constexpr std::array<u64, 6> BbscCutsceneRequestOffsets{0x0131A9F0, 0x0131AD70, 0x0131B230,
+                                                        0x0131B540, 0x0131BC10, 0x0131C170};
+constexpr u8 BbscCutsceneType = 0x28;
+#pragma pack(push, 1)
+struct BbscCutscenePacket {
+    u8 magic[4] = {'S', 'H', 'A', 'D'};
+    u8 type = BbscCutsceneType;
+    u8 variant = 0;
+    u8 rcx_is_pointer = 0;
+    u8 reserved = 0;
+    u32 sequence = 0;
+    u32 map = 0;   // the host's packed map
+    s32 cutscene = 0;
+    u32 flags = 0;
+    u32 r8 = 0;
+    u32 r9 = 0;
+    u64 rcx = 0;
+    u64 stack[3]{};
+    u8 rcx_bytes[32]{};
+};
+#pragma pack(pop)
+static_assert(sizeof(BbscCutscenePacket) == 0x60);
+
+thread_local bool bbsc_cutscene_replaying = false;
+std::mutex bbsc_cutscene_mutex;
+std::deque<BbscCutscenePacket> bbsc_cutscene_queue;          // from the host, for the game thread
+std::unordered_map<s32, s64> bbsc_cutscene_own_ms;           // our own requests, by cutscene id
+
+bool BbscCutscenesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_CUTSCENES");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+int BbscCutsceneVariant(u64 offset) {
+    for (size_t i = 0; i < BbscCutsceneRequestOffsets.size(); ++i) {
+        if (BbscCutsceneRequestOffsets[i] == offset) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void OnBbscCutsceneRequestHook(u64 offset, const GuestRegisterSnapshot& registers) {
+    const int variant = BbscCutsceneVariant(offset);
+    if (variant < 0 || bbsc_cutscene_replaying || !BbscCutscenesEnabled()) {
+        return;
+    }
+    const s32 cutscene = static_cast<s32>(registers.rsi);
+    const s32 state = GetSessionState();
+    if (state == 6) {
+        std::scoped_lock lock{bbsc_cutscene_mutex};
+        bbsc_cutscene_own_ms[cutscene] = SteadyNowMs();
+        return;
+    }
+    if (state != 3) {
+        return;
+    }
+    static u32 sequence = 0;
+    BbscCutscenePacket packet{};
+    packet.variant = static_cast<u8>(variant);
+    packet.sequence = ++sequence;
+    packet.map = GetCurrentPackedMap();
+    packet.cutscene = cutscene;
+    packet.flags = static_cast<u32>(registers.rdx);
+    packet.r8 = static_cast<u32>(registers.r8);
+    packet.r9 = static_cast<u32>(registers.r9);
+    packet.rcx = registers.rcx;
+    // rcx is a pointer when it points at the caller's stack (the handler's local); it is copied.
+    if (registers.rcx >= registers.rsp && registers.rcx < registers.rsp + 0x1000 &&
+        ReadablePointer(registers.rcx, sizeof(packet.rcx_bytes))) {
+        packet.rcx_is_pointer = 1;
+        std::memcpy(packet.rcx_bytes, reinterpret_cast<const void*>(registers.rcx),
+                    sizeof(packet.rcx_bytes));
+    }
+    for (size_t i = 0; i < 3; ++i) { // the caller's [rsp + 0, 8, 16]: ours + 8 (return address)
+        const u64 at = registers.rsp + 8 * (i + 1);
+        packet.stack[i] = ReadablePointer(at, 8) ? ReadValue<u64>(at, 0) : 0;
+    }
+    const u32 sent =
+        Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet, sizeof(packet));
+    LOG_INFO(Debug, "BBSC cutscenes: our cutscene {} (variant {}) sent to the guests ({} reached)",
+             cutscene, variant, sent);
+    BBSC_TIMELINE("CUTSCENE", "our cutscene {} sent to the guests ({} reached)", cutscene, sent);
+}
+
+} // namespace
+
+void OnBbscCutscenePacket(const void* data, std::size_t size) {
+    if (data == nullptr || size < sizeof(BbscCutscenePacket) || !BbscCutscenesEnabled()) {
+        return;
+    }
+    BbscCutscenePacket packet{};
+    std::memcpy(&packet, data, sizeof(packet));
+    if (packet.variant >= BbscCutsceneRequestOffsets.size()) {
+        return;
+    }
+    static u32 last_sequence = 0;
+    std::scoped_lock lock{bbsc_cutscene_mutex};
+    if (packet.sequence == last_sequence) {
+        return; // the same packet over the relay and the P2P channel
+    }
+    last_sequence = packet.sequence;
+    if (bbsc_cutscene_queue.size() < 8) {
+        bbsc_cutscene_queue.push_back(packet);
+    }
+}
+
+namespace {
+void TickBbscCutsceneReplay() {
+    BbscCutscenePacket packet{};
+    {
+        std::scoped_lock lock{bbsc_cutscene_mutex};
+        if (bbsc_cutscene_queue.empty()) {
+            return;
+        }
+        packet = bbsc_cutscene_queue.front();
+        bbsc_cutscene_queue.pop_front();
+    }
+    const s32 state = GetSessionState();
+    const u32 map = GetCurrentPackedMap();
+    if (image_base == 0 || state != 6) {
+        return;
+    }
+    if (map != packet.map) {
+        LOG_INFO(Debug, "BBSC cutscenes: the host's cutscene {} is in map {:#x}, we are in {:#x} - "
+                        "not played here", packet.cutscene, packet.map, map);
+        BBSC_TIMELINE("CUTSCENE", "the host's cutscene {} skipped: another map", packet.cutscene);
+        return;
+    }
+    {
+        std::scoped_lock lock{bbsc_cutscene_mutex};
+        const auto own = bbsc_cutscene_own_ms.find(packet.cutscene);
+        if (own != bbsc_cutscene_own_ms.end() && SteadyNowMs() - own->second < 15'000) {
+            BBSC_TIMELINE("CUTSCENE", "the host's cutscene {}: our game asked for it too", 
+                          packet.cutscene);
+            return;
+        }
+    }
+    static std::array<u8, 64> rcx_buffer{};
+    std::memcpy(rcx_buffer.data(), packet.rcx_bytes, sizeof(packet.rcx_bytes));
+    const u64 rcx = packet.rcx_is_pointer ? reinterpret_cast<u64>(rcx_buffer.data()) : packet.rcx;
+    using Request = void PS4_SYSV_ABI (*)(u64, u32, u32, u64, u32, u32, u64, u64, u64);
+    const auto request =
+        reinterpret_cast<Request>(image_base + BbscCutsceneRequestOffsets[packet.variant]);
+    bbsc_cutscene_replaying = true;
+    request(0, static_cast<u32>(packet.cutscene), packet.flags, rcx, packet.r8, packet.r9,
+            packet.stack[0], packet.stack[1], packet.stack[2]);
+    bbsc_cutscene_replaying = false;
+    LOG_INFO(Debug, "BBSC cutscenes: the host's cutscene {} (variant {}) played here",
+             packet.cutscene, packet.variant);
+    BBSC_TIMELINE("CUTSCENE", "the host's cutscene {} played here too", packet.cutscene);
+}
 } // namespace
 
 void OnBbscHostBossPacket(std::int32_t boss) {
