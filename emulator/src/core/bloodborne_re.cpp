@@ -5336,6 +5336,220 @@ u64 BbscFlagGroupStorage(u32 key) {
                : 0;
 }
 
+// ---- Each player's own NPC quests (2026-10-27) --------------------------------------------------
+// The user: every NPC's quest is each player's own, in the host's world too. Test: the host talked
+// to Eileen first, her "gave the marks" flag (72410540) reached the guest's table, so the guest's
+// talk took the "marks already given" branch (gesture only). A talk's flags reach the other
+// player's table without the game's SetFlag 0x013CFCC0 (the game's own talk sync; and BBSC's world
+// sync writes the host's map groups into a guest's table). So in a session each player keeps the
+// flags the talk scripts read or set (BbscNpcQuestFlags: every talk script's c1_11 / f15 literal
+// and talk-group argument that ends in one, through nested groups; tools: esd scan) at the values
+// its own game set them to: every SetFlag on this machine updates the copy, any other change is
+// put back each game tick (and at once after a world sync write). A guest's copy starts from its
+// own world's values (the groups as they were before the host's first write); the guest's talks
+// still go home through the journal. Left shared (the host's world): kind 1 flags (doors, bosses,
+// world events), the boss / progress flags, the night phases (1000-1099) and time (9800-9802),
+// the Hunter's Dream (area 21, BBSC's Dream handling), item pickups (kind 5).
+// SHADPS4_BBSC_OWN_NPC_QUESTS=0 turns it off.
+constexpr std::array<u32, 788> BbscNpcQuestFlags{
+    706, 751, 760, 762, 764, 1102, 1103, 1104, 1105, 1106,
+    1108, 1109, 1121, 1122, 1123, 1124, 1140, 1141, 1142, 1143,
+    1144, 1145, 1146, 1147, 1148, 1149, 1160, 1161, 1163, 1164,
+    1165, 1166, 1167, 1168, 1169, 1180, 1181, 1183, 1184, 1185,
+    1186, 1187, 1188, 1189, 1190, 1193, 1194, 1200, 1202, 1204,
+    1205, 1207, 1208, 1209, 1211, 1220, 1222, 1223, 1224, 1225,
+    1226, 1227, 1228, 1229, 1230, 1231, 1232, 1233, 1240, 1241,
+    1242, 1243, 1244, 1245, 1260, 1261, 1262, 1263, 1264, 1265,
+    1266, 1267, 1268, 1269, 1270, 1271, 1272, 1273, 1280, 1281,
+    1290, 1291, 1292, 1300, 1301, 1304, 1305, 1306, 1307, 1308,
+    1309, 1311, 1313, 1314, 1320, 1321, 1322, 1323, 1324, 1325,
+    1340, 1341, 1342, 1344, 1345, 1346, 1347, 1348, 1349, 1350,
+    1351, 1360, 1361, 1362, 1363, 1364, 1365, 1366, 1367, 1368,
+    1369, 1370, 1371, 1372, 1381, 1382, 1400, 1401, 1402, 1420,
+    1421, 1422, 1423, 1430, 1431, 1439, 1441, 1442, 1650, 1660,
+    1670, 1671, 1672, 1710, 1711, 1712, 1713, 1720, 1721, 1722,
+    1723, 1725, 1726, 1727, 1730, 1735, 1750, 1751, 1752, 1760,
+    1761, 1762, 1770, 1780, 1790, 1800, 1801, 1805, 1930, 1933,
+    1936, 1939, 1942, 1945, 1948, 1951, 1954, 1957, 1960, 1963,
+    1966, 1969, 1975, 1978, 6000, 6300, 6302, 6303, 6305, 6308,
+    6309, 6311, 6603, 6676, 6678, 6700, 6701, 6702, 6703, 6704,
+    6705, 6706, 6707, 6708, 6709, 6710, 6711, 6712, 6713, 6714,
+    6715, 6716, 6717, 6718, 6719, 6722, 6723, 6744, 6745, 6746,
+    6747, 6749, 6750, 6751, 6753, 6754, 6755, 6756, 6757, 6758,
+    6759, 6760, 6770, 6810, 6811, 6812, 6814, 9042, 9045, 9047,
+    9048, 9049, 9050, 9051, 9052, 9053, 9054, 9055, 9056, 9057,
+    9058, 9059, 9060, 9061, 9062, 9063, 9064, 9066, 9067, 9069,
+    9071, 9072, 9073, 9074, 9075, 9077, 9430, 9431, 9432, 70000007,
+    70000030, 70000050, 70000051, 70000052, 70000053, 70000054, 70000070, 70000071, 70000072, 70000073,
+    70000074, 70000075, 70000100, 70000140, 70000230, 70000231, 70002401, 70002413, 72000000, 72200100,
+    72200600, 72200601, 72300300, 72300301, 72300304, 72300305, 72300306, 72300307, 72300310, 72300313,
+    72300314, 72300315, 72400105, 72400300, 72400301, 72400302, 72400303, 72400304, 72400305, 72400306,
+    72400307, 72400309, 72400310, 72400311, 72400312, 72400313, 72400314, 72400315, 72400316, 72400317,
+    72400318, 72400319, 72400320, 72400321, 72400322, 72400323, 72400324, 72400330, 72400331, 72400332,
+    72400340, 72400341, 72400342, 72400343, 72400344, 72400345, 72400346, 72400347, 72400348, 72400349,
+    72400350, 72400353, 72400354, 72400356, 72400360, 72400361, 72400362, 72400363, 72400370, 72400372,
+    72400373, 72400374, 72400380, 72400381, 72400383, 72400384, 72400385, 72400390, 72400392, 72400393,
+    72400394, 72400397, 72400398, 72400440, 72400441, 72400460, 72400461, 72400462, 72400463, 72400465,
+    72400466, 72400467, 72400469, 72400470, 72400471, 72400474, 72400480, 72400484, 72400485, 72400486,
+    72400489, 72400490, 72400491, 72400497, 72400498, 72400499, 72400500, 72400501, 72400502, 72400503,
+    72400510, 72400511, 72400512, 72400513, 72400520, 72400521, 72400522, 72400523, 72400524, 72400525,
+    72400526, 72400527, 72400528, 72400530, 72400900, 72400914, 72400915, 72400916, 72400920, 72400921,
+    72400924, 72400933, 72400934, 72400935, 72400936, 72400937, 72400938, 72400950, 72400953, 72400954,
+    72400955, 72400960, 72400961, 72400962, 72400963, 72400964, 72400965, 72400966, 72400970, 72400971,
+    72400972, 72400980, 72400981, 72400982, 72409900, 72409901, 72409910, 72409920, 72409930, 72410300,
+    72410301, 72410302, 72410303, 72410304, 72410305, 72410306, 72410307, 72410308, 72410309, 72410310,
+    72410311, 72410320, 72410321, 72410322, 72410323, 72410325, 72410326, 72410327, 72410328, 72410329,
+    72410330, 72410331, 72410332, 72410333, 72410334, 72410335, 72410336, 72410337, 72410338, 72410339,
+    72410340, 72410341, 72410342, 72410343, 72410344, 72410345, 72410346, 72410347, 72410348, 72410349,
+    72410350, 72410351, 72410352, 72410353, 72410354, 72410355, 72410356, 72410357, 72410358, 72410359,
+    72410360, 72410361, 72410362, 72410363, 72410364, 72410365, 72410366, 72410370, 72410371, 72410380,
+    72410382, 72410383, 72410384, 72410385, 72410390, 72410391, 72410392, 72410393, 72410394, 72410400,
+    72410401, 72410402, 72410403, 72410404, 72410405, 72410406, 72410407, 72410412, 72410413, 72410414,
+    72410415, 72410416, 72410420, 72410421, 72410422, 72410423, 72410461, 72410462, 72410500, 72410501,
+    72410502, 72410503, 72410504, 72410505, 72410506, 72410511, 72410512, 72410513, 72410514, 72410515,
+    72410516, 72410520, 72410521, 72410530, 72410540, 72410541, 72410542, 72410543, 72410544, 72410545,
+    72410546, 72410600, 72410601, 72410602, 72410603, 72410610, 72410611, 72410612, 72410614, 72410615,
+    72410630, 72410631, 72410632, 72410633, 72410634, 72500301, 72500302, 72500304, 72500310, 72500311,
+    72500312, 72500320, 72500321, 72500322, 72500326, 72500329, 72500330, 72500331, 72500332, 72500333,
+    72500334, 72500335, 72500336, 72500337, 72500339, 72500340, 72500341, 72500342, 72500343, 72500344,
+    72500345, 72500346, 72500347, 72500348, 72500356, 72500357, 72500600, 72500601, 72500602, 72500604,
+    72600300, 72600301, 72600302, 72600303, 72600304, 72600305, 72600306, 72600311, 72600316, 72600317,
+    72700300, 72700301, 72700302, 72700303, 72700304, 72700305, 72700306, 72700321, 72700322, 72700330,
+    72700360, 72700361, 72700364, 72700374, 72700440, 72700443, 72700444, 72700445, 72700450, 72700451,
+    72800301, 72800302, 72800304, 72800305, 72800306, 72800307, 72800308, 72800309, 72800310, 72800311,
+    72800312, 72800313, 72800314, 72800315, 72800316, 72900000, 72900001, 72900002, 72910000, 72910020,
+    72910030, 73200300, 73200320, 73200321, 73200322, 73200323, 73200324, 73200325, 73200326, 73200327,
+    73200330, 73200331, 73200332, 73200333, 73200334, 73200335, 73200340, 73200341, 73200342, 73200343,
+    73200344, 73200350, 73200351, 73200352, 73200353, 73200354, 73200355, 73400400, 73400401, 73400402,
+    73400403, 73400404, 73400405, 73400422, 73400423, 73400424, 73400430, 73400431, 73400510, 73400511,
+    73400512, 73400513, 73500300, 73500301, 73500302, 73500303, 73500305, 73500306, 73500308, 73500309,
+    73500310, 73500311, 73500312, 73500315, 73500316, 73500317, 73500318, 73500319, 73500320, 73500321,
+    73500322, 73500326, 73500327, 73500338, 73500339, 73500400, 73500401, 73500402, 73500410, 73500411,
+    73500412, 73500414, 73500415, 73500500, 73500501, 73500502, 73500505, 73500600, 73500601, 73500602,
+    73500621, 73500630, 73500900, 73500905, 73500910, 73500911, 73500915, 73500920, 73500925, 73500930,
+    73500935, 73500936, 73500945, 73500946, 73500950, 73500955, 73500960, 73500965, 73500970, 73500971,
+    73500974, 73500975, 73500976, 73500979, 73500980, 73500981, 73600300, 73600301, 73600310, 73600311,
+    73600312, 73600313, 73600314, 73600315, 73600318, 73600500, 73600501, 73600503, 73600520, 73600521,
+    73600530, 79900100, 79900104, 79900106, 79900107, 79900108, 79900109, 79900111
+};
+
+bool BbscOwnNpcQuestsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_OWN_NPC_QUESTS");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+bool IsBbscNpcQuestFlag(u32 flag) {
+    return std::binary_search(BbscNpcQuestFlags.begin(), BbscNpcQuestFlags.end(), flag);
+}
+
+std::mutex bbsc_npc_own_mutex;
+std::unordered_map<u32, u8> bbsc_npc_own; // flag -> our own value in this session
+bool bbsc_npc_own_active = false;
+
+bool BbscNpcFlagBit(u64 storage, u32 flag) {
+    const u32 bit = flag % 1000;
+    return (ReadValue<u8>(storage, bit / 8) & (0x80u >> (bit % 8))) != 0;
+}
+
+void SetBbscNpcFlagBit(u64 storage, u32 flag, bool on) {
+    const u32 bit = flag % 1000;
+    auto* byte = reinterpret_cast<u8*>(storage + bit / 8);
+    const u8 mask = static_cast<u8>(0x80u >> (bit % 8));
+    *byte = static_cast<u8>(on ? (*byte | mask) : (*byte & ~mask));
+}
+
+// SetFlag hook: our own game set it.
+void NoteBbscNpcOwnFlag(u32 flag, u8 value) {
+    if (!bbsc_npc_own_active || !IsBbscNpcQuestFlag(flag)) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_npc_own_mutex};
+    bbsc_npc_own[flag] = value != 0 ? 1 : 0;
+}
+
+// The world sync wrote the host's group `key` over `before` (ours): our NPC quest bits back.
+void KeepBbscNpcOwnBits(u32 key, const u8* before, u8* live) {
+    if (!bbsc_npc_own_active) {
+        return;
+    }
+    const auto first = std::lower_bound(BbscNpcQuestFlags.begin(), BbscNpcQuestFlags.end(),
+                                        key * 1000);
+    std::scoped_lock lock{bbsc_npc_own_mutex};
+    for (auto it = first; it != BbscNpcQuestFlags.end() && *it / 1000 == key; ++it) {
+        const u32 bit = *it % 1000;
+        const u8 mask = static_cast<u8>(0x80u >> (bit % 8));
+        auto own = bbsc_npc_own.find(*it);
+        if (own == bbsc_npc_own.end()) {
+            own = bbsc_npc_own.emplace(*it, (before[bit / 8] & mask) != 0 ? 1 : 0).first;
+        }
+        live[bit / 8] = static_cast<u8>(own->second != 0 ? (live[bit / 8] | mask)
+                                                         : (live[bit / 8] & ~mask));
+    }
+}
+
+void TickBbscNpcOwnQuests() {
+    const s32 state = GetSessionState();
+    // 3 host, 6 guest, 4 joining (a guest's first world write comes while joining).
+    const bool session = BbscOwnNpcQuestsEnabled() && image_base != 0 &&
+                         (state == 3 || state == 4 || state == 6);
+    if (!session) {
+        if (bbsc_npc_own_active) {
+            std::scoped_lock lock{bbsc_npc_own_mutex};
+            LOG_INFO(Debug, "BBSC own NPC quests: session over - {} flags were kept as ours",
+                     bbsc_npc_own.size());
+            bbsc_npc_own.clear();
+            bbsc_npc_own_active = false;
+        }
+        return;
+    }
+    if (ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0) == 0) {
+        return;
+    }
+    if (!bbsc_npc_own_active) {
+        bbsc_npc_own_active = true;
+        LOG_INFO(Debug, "BBSC own NPC quests: session (state {}) - {} NPC quest flags stay ours",
+                 state, BbscNpcQuestFlags.size());
+        BBSC_TIMELINE("QUEST", "own NPC quests on (state {})", state);
+    }
+    u32 last_key = 0;
+    u64 storage = 0;
+    size_t reverted = 0;
+    std::scoped_lock lock{bbsc_npc_own_mutex};
+    for (const u32 flag : BbscNpcQuestFlags) {
+        const u32 key = flag / 1000;
+        if (key != last_key) {
+            last_key = key;
+            storage = BbscFlagGroupStorage(key);
+        }
+        if (storage == 0) {
+            continue;
+        }
+        const bool now = BbscNpcFlagBit(storage, flag);
+        const auto own = bbsc_npc_own.find(flag);
+        if (own == bbsc_npc_own.end()) {
+            bbsc_npc_own.emplace(flag, now ? 1 : 0); // first seen: ours as it is
+            continue;
+        }
+        if (now != (own->second != 0)) {
+            SetBbscNpcFlagBit(storage, flag, own->second != 0);
+            ++reverted;
+            static std::vector<u32> logged;
+            if (logged.size() < 256 && std::ranges::find(logged, flag) == logged.end()) {
+                logged.push_back(flag);
+                LOG_INFO(Debug, "BBSC own NPC quests: flag {} came in as {} from the other player - "
+                                "ours ({}) put back",
+                         flag, now ? 1 : 0, own->second);
+                BBSC_TIMELINE("QUEST", "NPC flag {} from the other player put back to ours ({})",
+                              flag, own->second);
+            }
+        }
+    }
+    (void)reverted;
+}
+
 struct BbscWorldSnapshot {
     u32 map = 0;
     u32 snapshot = 0;
@@ -5583,6 +5797,7 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
             }
             std::memcpy(live, snap.groups[i].data(), BbscWorldGroupBytes);
             KeepBbscGuestTalkBits(key, before.data(), live);
+            KeepBbscNpcOwnBits(key, before.data(), live);
             if (snap.map == BbscDreamStateMap) {
                 keep_own_dream_messengers(key, before.data(), live);
             }
@@ -12567,6 +12782,7 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
     const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
     NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx),
                      caller_offset);
+    NoteBbscNpcOwnFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
     if (caller_offset == BbscTalkSetFlagReturnOffset) {
         NoteBbscLocalTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
     }
@@ -16780,6 +16996,7 @@ void ApplyBbscBellsAnywhere(const GuestRegisterSnapshot* registers) {
 void OnBbscCutsceneRequestHook(u64 offset, const GuestRegisterSnapshot& registers); // below
 void TickBbscCutsceneReplay();                                                    // below
 void TickBbscSharedKeyItems();                                                    // below
+void TickBbscNpcOwnQuests();                                                      // see "Each player's own NPC quests"
 
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
@@ -16847,6 +17064,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscBossLine();
         TickBbscCutsceneReplay();
         TickBbscSharedKeyItems();
+        TickBbscNpcOwnQuests();
         TickBbscProgressBroadcast();
         TickBbscOwnWorld();
         TickBbscEchoCounter();
