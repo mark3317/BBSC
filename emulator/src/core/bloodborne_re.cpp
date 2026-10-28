@@ -18375,9 +18375,15 @@ namespace {
 // a guest takes into its inventory the ones it does not own yet - at once, so it can buy the new
 // lines in the session. Inventory lookup 0x014D9E80(player + 0x328, type, id) -> slot or -1,
 // AddItem 0x014CDFD0(player + 0x1D0, type, id, count, 1, 1, 0); goods are type 0x40000000.
-constexpr std::array<u32, 21> BbscSharedKeyItems{
-    4000, 4006, 4009, 4010, 4012, 4013, 4015, 4018, 4019, 4020,       // keys
-    4110, 4111, 4112, 4113, 4114, 4115, 4116, 4117, 4118, 4119, 4120}; // hunter badges
+// Workshop tools (2026-10-29, playtest 2026-10-27 on the save "ddd"): two guests picked up the Rune
+// Workshop Tool in the host's world, got its window but not the item, and could no longer use the
+// Memory Altar at home - a softlock of their own saves. The tools are now shared like the keys: a
+// guest whose host owns one gets it (appended after the badges: older builds ignore the new bits).
+constexpr std::array<u32, 25> BbscSharedKeyItems{
+    4000, 4006, 4009, 4010, 4012, 4013, 4015, 4018, 4019, 4020,        // keys
+    4110, 4111, 4112, 4113, 4114, 4115, 4116, 4117, 4118, 4119, 4120,  // hunter badges
+    4102, 4103, 4104, 4105};                                           // workshop tools
+static_assert(BbscSharedKeyItems.size() <= 32, "the packet carries one bit per item in a u32");
 constexpr u8 BbscKeyItemsType = 0x29;
 constexpr u32 BbscGoodsType = 0x40000000;
 std::atomic<u32> bbsc_host_key_items{0};
