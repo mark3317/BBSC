@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git branch:*)",
+      "Bash(git add:*)", "Bash(git commit:*)", "Bash(git fetch:*)", "Bash(git submodule update:*)",
+      "Bash(grep:*)", "Bash(rg:*)", "Bash(ls:*)", "Bash(find:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)",
+      "Bash(python:*)", "Bash(py:*)",
+      "Bash(cmd /c emulator\\\\mod\\\\build-mod-bbport.cmd:*)", "Bash(cmd.exe /c emulator\\\\mod\\\\build-mod-bbport.cmd:*)",
+      "Bash(ssh remote_server:*)", "Bash(ssh local_pc:*)", "Bash(scp:*)"
+    ],
+    "deny": [
+      "Bash(git push origin:*)", "Bash(git push --force:*)", "Bash(git push -f:*)",
+      "Edit(D:\\Games\\Bloodborne\\game\\**)", "Write(D:\\Games\\Bloodborne\\game\\**)"
+    ]
+  }
+}
