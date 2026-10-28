@@ -6192,7 +6192,20 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked();
 // Runs inside game hooks (the join load): a filesystem error must never become an exception there.
 std::optional<BbscSaveSlot> BbscActiveSaveSlot() {
     try {
-        return BbscActiveSaveSlotUnchecked();
+        auto slot = BbscActiveSaveSlotUnchecked();
+        // Logged when the character first becomes known in this run, and when it changes (tests of
+        // LA-1/GI-2: the guest's journals need it).
+        static std::mutex mutex;
+        static std::optional<BbscSaveSlot> logged;
+        std::scoped_lock lock{mutex};
+        if (slot.has_value() &&
+            (!logged.has_value() || logged->user != slot->user || logged->slot != slot->slot)) {
+            logged = slot;
+            LOG_INFO(Debug, "BBSC save slot: playing user {} slot {} (BB_USER_DIR {})", slot->user,
+                     slot->slot, std::getenv("BB_USER_DIR") ? std::getenv("BB_USER_DIR") : "-");
+            BBSC_TIMELINE("SAVE", "save slot: user {} slot {}", slot->user, slot->slot);
+        }
+        return slot;
     } catch (const std::exception& e) {
         LOG_WARNING(Debug, "BBSC save slot: could not read the save folder ({})", e.what());
         return std::nullopt;
@@ -6205,8 +6218,20 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked() {
     // As shadPS4 picks its user folder: <working folder>\user when it exists (portable install),
     // else %APPDATA%\shadPS4 - never both (another window may play from the other one).
     std::vector<fs::path> bases{fs::current_path(ec) / "user"};
+    // BB_USER_DIR (2026-10-29, docs/study LA-1): the BBport launcher keeps the saves in its own user
+    // folder (Settings > user_dir, e.g. D:\Games\Bloodborne\ddd) and names it here; the port saves to
+    // <BB_USER_DIR>\savedata\<user>\CUSA00207. Without it the slot was never found on such installs
+    // (BBSC_SAVE_DIR is the launcher's copy made before the session, never written during the run),
+    // so the guest's own world, shared progress and guest items stayed in memory only.
+    const char* port_user_dir = std::getenv("BB_USER_DIR");
+    const bool port_user = port_user_dir != nullptr && port_user_dir[0] &&
+                           fs::is_directory(fs::path(port_user_dir) / "savedata", ec);
+    ec.clear();
+    if (port_user) {
+        bases = {fs::path(port_user_dir)};
+    }
 #ifdef _WIN32
-    if (!fs::is_directory(bases.front() / "home", ec) &&
+    if (!port_user && !fs::is_directory(bases.front() / "home", ec) &&
         !fs::is_directory(bases.front() / "savedata", ec)) {
         bases.clear();
         if (const char* appdata = std::getenv("APPDATA")) {
@@ -11384,6 +11409,11 @@ std::vector<u32> bbsc_progress_host_flags;                         // guest: hos
 std::map<u32, std::array<u8, BbscWorldGroupBytes>> bbsc_progress_groups; // guest: kind 1, OR-ed
 bool bbsc_progress_was_guest = false;
 void ApplyBbscTalkJournal(std::string_view when, bool finish); // "A guest's own quests"
+// The trip journal on disk (see "A guest's own quests"): our talks' flags, talk items and home awards.
+void WriteBbscTripJournal(const BbscSaveSlot& slot);
+bool LoadBbscTripJournal(const BbscSaveSlot& slot);
+void FinishBbscTripJournal(const BbscSaveSlot& slot);
+void DropBbscTripJournalMemory();
 s64 bbsc_progress_left_ms = 0;  // when we stopped being a guest
 s64 bbsc_progress_home_ms = 0;  // home and settled since
 bool bbsc_progress_merged_at_load = false; // merged during the trip home (checked once settled)
@@ -11615,10 +11645,14 @@ void FinishBbscPendingProgress() {
 void TickBbscSharedProgress() {
     static s64 last_ms = 0;
     const s64 now = SteadyNowMs();
-    if (!BbscSharedProgressEnabled() || image_base == 0 || now - last_ms < 1'000) {
+    // Runs with Shared Progress off too (2026-10-29, docs/study WS-3): the trip home also brings our
+    // own talks' flags, talk items and home awards, which are ours whatever the switch says. Off only
+    // stops the host's progress (boss flags, kind 1 groups) from being collected and merged.
+    if (image_base == 0 || now - last_ms < 1'000) {
         return;
     }
     last_ms = now;
+    const bool share = BbscSharedProgressEnabled();
     const s32 state = GetSessionState();
     const u64 global = GetGlobalState();
     const bool own_world = ReadablePointer(global, 0x1598) && ReadValue<u8>(global, 0x1592) != 0;
@@ -11641,18 +11675,31 @@ void TickBbscSharedProgress() {
         if (!bbsc_progress_slot.has_value()) {
             bbsc_progress_slot = BbscActiveSaveSlot();
             if (bbsc_progress_slot.has_value()) {
-                LoadBbscPendingProgress(*bbsc_progress_slot);
+                if (share) {
+                    LoadBbscPendingProgress(*bbsc_progress_slot);
+                }
+                LoadBbscTripJournal(*bbsc_progress_slot);
             }
         }
         if (now - file_written_ms >= BbscProgressFileMs) {
             file_written_ms = now;
-            WriteBbscPendingProgress();
+            if (share) {
+                WriteBbscPendingProgress();
+            }
+            if (bbsc_progress_slot.has_value()) {
+                WriteBbscTripJournal(*bbsc_progress_slot);
+            }
         }
         bbsc_progress_was_guest = true;
         bbsc_progress_left_ms = 0;
         bbsc_progress_home_ms = 0;
         bbsc_progress_merged_at_load = false;
         bbsc_progress_backed_up = false;
+        if (!share) {
+            std::scoped_lock lock{bbsc_progress_mutex};
+            bbsc_progress_host_flags.clear(); // the relay packets still bring them: not kept
+            return;
+        }
         // Kind 1 groups (indices 0..9) of every block snapshot the host sent.
         std::vector<BbscWorldSnapshot> blocks;
         {
@@ -11670,6 +11717,13 @@ void TickBbscSharedProgress() {
             // the workshop - the guest's own story. The host's Dream is only shown while the guest
             // is in it (ApplyBbscHostDreamState) and put back after (RestoreBbscOwnDreamState).
             if (snap.map == BbscDreamStateMap) {
+                continue;
+            }
+            // Not the Chalice Dungeons (2026-10-29, docs/study WS-1): every dungeon of a kind shares
+            // its map ids (m29_xx), so the host's doors and bosses of ITS dungeon would land in the
+            // guest's own dungeon with the same id. Dungeons are played together in the session (the
+            // sync shows the host's while there); the guest's own ones stay its own.
+            if (BbscMapArea(snap.map) == BbscChaliceArea) {
                 continue;
             }
             for (size_t i = 0; i < 10; ++i) {
@@ -11693,7 +11747,8 @@ void TickBbscSharedProgress() {
             recover_checked_ms = now;
             if (const auto slot = BbscActiveSaveSlot(); slot.has_value()) {
                 RecoverBbscOwnWorldFile(*slot); // our own world back before the host's is added
-                if (LoadBbscPendingProgress(*slot)) {
+                const bool pending = share && LoadBbscPendingProgress(*slot);
+                if (LoadBbscTripJournal(*slot) || pending) {
                     bbsc_progress_slot = slot;
                     bbsc_progress_was_guest = true;
                     bbsc_progress_left_ms = now;
@@ -11706,7 +11761,12 @@ void TickBbscSharedProgress() {
     }
     if (bbsc_progress_left_ms == 0) {
         bbsc_progress_left_ms = now;
-        WriteBbscPendingProgress(); // the session just ended: the newest state to disk
+        if (share) {
+            WriteBbscPendingProgress(); // the session just ended: the newest state to disk
+        }
+        if (bbsc_progress_slot.has_value()) {
+            WriteBbscTripJournal(*bbsc_progress_slot);
+        }
     }
     if (now - bbsc_progress_left_ms > BbscProgressHomeLimitMs) {
         std::scoped_lock lock{bbsc_progress_mutex};
@@ -11723,6 +11783,9 @@ void TickBbscSharedProgress() {
         bbsc_progress_host_flags.clear();
         bbsc_progress_groups.clear();
         bbsc_progress_was_guest = false;
+        if (bbsc_progress_slot.has_value()) {
+            DropBbscTripJournalMemory(); // it is in the file; read again the next time we are home
+        }
         bbsc_progress_slot.reset();
         return;
     }
@@ -11745,14 +11808,20 @@ void TickBbscSharedProgress() {
     const bool at_load = bbsc_progress_merged_at_load;
     bbsc_progress_merged_at_load = false;
     RestoreBbscOwnWorld("before the shared progress merge");
-    const auto [bosses, bits] = MergeBbscSharedProgress("after the home load");
+    const auto [bosses, bits] =
+        share ? MergeBbscSharedProgress("after the home load") : std::pair<s64, size_t>{-1, 0};
     ApplyBbscTalkJournal("after the home load", true);
     {
         std::scoped_lock lock{bbsc_progress_mutex};
         bbsc_progress_host_flags.clear();
         bbsc_progress_groups.clear();
     }
-    FinishBbscPendingProgress(); // merged: the file is done
+    if (share) {
+        FinishBbscPendingProgress(); // merged: the file is done
+    }
+    if (bbsc_progress_slot.has_value()) {
+        FinishBbscTripJournal(*bbsc_progress_slot);
+    }
     bbsc_progress_slot.reset();
     if (bosses < 0) {
         LOG_INFO(Debug, "BBSC shared progress: home again, nothing from the host to merge");
@@ -11780,8 +11849,7 @@ void TickBbscSharedProgress() {
 // there, so the map comes up with the host's progress already in it. The tick above checks again
 // once we are settled (and merges whatever did not stick, should the own-world table come later).
 void ApplyBbscSharedProgressAtLoad() {
-    if (!BbscSharedProgressEnabled() || image_base == 0 || !bbsc_progress_was_guest ||
-        bbsc_progress_merged_at_load) {
+    if (image_base == 0 || !bbsc_progress_was_guest || bbsc_progress_merged_at_load) {
         return;
     }
     const s32 state = GetSessionState();
@@ -11792,7 +11860,9 @@ void ApplyBbscSharedProgressAtLoad() {
         return; // not home yet, or our own Dream state still to be put back (the tick merges then)
     }
     RestoreBbscOwnWorldAtLoad(); // our own world first, then the host's progress on top
-    const auto [bosses, bits] = MergeBbscSharedProgress("during the home load");
+    const auto [bosses, bits] = BbscSharedProgressEnabled()
+                                    ? MergeBbscSharedProgress("during the home load")
+                                    : std::pair<s64, size_t>{-1, 0};
     ApplyBbscTalkJournal("during the home load", false);
     bbsc_progress_merged_at_load = bosses >= 0;
 }
@@ -12805,6 +12875,167 @@ void ApplyBbscTalkJournal(std::string_view when, bool finish) {
                     "our own world", when, journal.size());
     BBSC_TIMELINE("QUEST", "{}: {} flag(s) of our talks in the host's world are now in our own world",
                   when, journal.size());
+}
+
+// ---- The trip journal on disk (2026-10-29, docs/study WS-2) ---------------------------------------
+// The talk journal, the talk items and the home awards lived in memory only: a crash or a quit while
+// a guest lost half a quest step (the global flags were saved, the map flags and the promised items
+// not) and every blood gem / rune "given in your own world". They now go to
+// <mod>/shared-progress/journal-<user>-<slot>.bin next to the pending progress (every 10 s while a
+// guest, and when the session ends), are read back the next time that character is home, and the
+// file becomes ".applied" once the trip home has written them. Flags are written once (as before),
+// items and awards are given once: the file is only read while memory holds none of them.
+constexpr u32 BbscTripJournalMagic = 0x4A544242; // "BBTJ"
+constexpr u32 BbscTripJournalVersion = 1;
+
+std::filesystem::path BbscTripJournalPath(const BbscSaveSlot& slot) {
+    return Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
+           "shared-progress" / fmt::format("journal-{}-{}.bin", slot.user, slot.slot);
+}
+
+void WriteBbscTripJournal(const BbscSaveSlot& slot) {
+    std::vector<u8> out;
+    const auto put32 = [&out](u32 v) {
+        const size_t at = out.size();
+        out.resize(at + 4);
+        std::memcpy(out.data() + at, &v, 4);
+    };
+    const auto put_items = [&](const std::vector<BbscTalkItem>& items) {
+        put32(static_cast<u32>(items.size()));
+        for (const auto& item : items) {
+            put32(item.type);
+            put32(item.id);
+            put32(static_cast<u32>(item.count));
+        }
+    };
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex, bbsc_home_award_mutex};
+        if (bbsc_talk_journal.empty() && bbsc_talk_items_meant.empty() && bbsc_home_awards.empty()) {
+            return;
+        }
+        put32(BbscTripJournalMagic);
+        put32(BbscTripJournalVersion);
+        put32(static_cast<u32>(bbsc_talk_journal.size()));
+        for (const auto& [flag, value] : bbsc_talk_journal) {
+            put32(flag);
+            put32(value);
+        }
+        put_items(bbsc_talk_items_meant);
+        put_items(bbsc_talk_items_added);
+        put32(static_cast<u32>(bbsc_home_awards.size()));
+        for (const s32 lot : bbsc_home_awards) {
+            put32(static_cast<u32>(lot));
+        }
+    }
+    std::error_code ec;
+    const auto path = BbscTripJournalPath(slot);
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const auto temp = std::filesystem::path(path).concat(".tmp");
+    {
+        std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+        if (!file) {
+            return;
+        }
+    }
+    std::filesystem::rename(temp, path, ec);
+}
+
+bool LoadBbscTripJournal(const BbscSaveSlot& slot) {
+    std::ifstream file(BbscTripJournalPath(slot), std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    const auto get32 = [&file](u32& v) {
+        return static_cast<bool>(file.read(reinterpret_cast<char*>(&v), 4));
+    };
+    u32 magic = 0;
+    u32 version = 0;
+    u32 count = 0;
+    if (!get32(magic) || magic != BbscTripJournalMagic || !get32(version) ||
+        version != BbscTripJournalVersion || !get32(count) || count > 4096) {
+        LOG_WARNING(Debug, "BBSC own quests: the trip journal of user {} slot {} is not readable",
+                    slot.user, slot.slot);
+        return false;
+    }
+    std::map<u32, u8> journal;
+    for (u32 i = 0; i < count; ++i) {
+        u32 flag = 0;
+        u32 value = 0;
+        if (!get32(flag) || !get32(value)) {
+            return false;
+        }
+        journal[flag] = static_cast<u8>(value);
+    }
+    const auto get_items = [&](std::vector<BbscTalkItem>& items) {
+        u32 n = 0;
+        if (!get32(n) || n > 1024) {
+            return false;
+        }
+        for (u32 i = 0; i < n; ++i) {
+            BbscTalkItem item{};
+            u32 item_count = 0;
+            if (!get32(item.type) || !get32(item.id) || !get32(item_count)) {
+                return false;
+            }
+            item.count = static_cast<s32>(item_count);
+            items.push_back(item);
+        }
+        return true;
+    };
+    std::vector<BbscTalkItem> meant;
+    std::vector<BbscTalkItem> added;
+    std::vector<s32> awards;
+    if (!get_items(meant) || !get_items(added) || !get32(count) || count > 64) {
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        u32 lot = 0;
+        if (!get32(lot)) {
+            return false;
+        }
+        awards.push_back(static_cast<s32>(lot));
+    }
+    size_t items_taken = 0;
+    {
+        std::scoped_lock lock{bbsc_talk_journal_mutex, bbsc_home_award_mutex};
+        for (const auto& [flag, value] : journal) {
+            bbsc_talk_journal.try_emplace(flag, value); // what this run noted since is newer
+        }
+        // Items and awards are given once: only when this run holds none of its own yet.
+        if (bbsc_talk_items_meant.empty() && bbsc_talk_items_added.empty() && bbsc_home_awards.empty()) {
+            bbsc_talk_items_meant = std::move(meant);
+            bbsc_talk_items_added = std::move(added);
+            bbsc_home_awards = std::move(awards);
+            items_taken = bbsc_talk_items_meant.size() + bbsc_home_awards.size();
+        }
+    }
+    LOG_INFO(Debug, "BBSC own quests: trip journal of user {} slot {} read - {} talk flag(s), {} "
+                    "item(s)/award(s) still to give at home",
+             slot.user, slot.slot, journal.size(), items_taken);
+    BBSC_TIMELINE("QUEST", "trip journal of user {} slot {} read: {} flag(s), {} item(s)/award(s)",
+                  slot.user, slot.slot, journal.size(), items_taken);
+    return true;
+}
+
+// The trip home wrote it: kept as ".applied" (the last one only).
+void FinishBbscTripJournal(const BbscSaveSlot& slot) {
+    std::error_code ec;
+    const auto path = BbscTripJournalPath(slot);
+    if (std::filesystem::exists(path, ec)) {
+        const auto done = std::filesystem::path(path).concat(".applied");
+        std::filesystem::remove(done, ec);
+        std::filesystem::rename(path, done, ec);
+    }
+}
+
+void DropBbscTripJournalMemory() {
+    std::scoped_lock lock{bbsc_talk_journal_mutex, bbsc_home_award_mutex};
+    bbsc_talk_journal.clear();
+    bbsc_talk_journal_written = false;
+    bbsc_talk_items_meant.clear();
+    bbsc_talk_items_added.clear();
+    bbsc_home_awards.clear();
 }
 
 // Research 2026-10-27 (quest flags of a guest's talks): every event flag set, in a session, once
