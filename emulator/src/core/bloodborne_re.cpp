@@ -5445,6 +5445,13 @@ bool IsBbscNpcQuestFlag(u32 flag) {
     return std::binary_search(BbscNpcQuestFlags.begin(), BbscNpcQuestFlags.end(), flag);
 }
 
+// The item ledger (see "The item ledger"): who gave an item, for its entries and log lines.
+enum class BbscLedgerSource : u8 { Give = 1, Pickup, Award, Drop, Boss, Talk, Key, Retro, Legacy };
+void NoteBbscLedgerGiven(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s32 count);
+void NoteBbscLedgerLot(s32 lot, u32 code);
+void NoteBbscLedgerPickupFlag(u32 flag);
+bool BbscLedgerOwnAwardFlag(u32 flag);
+
 std::mutex bbsc_npc_own_mutex;
 std::unordered_map<u32, u8> bbsc_npc_own; // flag -> our own value in this session
 bool bbsc_npc_own_active = false;
@@ -5512,6 +5519,17 @@ void RevertBbscNpcOwnFlags() {
             continue;
         }
         if (now != (own->second != 0)) {
+            // K3 (2026-10-29, PT-5): the get flag of a lot our own game just awarded (Valtr's
+            // Impurity 6676, League Staff 6678) is set inside the give, not through SetFlag - it
+            // was put back to 0 here, so the event gave the rune again at every load.
+            if (now && BbscLedgerOwnAwardFlag(flag)) {
+                own->second = 1;
+                LOG_INFO(Debug, "BBSC own NPC quests: flag {} was set by our own item award - "
+                                "ours now (not put back)",
+                         flag);
+                BBSC_TIMELINE("QUEST", "NPC flag {} set by our own award - kept", flag);
+                continue;
+            }
             SetBbscNpcFlagBit(storage, flag, own->second != 0);
             ++reverted;
             static std::vector<u32> logged;
@@ -6897,6 +6915,12 @@ void ApplyBbscGuestLootView(u32 packed_map, std::string_view why) {
                     bbsc_loot_dirty |= picked != 0;
                     if (picked != 0) {
                         MarkBbscTakenInOwnWorld(key, b, picked);
+                        for (u32 bit = 0; bit < 8; ++bit) {
+                            if ((picked & (0x80u >> bit)) != 0) {
+                                NoteBbscLedgerPickupFlag(key * 1000 + static_cast<u32>(b) * 8 +
+                                                         bit);
+                            }
+                        }
                     }
                 }
                 const u8 gone = static_cast<u8>(group.taken[b] | own[b]);
@@ -6952,6 +6976,11 @@ void CaptureBbscGuestLoot() {
                 group.written[b] |= picked;
                 picked_total += std::popcount(picked);
                 MarkBbscTakenInOwnWorld(key, b, picked);
+                for (u32 bit = 0; bit < 8; ++bit) {
+                    if ((picked & (0x80u >> bit)) != 0) {
+                        NoteBbscLedgerPickupFlag(key * 1000 + static_cast<u32>(b) * 8 + bit);
+                    }
+                }
             }
         }
     }
@@ -10661,7 +10690,6 @@ constexpr u64 AwardItemLotOffset = 0x017DDC50; // (item man, lot, 0) as the 2003
 std::mutex bbsc_boss_reward_mutex;
 std::vector<s64> bbsc_boss_reward_queue; // events whose reward is due (filled in the hook)
 std::vector<s64> bbsc_boss_reward_given; // events already rewarded in this game run
-std::vector<u32> bbsc_boss_goods_check;   // boss goods given in a session, checked once home
 
 void NoteBbscBossRewardEvent(s64 event) {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_GUEST_ITEMS");
@@ -10732,51 +10760,15 @@ bool GiveBbscBossGoods(const BbscBossGoodsLot& lot) {
                     "now: {}, get flag {})",
              lot.goods, lot.count, fits, slot, there, lot.flag);
     if (there) {
-        std::scoped_lock lock{bbsc_boss_reward_mutex};
-        bbsc_boss_goods_check.push_back(lot.goods);
-    }
-    return there;
-}
-
-// 2026-10-20 (test5: "the guest didn't get the Sword Hunter Badge", while the log says it was put in
-// at 19:07:07, 8 s before the session ended): once home after the session, check the boss goods
-// given in it are still carried, so the next log says whether the trip home took them.
-void TickBbscBossGoodsCheck() {
-    static s64 home_since_ms = 0;
-    std::vector<u32> goods;
-    {
-        std::scoped_lock lock{bbsc_boss_reward_mutex};
-        if (bbsc_boss_goods_check.empty()) {
-            home_since_ms = 0;
-            return;
+        // 2026-10-20 (test5: the Sword Hunter Badge "put in" 8 s before the session ended was not
+        // there at home): the item ledger now checks it once home and gives it back if the trip
+        // home took it.
+        NoteBbscLedgerGiven(BbscLedgerSource::Boss, lot.lot, lot.flag, code, lot.count);
+        if (lot.flag != 0) {
+            NoteBbscLedgerLot(lot.lot, code);
         }
     }
-    const u64 global = GetGlobalState();
-    const s64 now = SteadyNowMs();
-    if (GetSessionState() != 0 || !ReadablePointer(global, 0x1593) ||
-        ReadValue<u8>(global, 0x08) != 0 || ReadValue<u8>(global, 0x1592) == 0 ||
-        GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
-        home_since_ms = 0;
-        return;
-    }
-    if (home_since_ms == 0) {
-        home_since_ms = now;
-    }
-    if (now - home_since_ms < 5'000) {
-        return;
-    }
-    {
-        std::scoped_lock lock{bbsc_boss_reward_mutex};
-        goods.swap(bbsc_boss_goods_check);
-    }
-    const u64 carried = BbscCarriedInventory();
-    for (const u32 id : goods) {
-        const bool kept = carried != 0 && BbscInventoryHas(carried, 0x40000000u | id);
-        LOG_INFO(Debug, "BBSC boss drop: goods {} after the trip home - {}", id,
-                 kept ? "still in the carried items" : "NOT in the carried items any more");
-        BBSC_TIMELINE("BOSS", "boss drop: goods {} after the trip home - {}", id,
-                      kept ? "still in the carried items" : "NOT in the carried items any more");
-    }
+    return there;
 }
 
 // Game tick: award the queued boss lots, once each.
@@ -11075,10 +11067,11 @@ void ShowBbscItemPopup(u32 type, u32 id, s32 count, std::string_view what) {
 }
 
 bool bbsc_popup_hook_ready = false; // see "Awards to a guest in the host's world"
-std::mutex bbsc_home_award_mutex;
-std::vector<s32> bbsc_home_awards; // lots a guest gets once home (blood gems, runes)
+void NoteBbscLedgerOwed(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s32 count,
+                        std::string_view why); // see "The item ledger"
 
 void GiveBbscGuestDrop(s32 lot, u32 name) {
+    const BbscLedgerSource source = name != 0 ? BbscLedgerSource::Drop : BbscLedgerSource::Award;
     static std::mt19937 rng{static_cast<u32>(SteadyNowMs())};
     const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
     const u64 row = table != 0 ? BbscParamRow(table, static_cast<u32>(lot), ItemLotRowSize) : 0;
@@ -11149,19 +11142,22 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
         BBSC_TIMELINE("ITEMS", "guest drop: {} {} from lot {} {}", category == 0 ? "weapon" : "attire",
                       item, lot, there ? "added" : "not taken");
         if (there) {
+            const u32 code = type | static_cast<u32>(item);
+            NoteBbscLedgerGiven(source, lot, flag > 0 ? static_cast<u32>(flag) : 0, code, count);
+            if (flag > 0) {
+                NoteBbscLedgerLot(lot, code);
+            }
             ShowBbscItemPopup(type, static_cast<u32>(item), count, "guest item");
         }
         return;
     }
     if (category != 4) {
-        // Blood gems and runes (8), category 15: only the award makes them; it runs at home, where
-        // its popup works as for any host.
-        {
-            std::scoped_lock lock{bbsc_home_award_mutex};
-            if (bbsc_home_awards.size() < 64) {
-                bbsc_home_awards.push_back(lot);
-            }
-        }
+        // Blood gems and runes (8), category 15: only the award makes them. A lot holding them is
+        // given by the game's own award in the host's world (BbscGuestAwardHook); this is only
+        // reached when that award gave nothing - then the ledger owes it until home (the list of
+        // 64 lots in memory, which dropped the rest silently, is gone).
+        NoteBbscLedgerOwed(source, lot, flag > 0 ? static_cast<u32>(flag) : 0, 0, 1,
+                           category == 8 ? "blood gem / rune" : "category 15 item");
         LOG_INFO(Debug, "BBSC guest drop: a {} (id {}, lot {}) - awarded once we are home",
                  category == 8 ? "blood gem / rune" : "category 15 item", item, lot);
         BBSC_TIMELINE("ITEMS", "guest drop: lot {} (category {}) kept until home", lot, category);
@@ -11182,6 +11178,11 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
     BBSC_TIMELINE("ITEMS", "guest drop: goods {} x{} from lot {} {}", item, count, lot,
                   slot >= 0 ? "added" : "did not fit");
     if (slot >= 0) {
+        const u32 code = 0x40000000u | static_cast<u32>(item);
+        NoteBbscLedgerGiven(source, lot, flag > 0 ? static_cast<u32>(flag) : 0, code, count);
+        if (flag > 0) {
+            NoteBbscLedgerLot(lot, code);
+        }
         ShowBbscItemPopup(0x40000000u, static_cast<u32>(item), count, name != 0 ? "enemy drop" : "award");
     }
 }
@@ -11280,6 +11281,928 @@ bool SkipBbscOthersTalkGift(s32 lot) {
 bool BbscEventActionNotOurs(u64 caller_offset); // see "Talk-driven events are each player's own"
 s64 BbscCurrentEventRunId();
 
+// ---- The item ledger (2026-10-29, K2+K3, docs/fixes/K2-items.md) --------------------------------
+// Playtest 2026-10-27: two guests picked up the Rune Workshop Tool in the host's world - the game's
+// window came, the tool was not with them at home (PT-1); the Impurity rune never reached the
+// guests and reached the host again at every load (PT-5). An item reached a guest six ways (the
+// pickup, the award hook, enemy drops, boss rewards, talks, shared keys), two of them through
+// "given at home" lists in memory, and nothing ever looked at the inventory afterwards. Now every
+// way writes here, per character (save slot), on disk:
+//   * "Given": an item that entered our inventory while a guest in a host's world - the give
+//     0x017D89F0 queues its window 0x016D8850 (from 0x017D9348 / 0x017D94C7) only after its add
+//     worked, so that window is the record of the game's own pickups and awards; BBSC's own adds
+//     note theirs. 1.5 s later it must be carried or stored (BBSC CHECK FAIL K2-window-no-item
+//     otherwise, and it is owed). Its count is kept while we are in the host's world.
+//   * Home again and settled (5 s): every given item is counted once more. Fewer than in the host's
+//     world means the trip home took them (while a guest, the save is the own-world snapshot) -
+//     BBSC CHECK FAIL K2-lost-on-trip-home, and the difference (at most what the trip gave) is
+//     given back. Then the given entries are done.
+//   * "Owed": to give at home, once - a talk's item window without its add, an award the host's
+//     world could not make, the old trip journal's lists, items lost on the way.
+//   * One-time lots (with a get flag) a character got: an award of one again while its item is
+//     still here is skipped and its flags set (BBSC CHECK FAIL K3-repeat), for the host too; and the
+//     get flags our own award sets are ours for the NPC quest flag guard (see RevertBbscNpcOwnFlags).
+//   * Once per character and run, at home: the guest-items file (items taken in hosts' worlds) is
+//     looked through for keys, workshop tools, badges and chalices that are neither carried nor
+//     stored - those are given (the players who lost one before this fix, user decision).
+// File: <mod>/item-ledger/ledger-<user>-<slot>.bin (written at most every 2 s while it changes).
+enum class BbscLedgerState : u8 { Given = 1, Owed = 2 };
+
+struct BbscLedgerEntry {
+    BbscLedgerSource source{};
+    BbscLedgerState state{};
+    u8 tries = 0;     // owed: deliveries tried at home
+    s32 lot = 0;      // item lot, 0 when not known
+    u32 flag = 0;     // its get flag, 0 none
+    u32 code = 0;     // item category bits | id (0x40000000 goods); 0 when only the lot is known
+    s32 count = 0;
+    s64 noted_ms = 0; // not on disk: when it was noted
+    s64 check_ms = 0; // not on disk: given - when to look for it (0 = done)
+};
+
+constexpr u32 BbscLedgerMagic = 0x4C494242; // "BBIL"
+constexpr u32 BbscLedgerVersion = 1;
+std::mutex bbsc_ledger_mutex;
+std::vector<BbscLedgerEntry> bbsc_ledger;
+std::map<u32, s32> bbsc_ledger_host_counts; // code -> carried + stored, last seen in a host's world
+std::map<s32, u32> bbsc_ledger_lots;        // one-time lots this character got -> item code (0 unknown)
+std::map<u32, u8> bbsc_ledger_retro;        // taken flags the retro sweep has looked at
+std::optional<BbscSaveSlot> bbsc_ledger_slot;
+bool bbsc_ledger_dirty = false;
+// The award / pickup give running now (game thread): set at their entry, finished at the next tick.
+struct BbscLedgerContext {
+    BbscLedgerSource source{};
+    s32 lot = 0;
+    u32 flag = 0;
+    u32 gives = 0;      // item windows of the give since
+    bool check = false; // a sure lot: no window by the next tick = the award gave nothing
+};
+std::optional<BbscLedgerContext> bbsc_ledger_context;
+bool bbsc_ledger_regive = false;     // BBSC's own award at home: never a repeat
+bool bbsc_ledger_drop_award = false; // TickBbscGuestDrops awards an enemy's lot
+std::unordered_map<u32, s64> bbsc_ledger_own_flags; // NPC quest get flag -> our own award's time
+constexpr u64 BbscGiveWindowReturn1 = 0x017D934D; // after the give's two window calls
+constexpr u64 BbscGiveWindowReturn2 = 0x017D94CC;
+
+u64 BbscStorageInventory();                                       // see "Restock"
+s32 BbscInventoryCount(u64 inventory, u32 code);                  // see "Restock"
+u64 BbscCheckedParamRow(u64 table, u16 count, u64 offset, size_t size); // see "Kit"
+void LoadBbscGuestLootFile();                                     // see "Guest loot view"
+
+std::string_view BbscLedgerSourceName(BbscLedgerSource source) {
+    static constexpr std::array<std::string_view, 10> Names{
+        "?", "give", "pickup", "award", "enemy drop", "boss", "talk", "shared key", "retro",
+        "old journal"};
+    const size_t i = static_cast<size_t>(source);
+    return i < Names.size() ? Names[i] : Names[0];
+}
+
+// Gems, runes and category 15 items: no AddItem, no reliable count (an instance per item).
+bool BbscLedgerAddable(u32 code) {
+    const u32 type = code >> 28;
+    return type == 0 || type == 1 || type == 2 || type == 4;
+}
+
+s32 BbscLedgerCount(u32 code) {
+    s32 total = 0;
+    if (const u64 carried = BbscCarriedInventory(); carried != 0) {
+        total += std::max(BbscInventoryCount(carried, code), 0);
+    }
+    if (const u64 stored = BbscStorageInventory(); stored != 0) {
+        total += std::max(BbscInventoryCount(stored, code), 0);
+    }
+    return total;
+}
+
+// AddItem 0x014CDFD0(player data + 0x1D0, type, id, 1, 1, 1, 0), one at a time as a talk's c1_52
+// does; true when the count went up by `count`.
+bool AddBbscLedgerItem(u32 code, s32 count) {
+    const u64 game_data = ReadValue<u64>(image_base + 0x0553B130, 0);
+    const u64 player = ReadablePointer(game_data, 0x10) ? ReadValue<u64>(game_data, 8) : 0;
+    if (!ReadablePointer(player, 0x3B8) || !BbscLedgerAddable(code) || count <= 0) {
+        return false;
+    }
+    const s32 before = BbscLedgerCount(code);
+    using AddItem = u64 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id, s32 count, u32, u32, u32);
+    const auto add = reinterpret_cast<AddItem>(image_base + 0x014CDFD0);
+    for (s32 i = 0; i < std::min(count, 99); ++i) {
+        add(player + 0x1D0, code & 0xF0000000u, code & 0x0FFFFFFFu, 1, 1, 1, 0);
+    }
+    return BbscLedgerCount(code) >= before + std::min(count, 99);
+}
+
+void SetBbscLedgerFlag(u32 flag, u8 value) {
+    using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+    reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, flag, value);
+}
+
+u64 BbscLedgerLotRow(s32 lot) {
+    const u64 table = lot > 0 ? BbscGameParamTable("ITEMLOT_PARAM_ST") : 0;
+    return table != 0 ? BbscParamRow(table, static_cast<u32>(lot), ItemLotRowSize) : 0;
+}
+
+// Every get flag of a lot row: getItemFlagId01-08 (+0x60) and getItemFlagId (+0x80).
+std::vector<u32> BbscLotFlags(u64 row) {
+    std::vector<u32> flags;
+    for (u32 i = 0; i <= 8; ++i) {
+        const s32 flag = ReadValue<s32>(row, i < 8 ? 0x60 + i * 4 : 0x80);
+        if (flag > 0 && std::ranges::find(flags, static_cast<u32>(flag)) == flags.end()) {
+            flags.push_back(static_cast<u32>(flag));
+        }
+    }
+    return flags;
+}
+
+u32 BbscLotMainFlag(u64 row) {
+    const s32 lot_flag = ReadValue<s32>(row, 0x80);
+    if (lot_flag > 0) {
+        return static_cast<u32>(lot_flag);
+    }
+    const auto flags = BbscLotFlags(row);
+    return flags.empty() ? 0 : flags.front();
+}
+
+bool BbscLotHasGem(u64 row) {
+    for (u32 i = 0; i < 8; ++i) {
+        const u32 category = ReadValue<u32>(row, 0x20 + i * 4);
+        if (ReadValue<s32>(row, i * 4) > 0 && (category == 8 || category == 15)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Every roll gives something (no "nothing" weight): an award that gave nothing failed.
+bool BbscLotIsSure(u64 row) {
+    u32 total = 0;
+    u32 items = 0;
+    for (u32 i = 0; i < 8; ++i) {
+        const u32 weight = ReadValue<u16>(row, 0x40 + i * 2);
+        total += weight;
+        if (ReadValue<s32>(row, i * 4) > 0 && ReadValue<u32>(row, 0x20 + i * 4) != 0xFFFFFFFFu) {
+            items += weight;
+        }
+    }
+    return total != 0 && items == total;
+}
+
+// The lot whose get flag `flag` is (built once from the game's ItemLotParam), 0 when none.
+s32 BbscLotOfFlag(u32 flag) {
+    static std::unordered_map<u32, s32> lots;
+    if (lots.empty()) {
+        const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
+        const u16 count = table != 0 ? ReadValue<u16>(table, 0x0A) : 0;
+        for (u32 i = 0; i < count; ++i) {
+            const u64 entry = table + 0x40 + static_cast<u64>(i) * 0x18;
+            const u64 row = BbscCheckedParamRow(table, count, ReadValue<u64>(entry, 8), ItemLotRowSize);
+            if (row == 0) {
+                continue;
+            }
+            for (const u32 f : BbscLotFlags(row)) {
+                lots.try_emplace(f, static_cast<s32>(ReadValue<u32>(entry, 0)));
+            }
+        }
+    }
+    const auto it = lots.find(flag);
+    return it != lots.end() ? it->second : 0;
+}
+
+std::filesystem::path BbscLedgerPath(const BbscSaveSlot& slot) {
+    return Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
+           "item-ledger" / fmt::format("ledger-{}-{}.bin", slot.user, slot.slot);
+}
+
+// Caller holds bbsc_ledger_mutex.
+void WriteBbscLedgerLocked() {
+    if (!bbsc_ledger_slot.has_value()) {
+        return;
+    }
+    bbsc_ledger_dirty = false;
+    std::vector<u8> out;
+    const auto put32 = [&out](u32 v) {
+        const size_t at = out.size();
+        out.resize(at + 4);
+        std::memcpy(out.data() + at, &v, 4);
+    };
+    put32(BbscLedgerMagic);
+    put32(BbscLedgerVersion);
+    put32(static_cast<u32>(bbsc_ledger.size()));
+    for (const auto& e : bbsc_ledger) {
+        put32(static_cast<u32>(e.source) | (static_cast<u32>(e.state) << 8) |
+              (static_cast<u32>(e.tries) << 16));
+        put32(static_cast<u32>(e.lot));
+        put32(e.flag);
+        put32(e.code);
+        put32(static_cast<u32>(e.count));
+    }
+    put32(static_cast<u32>(bbsc_ledger_host_counts.size()));
+    for (const auto& [code, count] : bbsc_ledger_host_counts) {
+        put32(code);
+        put32(static_cast<u32>(count));
+    }
+    put32(static_cast<u32>(bbsc_ledger_lots.size()));
+    for (const auto& [lot, code] : bbsc_ledger_lots) {
+        put32(static_cast<u32>(lot));
+        put32(code);
+    }
+    put32(static_cast<u32>(bbsc_ledger_retro.size()));
+    for (const auto& [flag, done] : bbsc_ledger_retro) {
+        put32(flag);
+    }
+    std::error_code ec;
+    const auto path = BbscLedgerPath(*bbsc_ledger_slot);
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const auto temp = std::filesystem::path(path).concat(".tmp");
+    {
+        std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+        if (!file) {
+            return;
+        }
+    }
+    std::filesystem::rename(temp, path, ec);
+}
+
+// Caller holds bbsc_ledger_mutex. What the file holds is added to what this run noted already.
+void LoadBbscLedgerLocked(const BbscSaveSlot& slot) {
+    std::ifstream file(BbscLedgerPath(slot), std::ios::binary);
+    const auto get32 = [&file](u32& v) {
+        return static_cast<bool>(file.read(reinterpret_cast<char*>(&v), 4));
+    };
+    u32 magic = 0;
+    u32 version = 0;
+    u32 count = 0;
+    if (!file || !get32(magic) || magic != BbscLedgerMagic || !get32(version) ||
+        version != BbscLedgerVersion || !get32(count) || count > 4096) {
+        LOG_INFO(Debug, "BBSC ledger: user {} slot {} has no item ledger yet", slot.user, slot.slot);
+        return;
+    }
+    std::vector<BbscLedgerEntry> entries;
+    for (u32 i = 0; i < count; ++i) {
+        u32 kind = 0;
+        u32 lot = 0;
+        u32 entry_count = 0;
+        BbscLedgerEntry e{};
+        if (!get32(kind) || !get32(lot) || !get32(e.flag) || !get32(e.code) || !get32(entry_count)) {
+            return;
+        }
+        e.source = static_cast<BbscLedgerSource>(kind & 0xFF);
+        e.state = static_cast<BbscLedgerState>((kind >> 8) & 0xFF);
+        e.tries = static_cast<u8>((kind >> 16) & 0xFF);
+        e.lot = static_cast<s32>(lot);
+        e.count = static_cast<s32>(entry_count);
+        e.noted_ms = SteadyNowMs();
+        entries.push_back(e);
+    }
+    const auto get_pairs = [&](auto&& put) {
+        u32 n = 0;
+        if (!get32(n) || n > 65536) {
+            return false;
+        }
+        for (u32 i = 0; i < n; ++i) {
+            u32 a = 0;
+            u32 b = 0;
+            if (!get32(a) || !get32(b)) {
+                return false;
+            }
+            put(a, b);
+        }
+        return true;
+    };
+    get_pairs([](u32 code, u32 n) { bbsc_ledger_host_counts.try_emplace(code, static_cast<s32>(n)); });
+    get_pairs([](u32 lot, u32 code) { bbsc_ledger_lots.try_emplace(static_cast<s32>(lot), code); });
+    u32 n = 0;
+    if (get32(n) && n <= 65536) {
+        for (u32 i = 0; i < n; ++i) {
+            u32 flag = 0;
+            if (!get32(flag)) {
+                break;
+            }
+            bbsc_ledger_retro[flag] = 1;
+        }
+    }
+    bbsc_ledger.insert(bbsc_ledger.begin(), entries.begin(), entries.end());
+    LOG_INFO(Debug, "BBSC ledger: user {} slot {} read - {} entr(ies) open, {} one-time lot(s), {} "
+                    "taken flag(s) looked through",
+             slot.user, slot.slot, entries.size(), bbsc_ledger_lots.size(), bbsc_ledger_retro.size());
+    BBSC_TIMELINE("ITEMS", "ledger of user {} slot {} read: {} open, {} one-time lot(s)", slot.user,
+                  slot.slot, entries.size(), bbsc_ledger_lots.size());
+}
+
+// The character being played (every 2 s): a new one gets its own ledger.
+void SyncBbscLedgerSlot() {
+    const auto slot = BbscActiveSaveSlot();
+    if (!slot.has_value()) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    if (bbsc_ledger_slot.has_value() && bbsc_ledger_slot->user == slot->user &&
+        bbsc_ledger_slot->slot == slot->slot) {
+        return;
+    }
+    if (bbsc_ledger_slot.has_value()) {
+        WriteBbscLedgerLocked(); // the other character's, then start over
+        bbsc_ledger.clear();
+        bbsc_ledger_host_counts.clear();
+        bbsc_ledger_lots.clear();
+        bbsc_ledger_retro.clear();
+    }
+    bbsc_ledger_slot = slot; // what was noted before the slot was known is this character's
+    LoadBbscLedgerLocked(*slot);
+    bbsc_ledger_dirty = true;
+}
+
+void NoteBbscLedgerGiven(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s32 count) {
+    if (image_base == 0 || code == 0 || count <= 0 || !BbscGuestInHostWorld()) {
+        return;
+    }
+    const s32 now_count = BbscLedgerCount(code);
+    const s64 now = SteadyNowMs();
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        if (bbsc_ledger.size() >= 4096) {
+            LOG_ERROR(Debug, "BBSC CHECK FAIL K2-ledger-full: {} {:#x} x{} not noted",
+                      BbscLedgerSourceName(source), code, count);
+            return;
+        }
+        bbsc_ledger.push_back({source, BbscLedgerState::Given, 0, lot, flag, code, count, now,
+                               now + 1'500});
+        bbsc_ledger_host_counts[code] = now_count;
+        bbsc_ledger_dirty = true;
+    }
+    LOG_INFO(Debug, "BBSC ledger: {} {:#x} x{} given in the host's world (lot {}, flag {}; {} carried "
+                    "+ stored now)",
+             BbscLedgerSourceName(source), code, count, lot, flag, now_count);
+    BBSC_TIMELINE("ITEMS", "ledger: {} {:#x} x{} given in the host's world (lot {})",
+                  BbscLedgerSourceName(source), code, count, lot);
+}
+
+void NoteBbscLedgerOwed(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s32 count,
+                        std::string_view why) {
+    if (code == 0 && lot <= 0) {
+        return;
+    }
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        if (lot > 0 && flag != 0) {
+            const bool known = bbsc_ledger_lots.contains(lot) ||
+                               std::ranges::any_of(bbsc_ledger, [lot](const BbscLedgerEntry& e) {
+                                   return e.lot == lot && e.state == BbscLedgerState::Owed;
+                               });
+            if (known) {
+                LOG_WARNING(Debug, "BBSC CHECK FAIL K3-repeat: one-time lot {} (flag {}) owed again "
+                                   "({}, {}) - already given or owed, not again",
+                            lot, flag, BbscLedgerSourceName(source), why);
+                BBSC_TIMELINE("CHECK", "K3-repeat: lot {} owed again - not again", lot);
+                return;
+            }
+        }
+        if (bbsc_ledger.size() >= 4096) {
+            LOG_ERROR(Debug, "BBSC CHECK FAIL K2-ledger-full: lot {} {:#x} not owed", lot, code);
+            return;
+        }
+        bbsc_ledger.push_back({source, BbscLedgerState::Owed, 0, lot, flag, code, count,
+                               SteadyNowMs(), 0});
+        bbsc_ledger_dirty = true;
+    }
+    LOG_INFO(Debug, "BBSC ledger: {} lot {} {:#x} x{} owed until home ({})",
+             BbscLedgerSourceName(source), lot, code, count, why);
+    BBSC_TIMELINE("ITEMS", "ledger: {} lot {} {:#x} x{} owed until home ({})",
+                  BbscLedgerSourceName(source), lot, code, count, why);
+}
+
+void NoteBbscLedgerLot(s32 lot, u32 code) {
+    if (lot <= 0) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    const auto [it, added] = bbsc_ledger_lots.try_emplace(lot, code);
+    if (!added && it->second == 0) {
+        it->second = code;
+    }
+    bbsc_ledger_dirty |= added;
+}
+
+// A pickup's get flag (kind 5) seen set: the pickup entries of the last seconds get its lot.
+void NoteBbscLedgerPickupFlag(u32 flag) {
+    const s32 lot = BbscLotOfFlag(flag);
+    const s64 now = SteadyNowMs();
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    for (auto& e : bbsc_ledger) {
+        if (e.source == BbscLedgerSource::Pickup && e.lot == 0 && now - e.noted_ms < 10'000) {
+            e.lot = lot;
+            e.flag = flag;
+            bbsc_ledger_dirty = true;
+        }
+    }
+}
+
+bool BbscLedgerOwnAwardFlag(u32 flag) {
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    const auto it = bbsc_ledger_own_flags.find(flag);
+    return it != bbsc_ledger_own_flags.end() && SteadyNowMs() - it->second < 5'000;
+}
+
+// The give's item window (0x016D8850 entry): what the game's own give put into our inventory.
+void NoteBbscLedgerWindow(u64 caller_offset, u32 type, u32 id, s32 count) {
+    if (caller_offset != BbscGiveWindowReturn1 && caller_offset != BbscGiveWindowReturn2) {
+        return; // a talk's c1_65 or BBSC's own window
+    }
+    const u32 code = type | id;
+    BbscLedgerSource source = BbscLedgerSource::Give;
+    s32 lot = 0;
+    u32 flag = 0;
+    if (bbsc_ledger_context.has_value()) {
+        ++bbsc_ledger_context->gives;
+        source = bbsc_ledger_context->source;
+        lot = bbsc_ledger_context->lot;
+        flag = bbsc_ledger_context->flag;
+    }
+    if (lot > 0 && flag != 0) {
+        NoteBbscLedgerLot(lot, code); // host or guest: this character got that one-time lot
+    }
+    NoteBbscLedgerGiven(source, lot, flag, code, count);
+}
+
+// The give 0x017D89F0 starts: a pickup's, unless an award (which calls it) runs in this tick.
+void BeginBbscLedgerPickup() {
+    if (bbsc_ledger_context.has_value() && bbsc_ledger_context->source != BbscLedgerSource::Pickup) {
+        return;
+    }
+    bbsc_ledger_context = BbscLedgerContext{BbscLedgerSource::Pickup, 0, 0, 0, false};
+}
+
+// An award of `lot` runs now (not skipped): the give's windows belong to it, and the lot's NPC
+// quest get flags it sets are ours.
+void BeginBbscLedgerAward(s32 lot, u64 row) {
+    bbsc_ledger_context =
+        BbscLedgerContext{bbsc_ledger_drop_award ? BbscLedgerSource::Drop : BbscLedgerSource::Award,
+                          lot, row != 0 ? BbscLotMainFlag(row) : 0, 0, false};
+    if (row == 0) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    for (const u32 flag : BbscLotFlags(row)) {
+        if (IsBbscNpcQuestFlag(flag)) {
+            bbsc_ledger_own_flags[flag] = SteadyNowMs();
+        }
+    }
+}
+
+// K3: an award of a one-time lot this character already got, its item still here - skipped, its
+// get flags set. True when skipped.
+bool SkipBbscRepeatedLot(s32 lot, u64 row) {
+    if (bbsc_ledger_regive || row == 0) {
+        return false;
+    }
+    const auto flags = BbscLotFlags(row);
+    if (flags.empty()) {
+        return false; // not a one-time lot
+    }
+    u32 code = 0;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        const auto it = bbsc_ledger_lots.find(lot);
+        if (it == bbsc_ledger_lots.end()) {
+            return false;
+        }
+        code = it->second;
+    }
+    // Skipped only for an item there is one of: a gem / rune (no reliable count - what the ledger
+    // says is taken as still here), a weapon or attire, goods with maxNum 1. Never in the Chalice
+    // Dungeons: every dungeon of a kind has the same lots and flags, a new one gives them again.
+    bool unique = false;
+    bool here = false;
+    if (code != 0 && !BbscLedgerAddable(code)) {
+        unique = here = true;
+    } else if (code != 0) {
+        here = BbscLedgerCount(code) > 0;
+        unique = (code >> 28) != 4;
+        if (!unique) {
+            const u64 goods = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
+            const u64 goods_row = goods != 0 ? BbscParamRow(goods, code & 0x0FFFFFFFu, 0x40) : 0;
+            unique = goods_row != 0 && ReadValue<s16>(goods_row, 54) == 1; // maxNum
+        }
+    }
+    const bool chalice = BbscMapArea(GetCurrentPackedMap()) == BbscChaliceArea;
+    const bool skip = here && unique && !chalice;
+    LOG_WARNING(Debug, "BBSC CHECK FAIL K3-repeat: one-time lot {} awarded again (item {:#x} {}, "
+                       "session state {}) - {}",
+                lot, code, here ? "still here" : "not here", GetSessionState(),
+                skip ? "skipped, its get flag set" : "given again (not unique, gone or a dungeon)");
+    BBSC_TIMELINE("CHECK", "K3-repeat: lot {} awarded again - {}", lot, skip ? "skipped" : "given");
+    if (!skip) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        for (const u32 flag : flags) {
+            if (IsBbscNpcQuestFlag(flag)) {
+                bbsc_ledger_own_flags[flag] = SteadyNowMs();
+            }
+        }
+    }
+    for (const u32 flag : flags) {
+        SetBbscLedgerFlag(flag, 1);
+    }
+    return true;
+}
+
+// Talk items in the host's world: c1_65 (the window) and c1_52 (AddItem from the game's own code).
+void NoteBbscLedgerTalkWindow(u32 code, s32 count) {
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        const s64 now = SteadyNowMs();
+        const bool added = std::ranges::any_of(bbsc_ledger, [&](const BbscLedgerEntry& e) {
+            return e.source == BbscLedgerSource::Talk && e.code == code &&
+                   e.state == BbscLedgerState::Given && now - e.noted_ms < 3'000;
+        });
+        if (added) {
+            return; // its c1_52 came first
+        }
+    }
+    NoteBbscLedgerOwed(BbscLedgerSource::Talk, 0, 0, code, count, "a talk's item window");
+}
+
+void NoteBbscLedgerTalkAdd(u32 code, s32 count) {
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        const auto it = std::ranges::find_if(bbsc_ledger, [code](const BbscLedgerEntry& e) {
+            return e.source == BbscLedgerSource::Talk && e.code == code &&
+                   e.state == BbscLedgerState::Owed;
+        });
+        if (it != bbsc_ledger.end()) {
+            bbsc_ledger.erase(it); // its window: now given, noted below
+        }
+    }
+    NoteBbscLedgerGiven(BbscLedgerSource::Talk, 0, 0, code, count);
+}
+
+// Each game tick: the award / pickup of the last tick is finished; a sure award that gave nothing
+// in the host's world is given by BBSC.
+void FinishBbscLedgerContext() {
+    if (!bbsc_ledger_context.has_value()) {
+        return;
+    }
+    const BbscLedgerContext context = *bbsc_ledger_context;
+    bbsc_ledger_context.reset();
+    if (!context.check || context.gives != 0 || !BbscGuestInHostWorld()) {
+        return;
+    }
+    LOG_WARNING(Debug, "BBSC CHECK FAIL K2-award-nothing: the game's award of lot {} gave the guest "
+                       "nothing in the host's world - BBSC gives it",
+                context.lot);
+    BBSC_TIMELINE("CHECK", "K2-award-nothing: lot {} - BBSC gives it", context.lot);
+    if (context.flag != 0) {
+        SetBbscLedgerFlag(context.flag, 0); // the award may have set it without giving
+    }
+    GiveBbscGuestDrop(context.lot, 0);
+}
+
+// While a guest in the host's world: given items are looked for 1.5 s later, counts kept.
+void CheckBbscLedgerGiven(s64 now) {
+    struct Due {
+        size_t index;
+        u32 code;
+    };
+    std::vector<Due> due;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        for (size_t i = 0; i < bbsc_ledger.size(); ++i) {
+            const auto& e = bbsc_ledger[i];
+            if (e.state == BbscLedgerState::Given && e.check_ms != 0 && now >= e.check_ms) {
+                due.push_back({i, e.code});
+            }
+        }
+    }
+    static s64 counted_ms = 0;
+    const bool recount = now - counted_ms >= 2'000;
+    if (due.empty() && !recount) {
+        return;
+    }
+    std::vector<std::pair<size_t, s32>> seen;
+    for (const Due& d : due) {
+        seen.emplace_back(d.index, BbscLedgerCount(d.code));
+    }
+    std::map<u32, s32> counts;
+    if (recount) {
+        counted_ms = now;
+        std::vector<u32> codes;
+        {
+            std::scoped_lock lock{bbsc_ledger_mutex};
+            for (const auto& [code, count] : bbsc_ledger_host_counts) {
+                codes.push_back(code);
+            }
+        }
+        for (const u32 code : codes) {
+            counts[code] = BbscLedgerCount(code);
+        }
+    }
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    for (const auto& [code, count] : counts) {
+        auto& kept = bbsc_ledger_host_counts[code];
+        bbsc_ledger_dirty |= kept != count;
+        kept = count;
+    }
+    for (const auto& [index, count] : seen) {
+        if (index >= bbsc_ledger.size()) {
+            continue;
+        }
+        auto& e = bbsc_ledger[index];
+        e.check_ms = 0;
+        bbsc_ledger_host_counts[e.code] = count;
+        bbsc_ledger_dirty = true;
+        if (count > 0) {
+            continue;
+        }
+        if (!BbscLedgerAddable(e.code)) {
+            LOG_INFO(Debug, "BBSC ledger: {} {:#x} (lot {}) not found by the inventory lookup - a gem "
+                            "/ rune is not counted, not checked",
+                     BbscLedgerSourceName(e.source), e.code, e.lot);
+            continue;
+        }
+        LOG_WARNING(Debug, "BBSC CHECK FAIL K2-window-no-item: {} {:#x} x{} (lot {}, flag {}) - its "
+                           "window came, it is neither carried nor stored 1.5 s later - owed",
+                    BbscLedgerSourceName(e.source), e.code, e.count, e.lot, e.flag);
+        BBSC_TIMELINE("CHECK", "K2-window-no-item: {:#x} x{} (lot {}) - owed", e.code, e.count, e.lot);
+        e.state = BbscLedgerState::Owed;
+    }
+}
+
+// Gives one owed entry at home; true when it is done (given, or nothing more to do).
+bool GiveBbscLedgerOwed(BbscLedgerEntry& e) {
+    if (e.code != 0 && BbscLedgerAddable(e.code)) {
+        const bool given = AddBbscLedgerItem(e.code, e.count);
+        LOG_INFO(Debug, "BBSC ledger: {} {:#x} x{} (lot {}) given at home - {}",
+                 BbscLedgerSourceName(e.source), e.code, e.count, e.lot,
+                 given ? "in the items" : "NOT taken by AddItem");
+        BBSC_TIMELINE("ITEMS", "ledger: {:#x} x{} given at home ({})", e.code, e.count,
+                      given ? "ok" : "not taken");
+        if (given && e.lot > 0 && e.flag != 0) {
+            NoteBbscLedgerLot(e.lot, e.code);
+        }
+        return given;
+    }
+    const u64 item_man = ReadValue<u64>(image_base + BbscItemManPointer, 0);
+    const u64 row = BbscLedgerLotRow(e.lot);
+    if (item_man == 0 || row == 0) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        if (e.flag != 0 && bbsc_ledger_lots.contains(e.lot)) {
+            LOG_INFO(Debug, "BBSC ledger: lot {} owed, but this character got it since - done", e.lot);
+            return true;
+        }
+    }
+    if (e.flag != 0 && BbscEventFlag(e.flag)) {
+        SetBbscLedgerFlag(e.flag, 0); // set in the host's world without the item: the award again
+    }
+    BeginBbscLedgerAward(e.lot, row);
+    bbsc_ledger_regive = true;
+    using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+    reinterpret_cast<AwardItemLot>(image_base + BbscAwardItemLot)(item_man, e.lot, 0);
+    bbsc_ledger_regive = false;
+    const u32 gives = bbsc_ledger_context.has_value() ? bbsc_ledger_context->gives : 0;
+    bbsc_ledger_context.reset();
+    LOG_INFO(Debug, "BBSC ledger: {} lot {} awarded at home - {} item window(s)",
+             BbscLedgerSourceName(e.source), e.lot, gives);
+    BBSC_TIMELINE("ITEMS", "ledger: lot {} awarded at home ({} item(s))", e.lot, gives);
+    if (gives != 0 && e.flag != 0) {
+        NoteBbscLedgerLot(e.lot, 0);
+    }
+    return gives != 0;
+}
+
+// Keys, workshop tools, hunter badges and chalices: what the retro sweep may give back (quest items
+// handed to NPCs, Laurence's Skull, the Eye Pendant and the messengers' hats are left out).
+bool IsBbscRetroGoods(u32 goods) {
+    return (goods >= 4000 && goods <= 4021 && goods != 4014 && goods != 4017) ||
+           (goods >= 4102 && goods <= 4105) || (goods >= 4110 && goods <= 4120) ||
+           (goods >= 6100 && goods <= 6539);
+}
+
+// Once per character and run, at home: taken in a host's world (guest-items file), not with us.
+void RetroBbscLedger() {
+    static std::string done_for;
+    std::optional<BbscSaveSlot> slot;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        slot = bbsc_ledger_slot;
+    }
+    if (!slot.has_value()) {
+        return;
+    }
+    const std::string key = fmt::format("{}-{}", slot->user, slot->slot);
+    if (done_for == key) {
+        return;
+    }
+    if (!bbsc_loot_loaded) {
+        LoadBbscGuestLootFile(); // its slot is the same character now
+    }
+    if (!bbsc_loot_slot.has_value() || bbsc_loot_slot->user != slot->user ||
+        bbsc_loot_slot->slot != slot->slot) {
+        done_for = key; // the file of another character was read: nothing to look through
+        return;
+    }
+    done_for = key;
+    std::vector<u32> flags;
+    for (const auto& [group, bytes] : bbsc_loot_saved) {
+        for (size_t b = 0; b < bytes.size(); ++b) {
+            for (u32 bit = 0; bit < 8; ++bit) {
+                if ((bytes[b] & (0x80u >> bit)) != 0) {
+                    flags.push_back(group * 1000 + static_cast<u32>(b) * 8 + bit);
+                }
+            }
+        }
+    }
+    size_t looked = 0;
+    size_t given = 0;
+    for (const u32 flag : flags) {
+        {
+            std::scoped_lock lock{bbsc_ledger_mutex};
+            if (!bbsc_ledger_retro.try_emplace(flag, 1).second) {
+                continue;
+            }
+            bbsc_ledger_dirty = true;
+        }
+        ++looked;
+        const s32 lot = BbscLotOfFlag(flag);
+        const u64 row = BbscLedgerLotRow(lot);
+        if (row == 0) {
+            continue;
+        }
+        const s32 lot_flag = ReadValue<s32>(row, 0x80);
+        for (u32 i = 0; i < 8; ++i) {
+            const s32 item = ReadValue<s32>(row, i * 4);
+            const s32 entry_flag = ReadValue<s32>(row, 0x60 + i * 4);
+            const u32 its_flag = static_cast<u32>(entry_flag > 0 ? entry_flag : lot_flag);
+            if (item <= 0 || ReadValue<u32>(row, 0x20 + i * 4) != 4 || its_flag != flag ||
+                !IsBbscRetroGoods(static_cast<u32>(item))) {
+                continue;
+            }
+            const u32 code = 0x40000000u | static_cast<u32>(item);
+            if (BbscLedgerCount(code) > 0) {
+                continue;
+            }
+            const bool ok = AddBbscLedgerItem(code, 1);
+            ++given;
+            LOG_WARNING(Debug, "BBSC CHECK FAIL K2-retro: goods {} (lot {}, flag {}) was taken in a "
+                               "host's world but is neither carried nor stored - {}",
+                        item, lot, flag, ok ? "given now" : "AddItem did not take it");
+            BBSC_TIMELINE("CHECK", "K2-retro: goods {} (lot {}) given back ({})", item, lot,
+                          ok ? "ok" : "not taken");
+            if (ok) {
+                NoteBbscLedgerLot(lot, code);
+                ShowBbscItemPopup(0x40000000u, static_cast<u32>(item), 1, "item taken as a guest");
+            }
+        }
+    }
+    LOG_INFO(Debug, "BBSC ledger: retro sweep of user {} slot {} - {} taken flag(s) of {} new, {} "
+                    "key item(s) given back",
+             slot->user, slot->slot, looked, flags.size(), given);
+}
+
+// Home again and settled: the trip's given items counted again, the owed ones given.
+void ReconcileBbscLedgerAtHome() {
+    std::map<u32, s32> gained; // code -> what the trip gave
+    std::map<u32, s32> lot_of; // code -> a lot for a gem's award
+    std::map<u32, s32> host;
+    size_t owed = 0;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        for (const auto& e : bbsc_ledger) {
+            if (e.state == BbscLedgerState::Given) {
+                gained[e.code] += e.count;
+                if (e.lot > 0) {
+                    lot_of[e.code] = e.lot;
+                }
+            } else {
+                ++owed;
+            }
+        }
+        host = bbsc_ledger_host_counts;
+    }
+    if (gained.empty() && owed == 0) {
+        return;
+    }
+    size_t kept = 0;
+    size_t lost_items = 0;
+    std::vector<BbscLedgerEntry> regive;
+    for (const auto& [code, count] : gained) {
+        const auto seen = host.find(code);
+        if (!BbscLedgerAddable(code) || seen == host.end()) {
+            ++kept; // not countable: nothing to compare
+            continue;
+        }
+        const s32 home = BbscLedgerCount(code);
+        const s32 lost = std::clamp(seen->second - home, 0, count);
+        if (lost == 0) {
+            ++kept;
+            continue;
+        }
+        lost_items += static_cast<size_t>(lost);
+        LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, {} "
+                           "at home (the trip gave {}) - {} given back",
+                    code, seen->second, home, count, lost);
+        BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} - {} given back", code,
+                      seen->second, home, lost);
+        BbscLedgerEntry e{};
+        e.source = BbscLedgerSource::Give;
+        e.state = BbscLedgerState::Owed;
+        e.code = code;
+        e.count = lost;
+        e.lot = lot_of.contains(code) ? lot_of[code] : 0;
+        regive.push_back(e);
+    }
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        std::erase_if(bbsc_ledger,
+                      [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
+        bbsc_ledger_host_counts.clear();
+        bbsc_ledger.insert(bbsc_ledger.end(), regive.begin(), regive.end());
+        bbsc_ledger_dirty = true;
+    }
+    if (lost_items == 0 && !gained.empty()) {
+        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us", kept);
+        BBSC_TIMELINE("CHECK", "OK K2-trip-home: {} item kind(s) still with us", kept);
+    }
+    // The owed ones (game thread: AddItem / the award run here at once).
+    std::vector<BbscLedgerEntry> todo;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        todo.swap(bbsc_ledger);
+    }
+    std::vector<BbscLedgerEntry> left;
+    for (auto& e : todo) {
+        if (GiveBbscLedgerOwed(e)) {
+            continue;
+        }
+        if (++e.tries >= 3) {
+            LOG_ERROR(Debug, "BBSC CHECK FAIL K2-owed-not-given: {} lot {} {:#x} x{} - 3 tries at "
+                             "home, dropped",
+                      BbscLedgerSourceName(e.source), e.lot, e.code, e.count);
+            BBSC_TIMELINE("CHECK", "K2-owed-not-given: lot {} {:#x} dropped", e.lot, e.code);
+            continue;
+        }
+        left.push_back(e);
+    }
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    bbsc_ledger.insert(bbsc_ledger.begin(), left.begin(), left.end());
+    bbsc_ledger_dirty = true;
+    WriteBbscLedgerLocked();
+}
+
+void TickBbscItemLedger() {
+    if (image_base == 0) {
+        return;
+    }
+    FinishBbscLedgerContext();
+    const s64 now = SteadyNowMs();
+    static s64 slot_ms = 0;
+    if (now - slot_ms >= 2'000) {
+        slot_ms = now;
+        SyncBbscLedgerSlot();
+    }
+    static s64 home_since_ms = 0;
+    static s64 written_ms = 0;
+    if (BbscGuestInHostWorld()) {
+        home_since_ms = 0;
+        CheckBbscLedgerGiven(now);
+    } else {
+        const u64 global = GetGlobalState();
+        const s32 state = GetSessionState();
+        const bool home = (state == 0 || state == 3) && ReadablePointer(global, 0x1593) &&
+                          ReadValue<u8>(global, 0x08) == 0 && ReadValue<u8>(global, 0x1592) != 0 &&
+                          GetCharacterHp(GetLocalPlayerCharacter()) > 0 &&
+                          ReadValue<u64>(image_base + EventFlagManPointerOffset, 0) != 0;
+        if (!home) {
+            home_since_ms = 0;
+        } else if (home_since_ms == 0) {
+            home_since_ms = now;
+        } else if (now - home_since_ms >= 5'000) {
+            static s64 reconciled_ms = 0;
+            if (now - reconciled_ms >= 5'000) {
+                reconciled_ms = now;
+                bool slot_known = false;
+                {
+                    std::scoped_lock lock{bbsc_ledger_mutex};
+                    slot_known = bbsc_ledger_slot.has_value();
+                }
+                if (slot_known) {
+                    ReconcileBbscLedgerAtHome();
+                    RetroBbscLedger();
+                }
+            }
+        }
+    }
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    if (bbsc_ledger_dirty && now - written_ms >= 2'000) {
+        written_ms = now;
+        WriteBbscLedgerLocked();
+    }
+}
+
 void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || !bbsc_popup_hook_ready) {
         return;
@@ -11297,12 +12220,31 @@ void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* r
             return;
         }
     }
+    const s32 lot = static_cast<s32>(registers->rsi);
+    const u64 row = BbscLedgerLotRow(lot);
+    if (SkipBbscRepeatedLot(lot, row)) {
+        bbsc_award_skip = 1;
+        return;
+    }
+    BeginBbscLedgerAward(lot, row);
     if (!BbscGuestInHostWorld()) {
+        return;
+    }
+    if (row != 0 && BbscLotHasGem(row)) {
+        // 2026-10-29 (user: a guest gets every item at once in the host's world, as the host
+        // does): blood gems and runes are made only by the game's award - it runs here as for the
+        // host. If a sure lot gives nothing, FinishBbscLedgerContext gives it the BBSC way.
+        const u32 flag = BbscLotMainFlag(row);
+        bbsc_ledger_context->check = BbscLotIsSure(row) && !(flag != 0 && BbscEventFlag(flag));
+        bbsc_guest_award_active = !BbscItemPopupEnabled(); // popups off: BBSC's notice instead
+        LOG_INFO(Debug, "BBSC guest award: item lot {} (blood gem / rune) in the host's world - the "
+                        "game's award runs",
+                 lot);
+        BBSC_TIMELINE("ITEMS", "guest award: lot {} - the game's award", lot);
         return;
     }
     // Test 2026-10-27 (Iosefka's vial): the award in the host's world gave the guest nothing (no
     // popup queued either) - so it is taken over: the lot is rolled and given as a drop is.
-    const s32 lot = static_cast<s32>(registers->rsi);
     bbsc_award_skip = 1;
     LOG_INFO(Debug, "BBSC guest award: item lot {} in the host's world - given by BBSC", lot);
     BBSC_TIMELINE("ITEMS", "guest award: lot {}", lot);
@@ -11310,7 +12252,14 @@ void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* r
 }
 
 void PS4_SYSV_ABI BbscGuestPopupHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
-    if (registers == nullptr || !bbsc_guest_award_active || !BbscGuestInHostWorld()) {
+    if (registers == nullptr) {
+        return;
+    }
+    const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+    NoteBbscLedgerWindow(caller >= image_base ? caller - image_base : caller,
+                         static_cast<u32>(registers->rdx), static_cast<u32>(registers->rcx),
+                         static_cast<s32>(registers->r8));
+    if (!bbsc_guest_award_active || !BbscGuestInHostWorld()) {
         return;
     }
     bbsc_popup_skip = 1;
@@ -11322,24 +12271,6 @@ void PS4_SYSV_ABI BbscGuestPopupHook(u64 /*tag*/, const GuestRegisterSnapshot* r
         notice_ms = SteadyNowMs();
         BbscAnnounce(BbscL(u"An item was added to your items.", u"Предмет добавлен в ваши предметы."),
                      "guest award");
-    }
-}
-
-void GiveBbscHomeAwards() {
-    std::vector<s32> lots;
-    {
-        std::scoped_lock lock{bbsc_home_award_mutex};
-        lots.swap(bbsc_home_awards);
-    }
-    const u64 item_man = ReadValue<u64>(image_base + BbscItemManPointer, 0);
-    if (lots.empty() || item_man == 0) {
-        return;
-    }
-    using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
-    for (const s32 lot : lots) {
-        reinterpret_cast<AwardItemLot>(image_base + BbscAwardItemLot)(item_man, lot, 0);
-        LOG_INFO(Debug, "BBSC guest award: item lot {} from the host's world given at home", lot);
-        BBSC_TIMELINE("ITEMS", "guest award: lot {} given at home", lot);
     }
 }
 
@@ -11357,7 +12288,18 @@ void TickBbscGuestDrops() {
         ReadValue<u8>(global, 0x08) != 0 || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
         return; // dropped: no longer a guest, loading or dead
     }
+    const u64 item_man = ReadValue<u64>(image_base + BbscItemManPointer, 0);
     for (const auto& [lot, name] : due) {
+        // A lot that may hold a blood gem: one roll by the game's award (BbscGuestAwardHook lets it
+        // run), so the guest gets gems at once and with the game's chances.
+        const u64 row = BbscLedgerLotRow(lot);
+        if (row != 0 && item_man != 0 && BbscLotHasGem(row)) {
+            bbsc_ledger_drop_award = true;
+            using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+            reinterpret_cast<AwardItemLot>(image_base + BbscAwardItemLot)(item_man, lot, 0);
+            bbsc_ledger_drop_award = false;
+            continue;
+        }
         GiveBbscGuestDrop(lot, name);
     }
 }
@@ -12755,17 +13697,9 @@ void NoteBbscTalkFlag(u32 flag, u8 value, u64 caller_offset, bool talk_event) {
 }
 
 // Items of a guest's talks in the host's world. A talk gives an item with c1_65 (the "got item"
-// window, queued at 0x016D8850) next to c1_52 (into the inventory, AddItem 0x014CDFD0). Both are
-// logged; an item a talk meant to give (c1_65) that never reached the inventory is given at home,
+// window, queued at 0x016D8850) next to c1_52 (into the inventory, AddItem 0x014CDFD0). Both go
+// into the item ledger: a window whose item never reached the inventory is owed and given at home,
 // so a quest flag the journal brings home ("gave the music box") never leaves the item behind.
-struct BbscTalkItem {
-    u32 type; // item category bits (0x40000000 = goods)
-    u32 id;
-    s32 count;
-    auto operator<=>(const BbscTalkItem&) const = default;
-};
-std::vector<BbscTalkItem> bbsc_talk_items_meant; // c1_65 in the host's world
-std::vector<BbscTalkItem> bbsc_talk_items_added; // AddItem in the host's world
 constexpr u64 BbscAddItemOffset = 0x014CDFD0;
 constexpr u64 BbscTalkItemWindowOffset = 0x020436E4; // c1_65: EDX type, R14D id, R8D count
 
@@ -12773,80 +13707,37 @@ void PS4_SYSV_ABI BbscTalkItemWindowHook(u64 /*tag*/, const GuestRegisterSnapsho
     if (registers == nullptr || !BbscGuestInHostWorld()) {
         return;
     }
-    const BbscTalkItem item{static_cast<u32>(registers->rdx), static_cast<u32>(registers->r14),
-                            static_cast<s32>(registers->r8)};
-    {
-        std::scoped_lock lock{bbsc_talk_journal_mutex};
-        if (bbsc_talk_items_meant.size() < 256) {
-            bbsc_talk_items_meant.push_back(item);
-        }
+    const u32 type = static_cast<u32>(registers->rdx);
+    const u32 id = static_cast<u32>(registers->r14);
+    const s32 count = static_cast<s32>(registers->r8);
+    LOG_INFO(Debug, "BBSC own quests: a talk gives item {:#x}/{} x{} in the host's world", type, id,
+             count);
+    BBSC_TIMELINE("QUEST", "talk gives item {:#x}/{} x{}", type, id, count);
+    if (count > 0) {
+        NoteBbscLedgerTalkWindow(type | id, count);
     }
-    LOG_INFO(Debug, "BBSC own quests: a talk gives item {:#x}/{} x{} in the host's world",
-             item.type, item.id, item.count);
-    BBSC_TIMELINE("QUEST", "talk gives item {:#x}/{} x{}", item.type, item.id, item.count);
 }
 
 void PS4_SYSV_ABI BbscAddItemHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || !BbscGuestInHostWorld()) {
         return;
     }
-    const BbscTalkItem item{static_cast<u32>(registers->rsi), static_cast<u32>(registers->rdx),
-                            static_cast<s32>(registers->rcx)};
+    const u32 type = static_cast<u32>(registers->rsi);
+    const u32 id = static_cast<u32>(registers->rdx);
+    const s32 count = static_cast<s32>(registers->rcx);
     const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
-    {
-        std::scoped_lock lock{bbsc_talk_journal_mutex};
-        if (bbsc_talk_items_added.size() < 1024) {
-            bbsc_talk_items_added.push_back(item);
-        }
-    }
     LOG_INFO(Debug, "BBSC own quests: item {:#x}/{} x{} into the inventory in the host's world "
                     "(caller {:#x})",
-             item.type, item.id, item.count, caller >= image_base ? caller - image_base : caller);
-}
-
-void GiveBbscTalkItemsAtHome() {
-    std::vector<BbscTalkItem> meant;
-    std::vector<BbscTalkItem> added;
-    {
-        std::scoped_lock lock{bbsc_talk_journal_mutex};
-        meant.swap(bbsc_talk_items_meant);
-        added.swap(bbsc_talk_items_added);
-    }
-    if (meant.empty()) {
-        return;
-    }
-    const u64 game_data = ReadValue<u64>(image_base + 0x0553B130, 0);
-    const u64 player = ReadablePointer(game_data, 0x10) ? ReadValue<u64>(game_data, 8) : 0;
-    if (!ReadablePointer(player, 0x1D8)) {
-        LOG_ERROR(Debug, "BBSC own quests: no player game data - {} talk item(s) not given",
-                  meant.size());
-        return;
-    }
-    using AddItem = u64 PS4_SYSV_ABI (*)(u64 inventory, u32 type, u32 id, s32 count, u32, u32, u32);
-    const auto add = reinterpret_cast<AddItem>(image_base + BbscAddItemOffset);
-    for (const auto& item : meant) {
-        const bool reached = std::ranges::any_of(added, [&](const BbscTalkItem& a) {
-            return a.type == item.type && a.id == item.id;
-        });
-        if (reached || item.count <= 0) {
-            continue;
-        }
-        for (s32 i = 0; i < std::min(item.count, 99); ++i) {
-            add(player + 0x1D0, item.type, item.id, 1, 1, 1, 0);
-        }
-        LOG_INFO(Debug, "BBSC own quests: item {:#x}/{} x{} of a talk in the host's world given at "
-                        "home",
-                 item.type, item.id, item.count);
-        BBSC_TIMELINE("QUEST", "item {:#x}/{} x{} given at home", item.type, item.id, item.count);
+             type, id, count, caller >= image_base ? caller - image_base : caller);
+    // BBSC's own adds (keys, drops, the ledger) note themselves; the game's own (a talk's c1_52) here.
+    if (IsEbootCodeAddress(caller) && count > 0) {
+        NoteBbscLedgerTalkAdd(type | id, count);
     }
 }
 
 // Writes the journal into our own world (after it is back); the journal is kept until `finish`.
+// The talk items and the awards owed are the item ledger's (TickBbscItemLedger, once home).
 void ApplyBbscTalkJournal(std::string_view when, bool finish) {
-    if (finish) {
-        GiveBbscTalkItemsAtHome();
-        GiveBbscHomeAwards();
-    }
     std::map<u32, u8> journal;
     {
         std::scoped_lock lock{bbsc_talk_journal_mutex};
@@ -12878,15 +13769,15 @@ void ApplyBbscTalkJournal(std::string_view when, bool finish) {
 }
 
 // ---- The trip journal on disk (2026-10-29, docs/study WS-2) ---------------------------------------
-// The talk journal, the talk items and the home awards lived in memory only: a crash or a quit while
-// a guest lost half a quest step (the global flags were saved, the map flags and the promised items
-// not) and every blood gem / rune "given in your own world". They now go to
+// The talk journal lived in memory only: a crash or a quit while a guest lost half a quest step
+// (the global flags were saved, the map flags not). It now goes to
 // <mod>/shared-progress/journal-<user>-<slot>.bin next to the pending progress (every 10 s while a
-// guest, and when the session ends), are read back the next time that character is home, and the
-// file becomes ".applied" once the trip home has written them. Flags are written once (as before),
-// items and awards are given once: the file is only read while memory holds none of them.
+// guest, and when the session ends), is read back the next time that character is home, and the
+// file becomes ".applied" once the trip home has written it. Flags are written once (as before).
+// Version 2 (K2, 2026-10-29): the talk items and home awards of version 1 are the item ledger's
+// now; a version 1 file's lists are moved into the ledger as owed when it is read.
 constexpr u32 BbscTripJournalMagic = 0x4A544242; // "BBTJ"
-constexpr u32 BbscTripJournalVersion = 1;
+constexpr u32 BbscTripJournalVersion = 2;
 
 std::filesystem::path BbscTripJournalPath(const BbscSaveSlot& slot) {
     return Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
@@ -12900,17 +13791,9 @@ void WriteBbscTripJournal(const BbscSaveSlot& slot) {
         out.resize(at + 4);
         std::memcpy(out.data() + at, &v, 4);
     };
-    const auto put_items = [&](const std::vector<BbscTalkItem>& items) {
-        put32(static_cast<u32>(items.size()));
-        for (const auto& item : items) {
-            put32(item.type);
-            put32(item.id);
-            put32(static_cast<u32>(item.count));
-        }
-    };
     {
-        std::scoped_lock lock{bbsc_talk_journal_mutex, bbsc_home_award_mutex};
-        if (bbsc_talk_journal.empty() && bbsc_talk_items_meant.empty() && bbsc_home_awards.empty()) {
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
+        if (bbsc_talk_journal.empty()) {
             return;
         }
         put32(BbscTripJournalMagic);
@@ -12919,12 +13802,6 @@ void WriteBbscTripJournal(const BbscSaveSlot& slot) {
         for (const auto& [flag, value] : bbsc_talk_journal) {
             put32(flag);
             put32(value);
-        }
-        put_items(bbsc_talk_items_meant);
-        put_items(bbsc_talk_items_added);
-        put32(static_cast<u32>(bbsc_home_awards.size()));
-        for (const s32 lot : bbsc_home_awards) {
-            put32(static_cast<u32>(lot));
         }
     }
     std::error_code ec;
@@ -12941,6 +13818,8 @@ void WriteBbscTripJournal(const BbscSaveSlot& slot) {
     std::filesystem::rename(temp, path, ec);
 }
 
+void FinishBbscTripJournal(const BbscSaveSlot& slot);
+
 bool LoadBbscTripJournal(const BbscSaveSlot& slot) {
     std::ifstream file(BbscTripJournalPath(slot), std::ios::binary);
     if (!file) {
@@ -12953,7 +13832,7 @@ bool LoadBbscTripJournal(const BbscSaveSlot& slot) {
     u32 version = 0;
     u32 count = 0;
     if (!get32(magic) || magic != BbscTripJournalMagic || !get32(version) ||
-        version != BbscTripJournalVersion || !get32(count) || count > 4096) {
+        (version != 1 && version != BbscTripJournalVersion) || !get32(count) || count > 4096) {
         LOG_WARNING(Debug, "BBSC own quests: the trip journal of user {} slot {} is not readable",
                     slot.user, slot.slot);
         return false;
@@ -12967,54 +13846,74 @@ bool LoadBbscTripJournal(const BbscSaveSlot& slot) {
         }
         journal[flag] = static_cast<u8>(value);
     }
-    const auto get_items = [&](std::vector<BbscTalkItem>& items) {
-        u32 n = 0;
-        if (!get32(n) || n > 1024) {
-            return false;
-        }
-        for (u32 i = 0; i < n; ++i) {
-            BbscTalkItem item{};
-            u32 item_count = 0;
-            if (!get32(item.type) || !get32(item.id) || !get32(item_count)) {
+    size_t moved = 0;
+    if (version == 1) {
+        // Version 1 lists: talk item windows, talk adds, home award lots.
+        struct OldItem {
+            u32 type;
+            u32 id;
+            s32 count;
+        };
+        const auto get_items = [&](std::vector<OldItem>& items) {
+            u32 n = 0;
+            if (!get32(n) || n > 1024) {
                 return false;
             }
-            item.count = static_cast<s32>(item_count);
-            items.push_back(item);
+            for (u32 i = 0; i < n; ++i) {
+                OldItem item{};
+                u32 item_count = 0;
+                if (!get32(item.type) || !get32(item.id) || !get32(item_count)) {
+                    return false;
+                }
+                item.count = static_cast<s32>(item_count);
+                items.push_back(item);
+            }
+            return true;
+        };
+        std::vector<OldItem> meant;
+        std::vector<OldItem> added;
+        if (get_items(meant) && get_items(added) && get32(count) && count <= 64) {
+            for (const auto& item : meant) {
+                const bool reached = std::ranges::any_of(added, [&](const OldItem& a) {
+                    return a.type == item.type && a.id == item.id;
+                });
+                if (!reached && item.count > 0) {
+                    NoteBbscLedgerOwed(BbscLedgerSource::Legacy, 0, 0, item.type | item.id,
+                                       item.count, "talk item of the old trip journal");
+                    ++moved;
+                }
+            }
+            for (u32 i = 0; i < count; ++i) {
+                u32 lot = 0;
+                if (!get32(lot)) {
+                    break;
+                }
+                const u64 row = BbscLedgerLotRow(static_cast<s32>(lot));
+                NoteBbscLedgerOwed(BbscLedgerSource::Legacy, static_cast<s32>(lot),
+                                   row != 0 ? BbscLotMainFlag(row) : 0, 0, 1,
+                                   "home award of the old trip journal");
+                ++moved;
+            }
         }
-        return true;
-    };
-    std::vector<BbscTalkItem> meant;
-    std::vector<BbscTalkItem> added;
-    std::vector<s32> awards;
-    if (!get_items(meant) || !get_items(added) || !get32(count) || count > 64) {
-        return false;
     }
-    for (u32 i = 0; i < count; ++i) {
-        u32 lot = 0;
-        if (!get32(lot)) {
-            return false;
-        }
-        awards.push_back(static_cast<s32>(lot));
-    }
-    size_t items_taken = 0;
     {
-        std::scoped_lock lock{bbsc_talk_journal_mutex, bbsc_home_award_mutex};
+        std::scoped_lock lock{bbsc_talk_journal_mutex};
         for (const auto& [flag, value] : journal) {
             bbsc_talk_journal.try_emplace(flag, value); // what this run noted since is newer
         }
-        // Items and awards are given once: only when this run holds none of its own yet.
-        if (bbsc_talk_items_meant.empty() && bbsc_talk_items_added.empty() && bbsc_home_awards.empty()) {
-            bbsc_talk_items_meant = std::move(meant);
-            bbsc_talk_items_added = std::move(added);
-            bbsc_home_awards = std::move(awards);
-            items_taken = bbsc_talk_items_meant.size() + bbsc_home_awards.size();
+    }
+    LOG_INFO(Debug, "BBSC own quests: trip journal of user {} slot {} read (version {}) - {} talk "
+                    "flag(s), {} old item(s)/award(s) moved into the item ledger",
+             slot.user, slot.slot, version, journal.size(), moved);
+    BBSC_TIMELINE("QUEST", "trip journal of user {} slot {} read: {} flag(s), {} item(s) to the ledger",
+                  slot.user, slot.slot, journal.size(), moved);
+    if (version == 1) {
+        // Its lists are the ledger's now: the file again as version 2 (or done), never read twice.
+        WriteBbscTripJournal(slot);
+        if (journal.empty()) {
+            FinishBbscTripJournal(slot);
         }
     }
-    LOG_INFO(Debug, "BBSC own quests: trip journal of user {} slot {} read - {} talk flag(s), {} "
-                    "item(s)/award(s) still to give at home",
-             slot.user, slot.slot, journal.size(), items_taken);
-    BBSC_TIMELINE("QUEST", "trip journal of user {} slot {} read: {} flag(s), {} item(s)/award(s)",
-                  slot.user, slot.slot, journal.size(), items_taken);
     return true;
 }
 
@@ -13030,12 +13929,9 @@ void FinishBbscTripJournal(const BbscSaveSlot& slot) {
 }
 
 void DropBbscTripJournalMemory() {
-    std::scoped_lock lock{bbsc_talk_journal_mutex, bbsc_home_award_mutex};
+    std::scoped_lock lock{bbsc_talk_journal_mutex};
     bbsc_talk_journal.clear();
     bbsc_talk_journal_written = false;
-    bbsc_talk_items_meant.clear();
-    bbsc_talk_items_added.clear();
-    bbsc_home_awards.clear();
 }
 
 // Research 2026-10-27 (quest flags of a guest's talks): every event flag set, in a session, once
@@ -13982,6 +14878,7 @@ void PS4_SYSV_ABI BbscPickupHook(u64 tag, const GuestRegisterSnapshot* registers
         return;
     }
     case 3:
+        BeginBbscLedgerPickup(); // its item windows are the pickup's (see "The item ledger")
         LOG_INFO(Debug, "BBSC pickup: lot given to the player (session state {})", state);
         return;
     case 4: { // the map-treasure search 0x017DA500 (list +0x28), the pickup action's third search
@@ -17513,7 +18410,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscTransitionIdle();
         TickBbscCoopCountFix();
         TickBbscGuestTypeWatch();
-        TickBbscBossGoodsCheck();
+        TickBbscItemLedger();
         TickBbscRespawnPointWatch();
         TickBbscHostTime();
         TickBbscHomeSpot();
@@ -18479,6 +19376,7 @@ void TickBbscSharedKeyItems() {
             add(player + 0x1D0, BbscGoodsType, id, 1, 1, 1, 0);
             const bool now_owned = BbscOwnsGoods(player, id);
             if (now_owned) {
+                NoteBbscLedgerGiven(BbscLedgerSource::Key, 0, 0, BbscGoodsType | id, 1);
                 ShowBbscItemPopup(BbscGoodsType, id, 1, "shared key item");
             }
             LOG_INFO(Debug, "BBSC shared keys: the host's key item {} is now ours too ({})", id,
