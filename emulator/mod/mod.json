@@ -14,6 +14,7 @@
     {"id": "warp_together", "name": "Warp together", "description": "The guest follows the host through lamp warps", "type": "bool", "default": true, "env": "SHADPS4_BBSC_WARP_TOGETHER"},
     {"id": "world_sync", "name": "World sync", "description": "The guest sees the host's world state (doors, bosses, lifts)", "type": "bool", "default": true, "env": "SHADPS4_BBSC_WORLD_SYNC"},
     {"id": "dream", "name": "Hunter's Dream together", "description": "The guest uses the Doll, workshop and messengers", "type": "bool", "default": true, "env": "SHADPS4_BBSC_DREAM"},
+    {"id": "dream_own", "name": "Own Hunter's Dream", "description": "In the host's Hunter's Dream a guest sees its own Dream (own messengers, shops, Doll, workshop tools); off = the host's copy of the Dream", "type": "bool", "default": true, "env": "SHADPS4_BBSC_DREAM_OWN"},
     {"id": "no_fog_walls", "name": "No co-op fog walls", "description": "Leaving the area is allowed", "type": "bool", "default": true, "env": "SHADPS4_BBSC_NO_FOG_WALLS"},
     {"id": "lamp", "name": "Lamps in co-op", "description": "The host can use lamps during a session", "type": "bool", "default": true, "env": "SHADPS4_BBSC_LAMP"},
     {"id": "host_dead", "name": "Stay when the host dies", "description": "The guest keeps the session if the host dies", "type": "bool", "default": true, "env": "SHADPS4_BBSC_PERSIST_HOSTDEAD"},

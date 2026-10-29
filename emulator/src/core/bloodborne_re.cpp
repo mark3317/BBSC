@@ -4910,6 +4910,7 @@ constexpr s64 BbscWorldFlagsWaitMs = 4'000; // how long a follow waits for the h
 constexpr u32 BbscDreamStateMap = 0x15000000;
 bool BbscHostDreamStateReady();
 void ApplyBbscHostDreamState(std::string_view why);
+bool BbscDreamOwnEnabled(); // see "Our own Hunter's Dream"
 void RestoreBbscOwnDreamState(std::string_view why);
 bool BbscEventFlag(u32 flag); // SprjEventFlagMan read, see the Hunter's Dream section
 
@@ -5269,7 +5270,7 @@ void TickBbscFollowHost() {
         return;
     }
     const bool dream_wait = host.packed_map == BbscDreamStateMap && BbscDreamEnabled() &&
-                            !BbscHostDreamStateReady() &&
+                            !BbscDreamOwnEnabled() && !BbscHostDreamStateReady() &&
                             now - world_wait_since_ms < BbscWorldFlagsWaitMs;
     if (dream_wait) {
         return; // the host's Dream state comes with its flags, a moment more
@@ -5389,6 +5390,20 @@ constexpr size_t BbscDreamChunkCount =
     (BbscDreamGroupCount + BbscWorldChunkGroups - 1) / BbscWorldChunkGroups;
 constexpr size_t BbscSnapshotMaxGroups = 64;
 static_assert(BbscDreamGroupCount <= BbscSnapshotMaxGroups && BbscDreamChunkCount <= 8);
+
+// ---- Our own Hunter's Dream (2026-10-29, docs/fixes/DREAM.md option a) ---------------------------
+// The user chose: the Dream is each player's own place - the host and the guest only see each
+// other there. A guest that follows the host into its Dream keeps ITS OWN flags: none of the 57
+// Dream state groups above and none of the host's m21_00 block are written (the host does not send
+// the Dream state at all), so the guest's Doll, messengers, shops, Dream phase and workshop tools
+// are its own, and nothing of the host's Dream can reach the guest's save (the 2026-10-11 bug).
+// Unchanged: the talk / event / NPC rules that let a phantom use the Dream, the closed headstones
+// and Ritual Altars, Gehrman silent once the guest's own night is over. SHADPS4_BBSC_DREAM_OWN=0
+// brings the host's Dream back.
+bool BbscDreamOwnEnabled() {
+    static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_DREAM_OWN");
+    return enabled;
+}
 
 bool BbscWorldSyncEnabled() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_WORLD_SYNC");
@@ -5892,7 +5907,7 @@ void TickBbscWorldFlagsBroadcast() {
     const u32 sent = SendBbscFlagSnapshot(1, map, snapshot, BbscWorldGroupCount,
                                           BbscWorldGroupKey, present);
     u64 dream_present = 0;
-    const bool dream = map == BbscDreamStateMap && BbscDreamEnabled();
+    const bool dream = map == BbscDreamStateMap && BbscDreamEnabled() && !BbscDreamOwnEnabled();
     if (dream) {
         SendBbscFlagSnapshot(2, map, snapshot, BbscDreamGroupCount, BbscDreamGroupKey,
                              dream_present);
@@ -5965,6 +5980,9 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
     };
     const auto write_block = [&](const BbscWorldSnapshot& snap, size_t& changed, size_t& missing) {
         size_t written = 0;
+        if (snap.map == BbscDreamStateMap && BbscDreamOwnEnabled()) {
+            return written; // our own Hunter's Dream: its map flags stay ours
+        }
         for (size_t i = 0; i < BbscWorldAppliedGroups; ++i) {
             if ((snap.present & (u64{1} << i)) == 0) {
                 continue;
@@ -6177,6 +6195,13 @@ bool BbscHostDreamStateReady() {
 // Guest side: the host's Dream state into our live table (see "The host's Hunter's Dream").
 void ApplyBbscHostDreamState(std::string_view why) {
     if (!BbscWorldSyncEnabled() || !BbscDreamEnabled() || image_base == 0) {
+        return;
+    }
+    if (BbscDreamOwnEnabled()) {
+        LOG_INFO(Debug, "BBSC Dream state ({}): our own Hunter's Dream - the host's Dream flags are "
+                        "not written",
+                 why);
+        BBSC_TIMELINE("WORLD", "Dream state ({}): our own Hunter's Dream", why);
         return;
     }
     BbscWorldSnapshot host;
@@ -10664,6 +10689,14 @@ constexpr std::array<BbscDreamTalk, 10> BbscDreamGuestTalks{{
 }};
 // Not allowed: t210000-210003 and t210721 (headstones), t210050-210110 (Ritual Altars), t210306
 // (Gehrman as the final boss).
+// In our own Dream (BbscDreamOwnEnabled) the starter weapon messengers are the guest's again: their
+// sales flags (group 72101) and events 12101020 / 12101021 (wave, then sink once one is taken -
+// m21_00.emevd, both wait on "character 10000 has type 0") run on the guest's own flags.
+constexpr std::array<BbscDreamTalk, 2> BbscDreamOwnGuestTalks{{
+    {210694, "starter trick weapon messenger"},
+    {210695, "starter firearm messenger"},
+}};
+constexpr std::array<s64, 2> BbscDreamOwnGuestEvents{12101020, 12101021};
 
 // m21_00 events behind the allowed interactions, each read in full (tools/gamedata):
 //   Doll      12100112/12100113 level-up handshake, 12100114-12100117 her animations,
@@ -10807,6 +10840,21 @@ void PS4_SYSV_ABI BbscDreamTalkHook(u64 /*tag*/, const GuestRegisterSnapshot* re
         return; // host, solo, or no evaluator: nothing was refused
     }
     const u32 talk = ReadValue<u32>(condition, 0x10);
+    if (BbscDreamOwnEnabled() && BbscGuestInHostWorld()) {
+        for (size_t i = 0; i < BbscDreamOwnGuestTalks.size(); ++i) {
+            if (BbscDreamOwnGuestTalks[i].id != talk) {
+                continue;
+            }
+            WriteValue<u8>(condition, 0x25, 0);
+            const u32 bit = 1u << (BbscDreamGuestTalks.size() + i);
+            if ((bbsc_dream_talk_logged & bit) == 0) {
+                bbsc_dream_talk_logged |= bit;
+                LOG_INFO(Debug, "BBSC Dream: guest may use t{} ({}, our own Dream)", talk,
+                         BbscDreamOwnGuestTalks[i].what);
+            }
+            return;
+        }
+    }
     size_t index = 0;
     while (index < BbscDreamGuestTalks.size() && BbscDreamGuestTalks[index].id != talk) {
         ++index;
@@ -10847,7 +10895,7 @@ void PS4_SYSV_ABI BbscDreamTalkHook(u64 /*tag*/, const GuestRegisterSnapshot* re
         return;
     }
     WriteValue<u8>(condition, 0x25, 0);
-    if (talk == BbscWorkbenchTalkId) {
+    if (talk == BbscWorkbenchTalkId && !BbscDreamOwnEnabled()) {
         BbscGiveHostWorkshopTools();
     }
     if ((bbsc_dream_talk_logged & (1u << index)) == 0) {
@@ -13537,6 +13585,8 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
     bool allowed = known != bbsc_dream_type_conditions.end();
     if (event > 0) {
         allowed = std::ranges::find(BbscDreamGuestEvents, event) != BbscDreamGuestEvents.end() ||
+                  (BbscDreamOwnEnabled() && std::ranges::find(BbscDreamOwnGuestEvents, event) !=
+                                                BbscDreamOwnGuestEvents.end()) ||
                   std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end() ||
                   std::ranges::find(BbscGuestGiftEvents, event) != BbscGuestGiftEvents.end();
         if (allowed && known == bbsc_dream_type_conditions.end()) {
@@ -13732,7 +13782,9 @@ void TickBbscDream() {
         npcs_solid = MakeBbscDreamNpcsSolid();
     }
     const bool now = GetCurrentPackedMap() == BbscHuntersDreamMap && BbscGuestInHostWorld();
-    if (now && in_dream) {
+    // Our own Dream: the altar and the workbench check our own tools, as they should.
+    const bool host_tools = !BbscDreamOwnEnabled();
+    if (now && in_dream && host_tools) {
         TickBbscDreamTools(false);
     }
     if (now == in_dream) {
@@ -13740,14 +13792,19 @@ void TickBbscDream() {
     }
     in_dream = now;
     if (now) {
-        StartBbscToolScan();
+        if (host_tools) {
+            StartBbscToolScan();
+        }
         LOG_INFO(Debug,
-                 "BBSC Dream: guest in the host's Hunter's Dream - Doll, Gehrman{}, workshop and "
+                 "BBSC Dream: guest in the host's Hunter's Dream{} - Doll, Gehrman{}, workshop and "
                  "messengers open to the guest; headstones and Ritual Altars stay the host's",
+                 host_tools ? "" : " (our own Dream: own flags, own tools, starter weapons too)",
                  BbscNightIsOver() ? " (silent: the night is over)" : "");
     } else {
         LOG_INFO(Debug, "BBSC Dream: guest left the Hunter's Dream");
-        TickBbscDreamTools(true);
+        if (host_tools) {
+            TickBbscDreamTools(true);
+        }
         bbsc_dream_talk_logged = 0;
         bbsc_dream_tools_logged = false;
         bbsc_dream_type_logged.clear();

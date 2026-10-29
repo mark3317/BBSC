@@ -14,7 +14,7 @@ namespace Core::Bbsc {
 // any environment variable, so the build runs straight from a launcher. Everything still only
 // applies to CUSA03173 01.09 (checked where each feature installs). Experimental switches stay
 // off, and so is the boot intro (SHADPS4_BBSC_INTRO=1 brings it back). Setting a variable always wins: "0" turns a default off, any other value turns it on.
-inline constexpr std::array<std::string_view, 35> DefaultOnSwitches{
+inline constexpr std::array<std::string_view, 36> DefaultOnSwitches{
     "SHADPS4_BBSC_SHARED_PROGRESS",     // merge the host's progress into the guest's world (adds only)
     "SHADPS4_BBSC_WARP_TOGETHER",        // the guest follows the host through a lamp warp
     "SHADPS4_BBSC_WORLD_SYNC",           // ...and loads the host's map with the host's world flags
@@ -24,6 +24,7 @@ inline constexpr std::array<std::string_view, 35> DefaultOnSwitches{
     "SHADPS4_BBSC_SOLID_NPCS",           // a guest sees NPCs solid, not as grey wandering ghosts
     "SHADPS4_BBSC_FLOOR_GUARD",          // no crash when a character's floor was unloaded
     "SHADPS4_BBSC_DREAM",                // a guest uses the Doll, workshop and messengers in the host's Dream
+    "SHADPS4_BBSC_DREAM_OWN",            // ...and sees its OWN Dream there (no host's Dream flags)
     "SHADPS4_BBSC_DEATH_PENALTY",        // a kept death still drops a bloodstain and the echoes
     "SHADPS4_BBSC_TRACE_WALLS",          // log which map objects get shown/made solid (fog walls)
     "SHADPS4_BBSC_LAMP",                 // the lamp prompt works in co-op (clears the +0x4B gate)
