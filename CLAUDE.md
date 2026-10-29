@@ -47,6 +47,12 @@ save list|snap|restore pc|laptop · test begin|collect. Логи прогоно�
 Логи BBSC: `%LOCALAPPDATA%\bbport-coop\BBSC-0.0.1-BBport\bbsc\logs` (+ captures), лог игры `<user_dir>\last_run*.log`.
 VPS: `/opt/bbsc/{gameserver,shadnet,logs,data,backups}`, сервисы `bbsc-gameserver`, `bbsc-shadnet` (пользователь bbsc).
 
+Если Claude запущен прямо на mark-pc (Claude Code в приложении, Git Bash/PowerShell), а не в VM: `coopdev.sh` не подходит
+(он ходит по ssh в `mark_pc`) — вызывать `coopdev.ps1 -Action ...` локально для ПК, а для ноута `scp` + `ssh local_pc` (см. `docs/HANDOFF.md` §1).
+Анализ: `tools/eboot-disasm.sh` (дизассемблер eboot по адресу BBSC), `tools/gamedata/item_lots.py` (предметы, лоты, флаги, руны).
+
+**Состояние работы и что дальше — `docs/HANDOFF.md` (читать первым), баги — `docs/BACKLOG.md`.**
+
 ## Правила
 - Сейвы: только копии. Оригинальные сейвы пользователя не трогать.
 - Перед заменой файлов в `D:\Games\Bloodborne\bbport-coop` или на ноуте — бэкап заменяемых файлов.

@@ -14,7 +14,10 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-AEROLIB = os.path.join(HERE, "..", "..", "src-shadp2p", "src", "core", "aerolib", "aerolib.inl")
+AEROLIB = next((p for p in (
+    os.path.join(HERE, "..", "..", "src-shadp2p", "src", "core", "aerolib", "aerolib.inl"),
+    os.path.join(HERE, "..", "..", "emulator", "scripts", "aerolib.inl"),
+) if os.path.exists(p)), os.path.join(HERE, "..", "..", "emulator", "scripts", "aerolib.inl"))
 
 PT_DYNAMIC = 2
 PT_SCE_DYNLIBDATA = 0x61000000

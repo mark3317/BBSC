@@ -108,3 +108,29 @@ the item-lot flag range for "personal loot".
 
 Next: with Phase 1 persistence on, capture whether `CSMultiPlayerIns.*` steps run again after a
 kept stage load (M4). If they do not, locate the creator from a live frame chain on `Init`.
+
+## 2026-10-29 — Items for a guest, session end, deaths (K2/K3, PT-9, PT-12)
+
+Static reads off `D:\Games\Bloodborne\bbport-coop\out\eboot.elf` (vaddr 0 = file offset 0x4000:
+`tools/eboot-disasm.sh <hex va> <hex len>`), game data with `tools/gamedata` (`item_lots.py`),
+runs `bloodborne_pc/out/coop-dev/runs/20261029-055243` and `runs/20261029-040355`.
+
+| Finding | Evidence | Status |
+| --- | --- | --- |
+| Item give `0x017D89F0(?, list)` adds to the LOCAL player's inventory `[[0x0553B130]+8]+0x328` (`0x014CDA70` / `0x014D97F0`); no player-type test | disassembly | CONFIRMED static |
+| The give's item window `0x016D8850` is queued only after a successful add (`0x017D924C test ebx,ebx / je 0x017D9270`); its two calls return to `0x017D934D` / `0x017D94CC` | disassembly | CONFIRMED static |
+| Pickup = take `0x017D8570` → give `0x017D89F0` directly (no award) | trace + disassembly | CONFIRMED |
+| Award `0x017DDC50(item_man, lot, forced)`: session state 6 and `global+0x1592 == 0` → with `forced = 1` it returns at once, with 0 it goes on (`0x017DDCD9..0x017DDD3E`); calls the give at `0x017DE336` | disassembly | CONFIRMED static |
+| `0x014D3DC0` adds goods with `goodsType == 1` (`cmp [row+0x3A],1` at `0x014D470E/0x014D490E`) through AddItem `0x014CDFD0`; purpose unknown | disassembly | CONFIRMED static, role UNKNOWN |
+| Talk items: c1_65 window `0x020436E4`, c1_52 = AddItem `0x014CDFD0` (not the give's `0x014CDA70`) | disassembly | CONFIRMED static |
+| Low-level inventory change `0x014D94A0(inv, slot, delta, &over)`, slot free `0x014DAB20(inv, slot, 1)`; slot entry +0 item key (`0xB0000000|goods`), +8 count | disassembly + kit code | CONFIRMED |
+| `isGuestDrop` (EquipParamGoods +71 bit 3) is set only on Blood Vial 1000 and Quicksilver Bullets 900; the game drops those on an enemy's body for a cooperator itself | param + test 1 | CONFIRMED |
+| After a co-op session the game puts a cooperator's inventory back from the join snapshot AS A WHOLE: no `0x014D94A0` / `0x014DAB20` call for the lost key item, the moment varies (test 1: at 6→0 before any load; test 2: later than 5 s after the home load, before the save 28 s later). Lost: White Messenger Ribbon 4903 (goodsType 1). Kept: vials, bullets, Blood Stone Shard, Tiny Music Box | save scan of `userdata0001` + guard hooks silent | CONFIRMED (mechanism UNKNOWN) |
+| The eboot imports `scePadReadState` (NID `YndgXqQVV7c`) and not `scePadRead` (`q1cHNfGycLI`) — the mod's pad wrapper sees all pad input | NID scan of eboot.elf | CONFIRMED |
+| bbport's mouse camera puts SDL in relative mouse mode (`gpu/shim/window.cpp`); bbport ships `bin\SDL3.dll`; key bindings reach the game as pad data | port source | CONFIRMED |
+| Stage requests in captures (`Warp.StageDescriptor.Finalize` request_type): 5 = load a save, 2 = summon join, 4 = trip home (Blank or room leave) | captures of both tests + 27.10 | CONFIRMED |
+| PT-9: `0x01941C20` (BBSC.Type.OwnWorldStep, the room-leave decision) ran on the guest with no leave and no lua event → request 4 home; BBSC's kept session skipped the cleanup (`Persist.SkippedCleanup` outside a stage request → no rejoin) → home with state 6 | test 1 06:02:02 | CONFIRMED sequence, trigger UNKNOWN |
+| PT-12: ~5 s after the host's death at a wipe, `global+0x1528` (respawn point) went 2412951 → 2102961 (Dream lamp), 4 s before SoloPlayDeath_2 picked the map | test 2 11:30:48 (also 2026-10-20) | CONFIRMED, writer UNKNOWN |
+| Impurity = lot 43120 (gem gen 200030), get flag 6676, event 12700906 (m27_00): end if 6676; wait host type; wait 72700321 (Valtr talk); 2003[04] lot. League Staff = lot 43130 (goods 131), flag 6678. These two are the only lot get flags inside `BbscNpcQuestFlags` | emevd + param | CONFIRMED |
+| Lot gem ids are GemGenParam rows (covenant runes: effect 21xxxxx); rune names are in `menu.msgbnd` `魔石名.fmg` (Caryll 11000000.., covenant 12000004..9) — not in `item.msgbnd` | param + msg | CONFIRMED |
+| Rune Workshop Tool 4104 = lot 2200360, flag 52200360 (Hemwick pickup); Blood Gem Workshop Tool 4103 = lot 2411000 | param | CONFIRMED |
