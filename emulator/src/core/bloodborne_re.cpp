@@ -9748,6 +9748,69 @@ void TickBbscStuckLeaveLocks() {
     ReleaseBbscLeaveLocks("still locked 8 s after the session ended at home (OnRoomTimeOut etc.)");
 }
 
+// PT-9 (test 2026-10-29, runs/20261029-055243, guest): at 06:02:02, with no leave and no lua event,
+// the guest's game made its room-leave decision (0x01941C20, BBSC.Type.OwnWorldStep) and loaded home
+// (stage request 4 - the same as a Blank's trip home), but BBSC's kept session skipped the session
+// cleanup (BBSC.Persist.SkippedCleanup, outside a stage request, so no rejoin either). The guest was
+// home (global+0x1592 = 1, player type 0) with the session still in state 6 and the host's world
+// state on top; its Blank at 06:03:45 then had no trip home left (the send-home step is skipped in
+// our own world) and the lamp stayed unusable. What starts that leave is not known yet. So a guest
+// that has been in the host's world in this session and is now in its own world, alive, not
+// loading, still in state 6 for BbscKeptHomeMs, ends the session the game already left: session
+// patches lifted, CSMultiPlayMan::Stop (as an invader does) - then the usual "home again" steps run
+// (own world back, journals, leave locks). BBSC CHECK FAIL SN-kept-home in the log.
+constexpr s64 BbscKeptHomeMs = 5'000;
+void TickBbscKeptHome() {
+    static bool was_in_host_world = false;
+    static s64 home_since_ms = 0;
+    const s32 state = GetSessionState();
+    const u64 global = GetGlobalState();
+    if (state != 6 || image_base == 0 || !ReadablePointer(global, 0x1598)) {
+        was_in_host_world = false;
+        home_since_ms = 0;
+        return;
+    }
+    const bool own_world = ReadValue<u8>(global, 0x1592) != 0;
+    if (!own_world) {
+        was_in_host_world = true;
+        home_since_ms = 0;
+        return;
+    }
+    const u64 me = GetLocalPlayerCharacter();
+    if (!was_in_host_world || ReadValue<u8>(global, 0x08) != 0 || me == 0 ||
+        GetCharacterHp(me) <= 0 || IsInvaderType(GetLocalCharacterType())) {
+        home_since_ms = 0;
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (home_since_ms == 0) {
+        home_since_ms = now;
+        return;
+    }
+    if (now - home_since_ms < BbscKeptHomeMs) {
+        return;
+    }
+    home_since_ms = 0;
+    was_in_host_world = false;
+    LOG_WARNING(Debug, "BBSC CHECK FAIL SN-kept-home: the game took us home (own world, player type "
+                       "{}, map {:#x}) but the session is kept in state 6 - ending it",
+                GetLocalPlayerType(), GetCurrentPackedMap());
+    BBSC_TIMELINE("CHECK", "SN-kept-home: home while the session is kept - ending it");
+    SuspendBbscPersistenceOnce("the game took the guest home, the session was kept");
+    const u64 session_manager = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
+    if (ReadablePointer(session_manager, 0x128)) {
+        using Stop = u8 PS4_SYSV_ABI (*)(u64 session_manager);
+        const u8 stopped =
+            reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(session_manager);
+        LOG_INFO(Debug, "BBSC leave: the kept session of a guest already home ended (Stop -> {})",
+                 stopped);
+        BBSC_TIMELINE("LEAVE", "kept session of a guest already home ended (Stop -> {})", stopped);
+    }
+    BbscAnnounce(BbscL(u"The connection to the host was lost - you are in your own world.",
+                       u"Связь с хостом потеряна - вы в своём мире."),
+                 "kept home");
+}
+
 // A guest left in someone else's world after its session ended (test 2026-10-08: the host's game
 // closed at 22:38:39; abood's game saw the room disappear and stayed in the host's world - no load
 // home, nothing to do there). After BbscStrandedMs in session state 0 outside our own world with
@@ -18611,6 +18674,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscLeaveLocks();
         TickBbscStuckLeaveLocks();
         TickBbscStrandedGuest();
+        TickBbscKeptHome();
         TickBbscBossLine();
         TickBbscCutsceneReplay();
         TickBbscSharedKeyItems();
