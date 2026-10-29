@@ -55,6 +55,146 @@
 namespace Core::Bloodborne {
 namespace {
 
+// ---- BBSC perf (2026-10-29, docs/fixes/PERF.md) --------------------------------------------------
+// T4: the guest's frame rate fell to 17 in co-op. A light profiler instead of guesses: every game
+// tick function, every trace site and the hooks on hot game functions add their time here
+// (BBSC_PERF_SCOPE: steady_clock, atomics, no lock after the first call), and every 10 s one line
+// "BBSC perf: ..." names the top 10 by time per game frame. SHADPS4_BBSC_PERF=0 turns it off.
+struct BbscPerfSlot {
+    std::string name;
+    bool nested = false; // part of another slot's time (a tick inside the game tick's trace)
+    std::atomic<u64> ns{0};
+    std::atomic<u64> calls{0};
+    std::atomic<u64> max_ns{0};
+    u64 last_ns = 0;
+    u64 last_calls = 0;
+};
+
+bool BbscPerfEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_PERF");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+std::mutex bbsc_perf_mutex;
+std::deque<BbscPerfSlot> bbsc_perf_slots; // stable addresses
+
+BbscPerfSlot* BbscPerfRegister(std::string_view name, bool nested = false) {
+    std::scoped_lock lock{bbsc_perf_mutex};
+    BbscPerfSlot& slot = bbsc_perf_slots.emplace_back();
+    slot.name = std::string{name};
+    slot.nested = nested;
+    return &slot;
+}
+
+inline u64 BbscPerfNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+struct BbscPerfScope {
+    BbscPerfSlot* slot;
+    u64 start;
+    explicit BbscPerfScope(BbscPerfSlot* s)
+        : slot(BbscPerfEnabled() ? s : nullptr), start(slot != nullptr ? BbscPerfNowNs() : 0) {}
+    ~BbscPerfScope() {
+        if (slot == nullptr) {
+            return;
+        }
+        const u64 took = BbscPerfNowNs() - start;
+        slot->ns.fetch_add(took, std::memory_order_relaxed);
+        slot->calls.fetch_add(1, std::memory_order_relaxed);
+        u64 seen = slot->max_ns.load(std::memory_order_relaxed);
+        while (took > seen && !slot->max_ns.compare_exchange_weak(seen, took)) {
+        }
+    }
+    BbscPerfScope(const BbscPerfScope&) = delete;
+    BbscPerfScope& operator=(const BbscPerfScope&) = delete;
+};
+
+#define BBSC_PERF_CAT2(a, b) a##b
+#define BBSC_PERF_CAT(a, b) BBSC_PERF_CAT2(a, b)
+// A scope's time under `label` (a hook or a function); BBSC_PERF_NESTED for one inside another.
+#define BBSC_PERF_SCOPE(label)                                                                     \
+    static BbscPerfSlot* const BBSC_PERF_CAT(bbsc_perf_slot_, __LINE__) = BbscPerfRegister(label); \
+    BbscPerfScope BBSC_PERF_CAT(bbsc_perf_scope_, __LINE__) {                                      \
+        BBSC_PERF_CAT(bbsc_perf_slot_, __LINE__)                                                   \
+    }
+#define BBSC_PERF_NESTED(label)                                                                    \
+    static BbscPerfSlot* const BBSC_PERF_CAT(bbsc_perf_slot_, __LINE__) =                          \
+        BbscPerfRegister(label, true);                                                             \
+    BbscPerfScope BBSC_PERF_CAT(bbsc_perf_scope_, __LINE__) {                                      \
+        BBSC_PERF_CAT(bbsc_perf_slot_, __LINE__)                                                   \
+    }
+
+std::atomic<u64> bbsc_perf_frames{0}; // game ticks
+
+// Game thread, every tick: the line every 10 s.
+void TickBbscPerfReport() {
+    if (!BbscPerfEnabled()) {
+        return;
+    }
+    bbsc_perf_frames.fetch_add(1, std::memory_order_relaxed);
+    static u64 window_start_ns = 0;
+    static u64 frames_at_start = 0;
+    const u64 now = BbscPerfNowNs();
+    if (window_start_ns == 0) {
+        window_start_ns = now;
+        frames_at_start = bbsc_perf_frames.load();
+        return;
+    }
+    if (now - window_start_ns < 10'000'000'000ull) {
+        return;
+    }
+    const u64 frames = std::max<u64>(bbsc_perf_frames.load() - frames_at_start, 1);
+    const double seconds = static_cast<double>(now - window_start_ns) / 1e9;
+    window_start_ns = now;
+    frames_at_start = bbsc_perf_frames.load();
+    struct Row {
+        const BbscPerfSlot* slot;
+        u64 ns;
+        u64 calls;
+        u64 max_ns;
+    };
+    std::vector<Row> rows;
+    u64 top_level_ns = 0;
+    {
+        std::scoped_lock lock{bbsc_perf_mutex};
+        for (BbscPerfSlot& slot : bbsc_perf_slots) {
+            const u64 ns = slot.ns.load(std::memory_order_relaxed);
+            const u64 calls = slot.calls.load(std::memory_order_relaxed);
+            const u64 dns = ns - slot.last_ns;
+            const u64 dcalls = calls - slot.last_calls;
+            slot.last_ns = ns;
+            slot.last_calls = calls;
+            const u64 max_ns = slot.max_ns.exchange(0, std::memory_order_relaxed);
+            if (dcalls == 0) {
+                continue;
+            }
+            if (!slot.nested) {
+                top_level_ns += dns;
+            }
+            rows.push_back({&slot, dns, dcalls, max_ns});
+        }
+    }
+    std::ranges::sort(rows, [](const Row& a, const Row& b) { return a.ns > b.ns; });
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(rows.size(), 10); ++i) {
+        const Row& r = rows[i];
+        top += fmt::format("{}{} {:.1f} us/frame ({:.1f} calls/frame, max {:.0f} us)", i ? "; " : "",
+                           r.slot->name, static_cast<double>(r.ns) / 1e3 / static_cast<double>(frames),
+                           static_cast<double>(r.calls) / static_cast<double>(frames),
+                           static_cast<double>(r.max_ns) / 1e3);
+    }
+    LOG_INFO(Debug, "BBSC perf: {} game frames in {:.1f} s ({:.1f}/s), BBSC {:.0f} us/frame on top - {}",
+             frames, seconds, static_cast<double>(frames) / seconds,
+             static_cast<double>(top_level_ns) / 1e3 / static_cast<double>(frames), top);
+}
+
+
 enum class TraceKind : u8 {
     SosCondition,
     SosValidityDispatch,
@@ -4233,6 +4373,7 @@ bool BbscBossFightAtDeath() {
 constexpr u64 FailedBossAreaMissionOffset = 0x0138B2D0; // Lua "Failed_BossAreaMission"
 
 void PS4_SYSV_ABI BbscFailedBossAreaHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscFailedBossAreaHook");
     (void)tag;
     if (registers == nullptr) {
         return;
@@ -5560,6 +5701,7 @@ void RevertBbscNpcOwnFlags() {
 // events and talks look.
 bool bbsc_npc_pass_due = false;
 void PS4_SYSV_ABI BbscNpcPassHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+    BBSC_PERF_SCOPE("hook BbscNpcPassHook");
     if (!bbsc_npc_pass_due || !bbsc_npc_own_active) {
         return;
     }
@@ -8764,6 +8906,7 @@ bool BbscLateDeathStep(std::string_view name) {
 // a no-op, so nothing is skipped here: this only records that the local player died so the tick
 // below can revive them (or wait out a boss fight first).
 void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscSpectateDeathHook");
     if (registers == nullptr || bbsc_spectate_releasing || !BbscSpectateEnabled()) {
         return; // releasing: the reload the step asked for is being requested for real
     }
@@ -9081,6 +9224,7 @@ void TickBbscCoopCountFix() {
 }
 
 void PS4_SYSV_ABI BbscBossClearHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscBossClearHook");
     if (registers == nullptr || !BbscSessionAlive()) {
         return;
     }
@@ -9300,6 +9444,7 @@ int RemotePlayerCount() {
 }
 
 void PS4_SYSV_ABI BbscQuitToTitleHook(u64, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscQuitToTitleHook");
     // Who asked to return to the title matters. A player choosing "quit to title" from the menu
     // and the game bailing out on its own both land here, and only the first should tear the
     // session down. Sessions were ending by themselves (2026-09-21) with nothing failing in the
@@ -9683,6 +9828,7 @@ void ReleaseBbscLeaveLocks(std::string_view why) {
 }
 
 void PS4_SYSV_ABI BbscSendPhantomHomeHook(u64, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscSendPhantomHomeHook");
     const u64 global = GetGlobalState();
     if (!BbscOwnWorldNonGuest(global)) {
         LOG_INFO(Debug, "BBSC leave: the game's send-home step runs (session state {}, own world {})",
@@ -9946,6 +10092,7 @@ std::array<s32, BbscShopRows.size()> bbsc_shop_row_ids{-1, -1, -1, -1}; // game 
 bool BbscKitParamsReady();
 
 void PS4_SYSV_ABI BbscShopLineupResultHook(u64, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscShopLineupResultHook");
     // These IDs are unused vanilla goods until PrepareBbscDuelBell has copied and corrected their
     // EquipParamGoods rows.  Exposing the synthetic shop rows before then lets the shop cache the
     // original key/unused definitions, after which the bells may stay invisible or appear in the
@@ -9994,6 +10141,7 @@ void PS4_SYSV_ABI BbscShopLineupResultHook(u64, const GuestRegisterSnapshot* reg
 }
 
 void PS4_SYSV_ABI BbscShopListHook(u64, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscShopListHook");
     if (registers == nullptr || image_base == 0) {
         return;
     }
@@ -10053,6 +10201,7 @@ void PS4_SYSV_ABI BbscShopListHook(u64, const GuestRegisterSnapshot* registers) 
 // (0x0157F6D1: mov bl, al ; mov rdi, r14) and logs each change of goods id / result / map.
 constexpr u64 BellCheckTraceOffset = 0x0157F6D1;
 void PS4_SYSV_ABI BbscBellCheckHook(u64, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscBellCheckHook");
     if (registers == nullptr || !HasMemoryAccess(registers->rbp - 0x1B8, 4, MemoryProt::CpuRead)) {
         return;
     }
@@ -10307,6 +10456,7 @@ s64 BbscRunningEventId(u64 instance) {
 
 // tag 3 = bank 2005 (objects), tag 4 = bank 2006 (SFX); rsi is the running event instance.
 void PS4_SYSV_ABI BbscWallScriptHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscWallScriptHook");
     bbsc_coop_wall_entity = 0;
     if (registers == nullptr) {
         return;
@@ -10360,6 +10510,7 @@ void PS4_SYSV_ABI BbscWallScriptHook(u64 tag, const GuestRegisterSnapshot* regis
 // tag 0 = draw (0x013CABD0), tag 1 = collision (0x013CA580), both (entity_id, on).
 // tag 2 = fog on (0x01315FA0), which is (map_list, entity_id): the id is in rsi, there is no "on".
 void PS4_SYSV_ABI BbscWallToggleHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscWallToggleHook");
     if (registers == nullptr) {
         return;
     }
@@ -10640,6 +10791,7 @@ void BbscGiveHostWorkshopTools() {
 }
 
 void PS4_SYSV_ABI BbscDreamTalkHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscDreamTalkHook");
     if (registers == nullptr) {
         return;
     }
@@ -11006,6 +11158,7 @@ constexpr u32 BbscStarterWeaponGroup = 72101;
 std::atomic<s64> bbsc_shop_dialog_ms{0};
 
 void PS4_SYSV_ABI BbscShopDialogHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+    BBSC_PERF_SCOPE("hook BbscShopDialogHook");
     bbsc_shop_dialog_ms.store(SteadyNowMs(), std::memory_order_relaxed);
 }
 
@@ -12492,7 +12645,18 @@ std::string BbscKeyItemsDiff(const std::vector<std::pair<u32, s32>>& before,
     return out;
 }
 
+// Research-only hooks and logs (the key item census, the item hooks, the "research: flag" lines):
+// off in a release, SHADPS4_BBSC_RESEARCH=1 (launcher: "Research logs") turns them on. Nothing
+// the co-op does depends on them (docs/fixes/PERF.md).
+bool BbscResearchEnabled() {
+    static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_RESEARCH");
+    return enabled;
+}
+
 void TickBbscKeyItemCensus(s64 now) {
+    if (!BbscResearchEnabled()) {
+        return;
+    }
     static s64 last_ms = 0;
     static std::vector<std::pair<u32, s32>> carried_before;
     static std::vector<std::pair<u32, s32>> stored_before;
@@ -12561,6 +12725,7 @@ constexpr std::array<u64, 5> BbscItemResearchSites{0x014D3DC0, 0x014D0030, 0x014
                                                    0x0156AA50};
 
 void PS4_SYSV_ABI BbscItemResearchHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscItemResearchHook");
     if (registers == nullptr || tag >= BbscItemResearchSites.size()) {
         return;
     }
@@ -12619,6 +12784,10 @@ void PS4_SYSV_ABI BbscItemResearchHook(u64 tag, const GuestRegisterSnapshot* reg
 }
 
 void InstallBbscItemResearchHooks() {
+    if (!BbscResearchEnabled()) {
+        LOG_INFO(Debug, "BBSC research: item hooks off (SHADPS4_BBSC_RESEARCH=1 turns them on)");
+        return;
+    }
     static constexpr std::array<u8, 6> Prologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
     for (size_t tag = 0; tag < BbscItemResearchSites.size(); ++tag) {
         if (image_base == 0 ||
@@ -12730,6 +12899,7 @@ bool GiveBbscPickedLotEntry(u64 row, s32 lot, u32 pick, BbscLedgerSource source)
 }
 
 void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscGuestAwardHook");
     if (registers == nullptr || !bbsc_popup_hook_ready) {
         return;
     }
@@ -12779,6 +12949,7 @@ void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* r
 }
 
 void PS4_SYSV_ABI BbscGuestPopupHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscGuestPopupHook");
     if (registers == nullptr) {
         return;
     }
@@ -13338,6 +13509,7 @@ size_t bbsc_dream_type_next = 0;
 std::vector<s64> bbsc_dream_type_logged;
 
 void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscDreamTypeCheckHook");
     if (registers == nullptr) {
         return;
     }
@@ -13908,6 +14080,7 @@ bool BbscWatchCamera(u64 director, u64 render, const Bbsc::CinematicInput& in, s
 }
 
 void PS4_SYSV_ABI BbscCinematicCameraHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscCinematicCameraHook");
     bbsc_frames.fetch_add(1, std::memory_order_relaxed);
     if (registers == nullptr) {
         return;
@@ -14183,6 +14356,7 @@ void KeepBbscGuestTalkBits(u32 key, const u8* before, u8* live) {
 }
 
 void PS4_SYSV_ABI BbscTalkStepBeginHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscTalkStepBeginHook");
     BbscNpcPassHook(0, registers);
     bbsc_in_talk_step = true;
     bbsc_talk_step_id = 0;
@@ -14196,6 +14370,7 @@ void PS4_SYSV_ABI BbscTalkStepBeginHook(u64 /*tag*/, const GuestRegisterSnapshot
 }
 
 void PS4_SYSV_ABI BbscTalkStepEndHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+    BBSC_PERF_SCOPE("hook BbscTalkStepEndHook");
     bbsc_in_talk_step = false;
 }
 
@@ -14241,6 +14416,7 @@ constexpr u64 BbscAddItemOffset = 0x014CDFD0;
 constexpr u64 BbscTalkItemWindowOffset = 0x020436E4; // c1_65: EDX type, R14D id, R8D count
 
 void PS4_SYSV_ABI BbscTalkItemWindowHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscTalkItemWindowHook");
     if (registers == nullptr || !BbscGuestInHostWorld()) {
         return;
     }
@@ -14256,6 +14432,7 @@ void PS4_SYSV_ABI BbscTalkItemWindowHook(u64 /*tag*/, const GuestRegisterSnapsho
 }
 
 void PS4_SYSV_ABI BbscAddItemHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscAddItemHook");
     if (registers == nullptr || !BbscGuestInHostWorld()) {
         return;
     }
@@ -14614,6 +14791,7 @@ bool BbscTalkEventIsOurs(s64 event) {
 }
 
 void PS4_SYSV_ABI BbscEventBank2003Hook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscEventBank2003Hook");
     if (registers == nullptr || !bbsc_npc_own_active) {
         bbsc_event_run = {};
         return;
@@ -14648,6 +14826,7 @@ bool BbscEventActionNotOurs(u64 caller_offset) {
 }
 
 void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscResearchSetFlagHook");
     if (registers == nullptr) {
         return;
     }
@@ -14671,7 +14850,7 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
         NoteBbscLocalTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
     }
     const s32 state = GetSessionState();
-    if (state != 3 && state != 6) {
+    if ((state != 3 && state != 6) || !BbscResearchEnabled()) {
         return;
     }
     const u32 flag = static_cast<u32>(registers->rsi);
@@ -14815,6 +14994,7 @@ bool BbscFloorReadsBack(u64 floor) {
 }
 
 void PS4_SYSV_ABI BbscFloorGuardHook(u64, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscFloorGuardHook");
     // The session manager pointer lives in the image's data and is always mapped.
     const u64 manager = *reinterpret_cast<const u64*>(image_base + MatchingStatePointerOffset);
     if (manager < 0x10000) {
@@ -15404,6 +15584,7 @@ void TickBbscGateWatch() {
 }
 
 void PS4_SYSV_ABI BbscPickupHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscPickupHook");
     if (tag == 0) {
         bbsc_pickup_action_runs.fetch_add(1, std::memory_order_relaxed);
     }
@@ -16002,6 +16183,7 @@ bool BbscJoinQuiet() {
 }
 
 void PS4_SYSV_ABI BbscBannerMenuHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscBannerMenuHook");
     if (registers == nullptr || ReadValue<u8>(image_base + BannerPendingOffset, 0) != 1) {
         return;
     }
@@ -16066,6 +16248,7 @@ bool bbsc_death_text_raised = false; // "YOU DIED" raised by BBSC for the curren
 constexpr s64 BbscRepeatDeathTextMs = 500;
 
 void PS4_SYSV_ABI BbscDeathStepTraceHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscDeathStepTraceHook");
     static constexpr std::array<std::string_view, 3> Names{"SoloPlayDeath", "SoloPlayDeath_1",
                                                            "PartyGhostDeath"};
     if (tag >= Names.size() || registers == nullptr) {
@@ -16109,6 +16292,7 @@ constexpr int BbscEchoPathLogLimit = 300;
 std::atomic<int> bbsc_echo_path_logged{0};
 
 void PS4_SYSV_ABI BbscEchoPathHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscEchoPathHook");
     if (registers == nullptr) {
         return;
     }
@@ -16178,6 +16362,7 @@ constexpr u64 HudEchoWidgetUpdateOffset = 0x01656C40;
 std::atomic<s64> bbsc_echo_widget_ms{0};
 
 void PS4_SYSV_ABI BbscEchoWidgetHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+    BBSC_PERF_SCOPE("hook BbscEchoWidgetHook");
     bbsc_echo_widget_ms.store(SteadyNowMs(), std::memory_order_relaxed);
 }
 
@@ -17986,6 +18171,7 @@ void TickBbscPvp() {
 
 // Trace: a boss script asked for the vanilla co-op buff (now skipped by the Scaling patches).
 void PS4_SYSV_ABI BbscMultiDopingHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscMultiDopingHook");
     (void)tag;
     if (registers == nullptr) {
         return;
@@ -18923,6 +19109,14 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
     }
+    // Each trace site's time (the game tick's site holds the tick functions: those are nested).
+    static std::array<std::atomic<BbscPerfSlot*>, Sites.size()> perf_sites{};
+    BbscPerfSlot* perf_site = perf_sites[tag].load(std::memory_order_acquire);
+    if (perf_site == nullptr && BbscPerfEnabled()) {
+        perf_site = BbscPerfRegister(fmt::format("trace {}", Sites[tag].name));
+        perf_sites[tag].store(perf_site, std::memory_order_release);
+    }
+    BbscPerfScope perf_scope{perf_site};
 
     const auto& site = Sites[tag];
     if (site.offset == ItemUsableResultOffset) {
@@ -18964,79 +19158,80 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         }
     }
     if (site.offset == BbscGameTickOffset) {
+        TickBbscPerfReport();
         bbsc_tick_map.store(GetCurrentPackedMap(), std::memory_order_release);
-        TickBbscTimelineContext();
-        TickBbscFrameRate();
-        TickBbscGateWatch();
-        TickBbscTransitionIdle();
-        TickBbscCoopCountFix();
-        TickBbscGuestTypeWatch();
-        TickBbscItemLedger();
-        TickBbscRespawnPointWatch();
-        TickBbscHostTime();
-        TickBbscHomeSpot();
-        TickBbscRelayHostLock();
-        TickBbscBossRewards();
-        TickBbscGuestDrops();
-        TickBbscSendBacklog();
-        TickBbscLeaveLocks();
-        TickBbscStuckLeaveLocks();
-        TickBbscStrandedGuest();
-        TickBbscKeptHome();
-        TickBbscBossLine();
-        TickBbscCutsceneReplay();
-        TickBbscSharedKeyItems();
-        TickBbscNpcOwnQuests();
-        TickBbscProgressBroadcast();
-        TickBbscOwnWorld();
-        TickBbscEchoCounter();
-        TickBbscSharedProgress();
-        TickBbscSpectate();
-        TickBbscFollowBroadcast();
-        TickBbscWorldFlagsBroadcast();
-        TickBbscFollowHost();
-        TickBbscLoadCover();
-        TickBbscHpPenalty();
-        TickBbscLampRole();
-        TickBbscMessages();
-        TickBbscRejoinLines();
-        TickBbscDream();
-        TickBbscItemSurvey();
-        TickBbscGuestItemsPickable();
-        TickBbscUnstuckKey();
-        TickBbscLifeBroadcast();
-        TickBbscSessionEnd();
-        TickBbscStrayForcedWarp();
-        TickBbscGuestBlank();
-        TickBbscDeadWatchdog();
-        TickBbscDeathCurtain();
-        TickBbscLoadingScreenClose();
-        TickBbscStageWatch();
-        TickBbscHostDeathNotice();
-        TickBbscBossUnlock();
-        CaptureBbscGuestLoot();
-        TickBbscGuestLootReset();
-        TickBbscDreamStateRestore();
-        TickBbscFreeBell();
-        TickBbscFreeBellRefund();
-        TickBbscEchoTrace();
-        TickBbscMapTrace();
-        TickBbscPresence();
-        TickBbscScaling();
-        TickBbscScaleBroadcast();
-        TickBbscScaledMaxHp();
-        TickBbscPvp();
+        { BBSC_PERF_NESTED("tick TickBbscTimelineContext"); TickBbscTimelineContext(); }
+        { BBSC_PERF_NESTED("tick TickBbscFrameRate"); TickBbscFrameRate(); }
+        { BBSC_PERF_NESTED("tick TickBbscGateWatch"); TickBbscGateWatch(); }
+        { BBSC_PERF_NESTED("tick TickBbscTransitionIdle"); TickBbscTransitionIdle(); }
+        { BBSC_PERF_NESTED("tick TickBbscCoopCountFix"); TickBbscCoopCountFix(); }
+        { BBSC_PERF_NESTED("tick TickBbscGuestTypeWatch"); TickBbscGuestTypeWatch(); }
+        { BBSC_PERF_NESTED("tick TickBbscItemLedger"); TickBbscItemLedger(); }
+        { BBSC_PERF_NESTED("tick TickBbscRespawnPointWatch"); TickBbscRespawnPointWatch(); }
+        { BBSC_PERF_NESTED("tick TickBbscHostTime"); TickBbscHostTime(); }
+        { BBSC_PERF_NESTED("tick TickBbscHomeSpot"); TickBbscHomeSpot(); }
+        { BBSC_PERF_NESTED("tick TickBbscRelayHostLock"); TickBbscRelayHostLock(); }
+        { BBSC_PERF_NESTED("tick TickBbscBossRewards"); TickBbscBossRewards(); }
+        { BBSC_PERF_NESTED("tick TickBbscGuestDrops"); TickBbscGuestDrops(); }
+        { BBSC_PERF_NESTED("tick TickBbscSendBacklog"); TickBbscSendBacklog(); }
+        { BBSC_PERF_NESTED("tick TickBbscLeaveLocks"); TickBbscLeaveLocks(); }
+        { BBSC_PERF_NESTED("tick TickBbscStuckLeaveLocks"); TickBbscStuckLeaveLocks(); }
+        { BBSC_PERF_NESTED("tick TickBbscStrandedGuest"); TickBbscStrandedGuest(); }
+        { BBSC_PERF_NESTED("tick TickBbscKeptHome"); TickBbscKeptHome(); }
+        { BBSC_PERF_NESTED("tick TickBbscBossLine"); TickBbscBossLine(); }
+        { BBSC_PERF_NESTED("tick TickBbscCutsceneReplay"); TickBbscCutsceneReplay(); }
+        { BBSC_PERF_NESTED("tick TickBbscSharedKeyItems"); TickBbscSharedKeyItems(); }
+        { BBSC_PERF_NESTED("tick TickBbscNpcOwnQuests"); TickBbscNpcOwnQuests(); }
+        { BBSC_PERF_NESTED("tick TickBbscProgressBroadcast"); TickBbscProgressBroadcast(); }
+        { BBSC_PERF_NESTED("tick TickBbscOwnWorld"); TickBbscOwnWorld(); }
+        { BBSC_PERF_NESTED("tick TickBbscEchoCounter"); TickBbscEchoCounter(); }
+        { BBSC_PERF_NESTED("tick TickBbscSharedProgress"); TickBbscSharedProgress(); }
+        { BBSC_PERF_NESTED("tick TickBbscSpectate"); TickBbscSpectate(); }
+        { BBSC_PERF_NESTED("tick TickBbscFollowBroadcast"); TickBbscFollowBroadcast(); }
+        { BBSC_PERF_NESTED("tick TickBbscWorldFlagsBroadcast"); TickBbscWorldFlagsBroadcast(); }
+        { BBSC_PERF_NESTED("tick TickBbscFollowHost"); TickBbscFollowHost(); }
+        { BBSC_PERF_NESTED("tick TickBbscLoadCover"); TickBbscLoadCover(); }
+        { BBSC_PERF_NESTED("tick TickBbscHpPenalty"); TickBbscHpPenalty(); }
+        { BBSC_PERF_NESTED("tick TickBbscLampRole"); TickBbscLampRole(); }
+        { BBSC_PERF_NESTED("tick TickBbscMessages"); TickBbscMessages(); }
+        { BBSC_PERF_NESTED("tick TickBbscRejoinLines"); TickBbscRejoinLines(); }
+        { BBSC_PERF_NESTED("tick TickBbscDream"); TickBbscDream(); }
+        { BBSC_PERF_NESTED("tick TickBbscItemSurvey"); TickBbscItemSurvey(); }
+        { BBSC_PERF_NESTED("tick TickBbscGuestItemsPickable"); TickBbscGuestItemsPickable(); }
+        { BBSC_PERF_NESTED("tick TickBbscUnstuckKey"); TickBbscUnstuckKey(); }
+        { BBSC_PERF_NESTED("tick TickBbscLifeBroadcast"); TickBbscLifeBroadcast(); }
+        { BBSC_PERF_NESTED("tick TickBbscSessionEnd"); TickBbscSessionEnd(); }
+        { BBSC_PERF_NESTED("tick TickBbscStrayForcedWarp"); TickBbscStrayForcedWarp(); }
+        { BBSC_PERF_NESTED("tick TickBbscGuestBlank"); TickBbscGuestBlank(); }
+        { BBSC_PERF_NESTED("tick TickBbscDeadWatchdog"); TickBbscDeadWatchdog(); }
+        { BBSC_PERF_NESTED("tick TickBbscDeathCurtain"); TickBbscDeathCurtain(); }
+        { BBSC_PERF_NESTED("tick TickBbscLoadingScreenClose"); TickBbscLoadingScreenClose(); }
+        { BBSC_PERF_NESTED("tick TickBbscStageWatch"); TickBbscStageWatch(); }
+        { BBSC_PERF_NESTED("tick TickBbscHostDeathNotice"); TickBbscHostDeathNotice(); }
+        { BBSC_PERF_NESTED("tick TickBbscBossUnlock"); TickBbscBossUnlock(); }
+        { BBSC_PERF_NESTED("tick CaptureBbscGuestLoot"); CaptureBbscGuestLoot(); }
+        { BBSC_PERF_NESTED("tick TickBbscGuestLootReset"); TickBbscGuestLootReset(); }
+        { BBSC_PERF_NESTED("tick TickBbscDreamStateRestore"); TickBbscDreamStateRestore(); }
+        { BBSC_PERF_NESTED("tick TickBbscFreeBell"); TickBbscFreeBell(); }
+        { BBSC_PERF_NESTED("tick TickBbscFreeBellRefund"); TickBbscFreeBellRefund(); }
+        { BBSC_PERF_NESTED("tick TickBbscEchoTrace"); TickBbscEchoTrace(); }
+        { BBSC_PERF_NESTED("tick TickBbscMapTrace"); TickBbscMapTrace(); }
+        { BBSC_PERF_NESTED("tick TickBbscPresence"); TickBbscPresence(); }
+        { BBSC_PERF_NESTED("tick TickBbscScaling"); TickBbscScaling(); }
+        { BBSC_PERF_NESTED("tick TickBbscScaleBroadcast"); TickBbscScaleBroadcast(); }
+        { BBSC_PERF_NESTED("tick TickBbscScaledMaxHp"); TickBbscScaledMaxHp(); }
+        { BBSC_PERF_NESTED("tick TickBbscPvp"); TickBbscPvp(); }
         if (BbscSpectateEnabled()) {
-            TickBbscRemoteRevive();
-            TickBbscDeathLockClear();
-            TickBbscStateDiff();
-            TickBbscJoinTeleport();
+            { BBSC_PERF_NESTED("tick TickBbscRemoteRevive"); TickBbscRemoteRevive(); }
+            { BBSC_PERF_NESTED("tick TickBbscDeathLockClear"); TickBbscDeathLockClear(); }
+            { BBSC_PERF_NESTED("tick TickBbscStateDiff"); TickBbscStateDiff(); }
+            { BBSC_PERF_NESTED("tick TickBbscJoinTeleport"); TickBbscJoinTeleport(); }
         }
-        TickBbscGuestRejoin();
+        { BBSC_PERF_NESTED("tick TickBbscGuestRejoin"); TickBbscGuestRejoin(); }
         if (BbscRejoinEnabled()) {
-            TrackBbscSignType();
-            TickBbscReinsertV8();
-            TickBbscSelfHeal();
+            { BBSC_PERF_NESTED("tick TrackBbscSignType"); TrackBbscSignType(); }
+            { BBSC_PERF_NESTED("tick TickBbscReinsertV8"); TickBbscReinsertV8(); }
+            { BBSC_PERF_NESTED("tick TickBbscSelfHeal"); TickBbscSelfHeal(); }
             static s64 last_shape_ms = 0;
             if (const s64 now = SteadyNowMs(); now - last_shape_ms > 1'000) {
                 last_shape_ms = now;
@@ -19637,7 +19832,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             break;
         }
         capture_file << "}\n";
-        capture_file.flush();
+        // At most every 250 ms (a flush per entry was a disk write per hook hit); a game panic
+        // goes out at once.
+        static s64 capture_flush_ms = 0;
+        if (site.kind == TraceKind::EnginePanic || SteadyNowMs() - capture_flush_ms >= 250) {
+            capture_file.flush();
+            capture_flush_ms = SteadyNowMs();
+        }
 
         if (hit <= 8 || hit % 300 == 0) {
             LOG_INFO(Debug,

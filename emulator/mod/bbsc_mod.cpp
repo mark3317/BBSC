@@ -479,7 +479,19 @@ void LogLine(char level, const char* category, const std::string& text) {
     GetLocalTime(&now);
     std::fprintf(log_file, "[%02u:%02u:%02u.%03u] %c %s: %s\n", now.wHour, now.wMinute, now.wSecond,
                  now.wMilliseconds, level, category, text.c_str());
-    std::fflush(log_file);
+    // A flush per line was a disk write per line (docs/fixes/PERF.md): warnings and errors go out
+    // at once, the rest at most every 250 ms. SHADPS4_BBSC_LOG_FLUSH=1 flushes every line (to
+    // keep the last lines before a crash).
+    static const bool flush_every_line = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_LOG_FLUSH");
+        return value != nullptr && value[0] == '1';
+    }();
+    static ULONGLONG last_flush_ms = 0;
+    const ULONGLONG now_ms = GetTickCount64();
+    if (flush_every_line || level == 'W' || level == 'E' || now_ms - last_flush_ms >= 250) {
+        std::fflush(log_file);
+        last_flush_ms = now_ms;
+    }
 }
 
 void LogPlain(const char* text) {
