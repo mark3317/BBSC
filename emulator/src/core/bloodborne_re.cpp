@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -3462,6 +3463,7 @@ std::atomic<u32> bbsc_tick_map{0};
 
 void BbscLeaveItemUsed(std::string_view event); // see "Silencing Blank" below
 void NoteBbscSessionEnding(std::string_view why); // see "The item ledger"
+void CaptureBbscGuestRespawnPoint();
 void DeliverBbscLedgerAtJoin(std::string_view why); // see "The item ledger"
 void SuspendBbscPersistenceOnce(std::string_view why); // see "quit to title" below
 
@@ -3479,6 +3481,7 @@ void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& regist
         KeepBbscHomeSpot(); // where we stand now is where the trip home goes back to
     }
     if (name == "JoinSession_White" && GetSessionState() != 3) {
+        CaptureBbscGuestRespawnPoint();
         DeliverBbscLedgerAtJoin(name); // the join check: still our own world, before the load
         CaptureBbscOwnWorldBeforeJoin(); // first: the load resets the map's item flags
         StartBbscLoadCover("summon");
@@ -4195,6 +4198,12 @@ std::map<u32, BbscPeerLife> bbsc_peer_life;
 std::atomic<u32> bbsc_life_own_id{0}; // ours, so an echo of our own packet is ignored
 // Counts "dead -> alive" reports: a partner that came back by reloading (see TickBbscSpectate).
 std::atomic<u32> bbsc_peer_revivals{0};
+// T5 (2026-10-29, Gascoigne): the host's wipe reload was over (it said "alive" at 17:35:39.8) before
+// the guest's death step ran (17:35:43); the step took bbsc_peer_revivals then, saw no revival and
+// the guest watched the reloaded host for a boss kill that never came. The count is now taken when
+// we told the others we are dead (hp 0), which is what the death step compares with.
+std::atomic<bool> bbsc_own_dead{false};
+std::atomic<u32> bbsc_revivals_at_own_death{0};
 
 // {fresh reports, of which dead}
 std::pair<u32, u32> BbscPeerLifeCounts() {
@@ -4204,7 +4213,7 @@ std::pair<u32, u32> BbscPeerLifeCounts() {
     u32 dead = 0;
     for (const auto& [player, life] : bbsc_peer_life) {
         const s64 age = now - life.received_ms;
-        if (age <= BbscLifeFreshMs || (life.dead != 0 && age <= BbscLifeDeadHoldMs)) {
+        if (life.received_ms != 0) { // life changes only on an explicit report, never on a timeout
             ++fresh;
             dead += life.dead != 0 ? 1 : 0;
         }
@@ -4229,12 +4238,23 @@ bool IsInvaderType(s32 type) {
     return type == 2 || type == 12;
 }
 
+int RemoteInvaderCount(); // below
+
 // Invasions (2026-10-05): an invader is never a "partner". Their death and the host's follow the
 // vanilla rules - the invader goes home whether they win or lose - so the kept-session death
 // rules only count co-op players.
 bool LivingPartnerExists() {
     if (BbscAllPartnersReportDead()) {
         return false; // their copies may still show HP; they said they are dead
+    }
+    // T5 (2026-10-29): the partners' own word first - a fresh "alive" report is a living partner,
+    // whatever its copy here shows (a copy's HP can read 0 while the player is alive and fighting).
+    // Not with an invader in the world: invaders report too and are never partners.
+    if (RemoteInvaderCount() == 0) {
+        const auto [fresh, dead] = BbscPeerLifeCounts();
+        if (fresh != 0 && dead < fresh) {
+            return true;
+        }
     }
     const u64 world_chr = ReadValue<u64>(image_base + CandidateLocalStatePointerOffset, 0);
     if (!ReadablePointer(world_chr, 0x68)) {
@@ -5618,6 +5638,7 @@ bool BbscLedgerOwnAwardFlag(u32 flag);
 std::mutex bbsc_npc_own_mutex;
 std::unordered_map<u32, u8> bbsc_npc_own; // flag -> our own value in this session
 bool bbsc_npc_own_active = false;
+std::unordered_map<u32, bool> bbsc_action_owner; // local action / received change
 
 bool BbscNpcFlagBit(u64 storage, u32 flag) {
     const u32 bit = flag % 1000;
@@ -5693,7 +5714,8 @@ void RevertBbscNpcOwnFlags() {
                 BBSC_TIMELINE("QUEST", "NPC flag {} set by our own award - kept", flag);
                 continue;
             }
-            SetBbscNpcFlagBit(storage, flag, own->second != 0);
+            bbsc_action_owner[flag] = false;
+        SetBbscNpcFlagBit(storage, flag, own->second != 0);
             ++reverted;
             static std::vector<u32> logged;
             if (logged.size() < 256 && std::ranges::find(logged, flag) == logged.end()) {
@@ -5735,6 +5757,7 @@ void TickBbscNpcOwnQuests() {
             LOG_INFO(Debug, "BBSC own NPC quests: session over - {} flags were kept as ours",
                      bbsc_npc_own.size());
             bbsc_npc_own.clear();
+            bbsc_action_owner.clear();
             bbsc_npc_own_active = false;
         }
         return;
@@ -7970,8 +7993,14 @@ bool BbscRespawnInPlace(std::string_view why) {
                 host_map = bbsc_follow_latest.packed_map;
             }
         }
+        // T5 (2026-10-29, 17:37:17): after a wipe load into the Dream, Central Yharnam was still in
+        // the resident list - "loaded here" - and the guest was put at the host's Yharnam
+        // coordinates inside the Dream and fell to its death. Beside the host only in the host's
+        // own area (another block of it may be resident), never across areas.
+        const u32 here_map = GetCurrentPackedMap();
         partner_here = IsUsablePackedMap(host_map) &&
-                       (host_map == GetCurrentPackedMap() || BbscMapResident(host_map));
+                       (host_map == here_map ||
+                        (BbscMapResident(host_map) && BbscMapArea(host_map) == BbscMapArea(here_map)));
         if (host_lamp != -1 && !BbscLampBlockLoaded(host_lamp)) {
             LOG_INFO(Debug, "BBSC respawn: host's lamp {} is in map {:#x}, not loaded here - "
                             "skipped",
@@ -8983,10 +9012,23 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
     bbsc_spectate_saw_wipe = guest_waits_for_host;
     bbsc_spectate_wipe_warped = false;
     bbsc_spectate_host_back_ms = 0;
-    bbsc_spectate_revivals_at_death = bbsc_peer_revivals.load();
+    bbsc_spectate_revivals_at_death =
+        bbsc_own_dead.load() ? bbsc_revivals_at_own_death.load() : bbsc_peer_revivals.load();
     bbsc_boss_cleared_since_ms = 0;
     bbsc_death_mode = BbscBossFightAtDeath() || guest_waits_for_host ? BbscDeathMode::Spectate
                                                                       : BbscDeathMode::RespawnNow;
+    // A guest whose host said "dead" and then "alive" while we were dying: the host reloaded after
+    // a wipe (the fight is over in its world) - no watching, the guest reloads beside the host now.
+    if (session_state == 6 && !guest_waits_for_host &&
+        bbsc_peer_revivals.load() != bbsc_spectate_revivals_at_death) {
+        bbsc_spectate_saw_wipe = true;
+        bbsc_spectate_host_back_ms = SteadyNowMs() - BbscWipeHostSettleMs;
+        bbsc_death_mode = BbscDeathMode::Spectate;
+        LOG_INFO(Debug, "BBSC death: {} - the host died and reloaded while we were dying (fight "
+                        "over) -> the guest reloads beside the host now, no watching",
+                 name);
+        BBSC_TIMELINE("DEATH", "{}: the host reloaded while we were dying - reload beside it", name);
+    }
     bbsc_spectate_active = true;
     if (guest_waits_for_host) {
         LOG_INFO(Debug, "BBSC death: {} with nobody alive (guest) -> wait for the host's reload, "
@@ -9000,6 +9042,8 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
                  ? "boss fight: spectate until the boss dies or nobody is alive"
                  : "no boss fight: respawn at the last lamp without a reload");
 }
+
+void ReleaseBbscGuestRespawnPoint(std::string_view why); // see TickBbscRespawnPointWatch
 
 // Game-thread tick: release the held death once nobody is left alive, the session is over, or the
 // safety limit is reached.
@@ -9104,7 +9148,7 @@ void TickBbscSpectate() {
         // fall through to the release below: the normal reload is better than staying dead
     } else if (session_state != 3 && session_state != 6) {
         reason = "session ended";
-    } else if (now - bbsc_spectate_since_ms > BbscSpectateSafetyMs) {
+    } else if (!LivingPartnerExists() && now - bbsc_spectate_since_ms > BbscSpectateSafetyMs) {
         reason = "safety limit";
     } else if (LivingPartnerExists()) {
         bbsc_spectate_alone_since_ms = 0;
@@ -9144,6 +9188,7 @@ void TickBbscSpectate() {
         // the session ends first (patches lifted, CSMultiPlayMan::Stop) and the reload is then the
         // game's own trip home.
         SuspendBbscPersistenceOnce("a dead guest reloads by itself: the co-op ends first");
+        ReleaseBbscGuestRespawnPoint("a dead guest reloads by itself");
         const u64 session_manager = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
         if (ReadablePointer(session_manager, 0x128)) {
             using Stop = u8 PS4_SYSV_ABI (*)(u64 session_manager);
@@ -9896,6 +9941,47 @@ void TickBbscLeaveLocks() {
 // then OnRoomTimeOut (caller 0x1789F6B) set flag 4047 + the load wait again and no send-home step
 // followed -> the host stood in its Dream with every menu/bell locked (soft lock). Within 60 s after
 // a session ended, while we are home, alive and not loading: locks held 8 s -> released.
+// T5 (2026-10-29, guest 17:39): a dead guest whose session ended first reloaded home and could use
+// nothing - the death's locks (menu brake, death pending, the slots' "leaving" marks) are cleared
+// only while a session is alive (TickBbscDeathLockClear). Now within 180 s after a session ended
+// every lock of a leave or a death is looked at (held 5 s -> released, BBSC CHECK FAIL SN-stuck-locks).
+bool BbscDeathLocksHeld() {
+    if (const u64 menu = ReadValue<u64>(image_base + 0x05562878, 0);
+        ReadablePointer(menu, 0x2E0) && ReadValue<s32>(menu, 0x2DC) != 0) {
+        return true;
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    return ReadablePointer(slots, 0x78) && ReadValue<u8>(slots, 0x70) != 0;
+}
+
+void ReleaseBbscDeathLocks(std::string_view why) {
+    bool brake = false;
+    bool pending = false;
+    u32 leaving = 0;
+    if (const u64 menu = ReadValue<u64>(image_base + 0x05562878, 0);
+        ReadablePointer(menu, 0x2E0) && HasMemoryAccess(menu + 0x2DC, 4, MemoryProt::CpuWrite) &&
+        ReadValue<s32>(menu, 0x2DC) != 0) {
+        WriteValue<s32>(menu, 0x2DC, 0);
+        brake = true;
+    }
+    if (const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+        ReadablePointer(slots, 0xB0) && HasMemoryAccess(slots + 0x70, 0x40, MemoryProt::CpuWrite)) {
+        if (ReadValue<u8>(slots, 0x70) != 0) {
+            WriteValue<u8>(slots, 0x70, 0);
+            pending = true;
+        }
+        for (u32 slot = 0; slot < 4; ++slot) {
+            if (ReadValue<u8>(slots, 0xA9 + slot * 2) != 0) {
+                WriteValue<u8>(slots, 0xA9 + slot * 2, 0);
+                leaving |= 1u << slot;
+            }
+        }
+    }
+    LOG_INFO(Debug, "BBSC leave ({}): death locks released (menu brake {}, death pending {}, slot "
+                    "leaving mask {:#x})",
+             why, brake, pending, leaving);
+}
+
 void TickBbscStuckLeaveLocks() {
     static s64 last_ms = 0;
     static s64 ended_ms = 0;
@@ -9918,7 +10004,7 @@ void TickBbscStuckLeaveLocks() {
         }
         return;
     }
-    if (now - ended_ms > 60'000) {
+    if (now - ended_ms > 180'000) {
         ended_ms = 0;
         held_ms = 0;
         return;
@@ -9932,8 +10018,10 @@ void TickBbscStuckLeaveLocks() {
     }
     const u64 lua_man = ReadValue<u64>(image_base + 0x0553B0C8, 0);
     const u64 lua = ReadablePointer(lua_man, 0x10) ? ReadValue<u64>(lua_man, 8) : 0;
-    const bool locked = BbscEventFlag(4047) || (ReadablePointer(lua, 0x90) && ReadValue<u8>(lua, 0x8D) != 0);
-    if (!locked) {
+    const bool leave_locked =
+        BbscEventFlag(4047) || (ReadablePointer(lua, 0x90) && ReadValue<u8>(lua, 0x8D) != 0);
+    const bool death_locked = BbscDeathLocksHeld();
+    if (!leave_locked && !death_locked) {
         held_ms = 0;
         return;
     }
@@ -9941,11 +10029,18 @@ void TickBbscStuckLeaveLocks() {
         held_ms = now;
         return;
     }
-    if (now - held_ms < 8'000) {
+    if (now - held_ms < 5'000) {
         return;
     }
     held_ms = 0;
-    ReleaseBbscLeaveLocks("still locked 8 s after the session ended at home (OnRoomTimeOut etc.)");
+    LOG_WARNING(Debug, "BBSC CHECK FAIL SN-stuck-locks: home, alive, session over {} s - locks still "
+                       "held (leave {}, death {}) - released",
+                (now - ended_ms) / 1'000, leave_locked, death_locked);
+    BBSC_TIMELINE("CHECK", "SN-stuck-locks: locks held at home after the session (leave {}, death {}) "
+                           "- released",
+                  leave_locked, death_locked);
+    ReleaseBbscLeaveLocks("still locked 5 s after the session ended at home");
+    ReleaseBbscDeathLocks("still locked 5 s after the session ended at home");
 }
 
 // PT-9 (test 2026-10-29, runs/20261029-055243, guest): at 06:02:02, with no leave and no lua event,
@@ -11557,6 +11652,7 @@ void NoteBbscLocalTalkFlag(u32 flag, u8 value) {
         bbsc_local_talk_ms.clear();
     }
     bbsc_local_talk_ms[flag] = SteadyNowMs();
+    { std::scoped_lock owner_lock{bbsc_npc_own_mutex}; bbsc_action_owner[flag] = true; }
 }
 
 // True when the award of `lot` is another player's talk gift (and was skipped).
@@ -11645,7 +11741,12 @@ std::mutex bbsc_ledger_mutex;
 std::vector<BbscLedgerEntry> bbsc_ledger;
 std::map<u32, s32> bbsc_ledger_host_counts; // code -> carried + stored, last seen in a host's world
 std::map<s32, u32> bbsc_ledger_lots;        // one-time lots this character got -> item code (0 unknown)
-std::map<u32, u8> bbsc_ledger_retro;        // taken flags the retro sweep has looked at
+std::map<u32, u8> bbsc_ledger_retro;        // get flags whose key item the retro check gave back
+// T5 (2026-10-29): the trip's journal of key / unique items - code -> how many there must be at
+// least (the count right after the trip gave it, lowered only when it went down in steady play, far
+// from a load: handed to an NPC). The loads' checks compare with this, never with a recount (a
+// recount 6 s after the follow load at 17:18 read 0 and the trip home said "all still with us").
+std::map<u32, s32> bbsc_ledger_trip;
 std::optional<BbscSaveSlot> bbsc_ledger_slot;
 bool bbsc_ledger_dirty = false;
 // The award / pickup give running now (game thread): set at their entry, finished at the next tick.
@@ -11827,7 +11928,12 @@ void WriteBbscLedgerLocked() {
     }
     put32(static_cast<u32>(bbsc_ledger_retro.size()));
     for (const auto& [flag, done] : bbsc_ledger_retro) {
-        put32(flag);
+        put32(flag | 0x80000000u); // high bit: given back (older files: only looked at)
+    }
+    put32(static_cast<u32>(bbsc_ledger_trip.size()));
+    for (const auto& [code, count] : bbsc_ledger_trip) {
+        put32(code);
+        put32(static_cast<u32>(count));
     }
     std::error_code ec;
     const auto path = BbscLedgerPath(*bbsc_ledger_slot);
@@ -11898,13 +12004,20 @@ void LoadBbscLedgerLocked(const BbscSaveSlot& slot) {
             if (!get32(flag)) {
                 break;
             }
-            bbsc_ledger_retro[flag] = 1;
+            if ((flag & 0x80000000u) != 0) {
+                bbsc_ledger_retro[flag & 0x7FFFFFFFu] = 1;
+            }
         }
+        get_pairs([](u32 code, u32 n) {
+            auto& want = bbsc_ledger_trip[code];
+            want = std::max(want, static_cast<s32>(n));
+        });
     }
     bbsc_ledger.insert(bbsc_ledger.begin(), entries.begin(), entries.end());
     LOG_INFO(Debug, "BBSC ledger: user {} slot {} read - {} entr(ies) open, {} one-time lot(s), {} "
-                    "taken flag(s) looked through",
-             slot.user, slot.slot, entries.size(), bbsc_ledger_lots.size(), bbsc_ledger_retro.size());
+                    "key item(s) given back by the retro check, {} trip item(s) to keep",
+             slot.user, slot.slot, entries.size(), bbsc_ledger_lots.size(), bbsc_ledger_retro.size(),
+             bbsc_ledger_trip.size());
     BBSC_TIMELINE("ITEMS", "ledger of user {} slot {} read: {} open, {} one-time lot(s)", slot.user,
                   slot.slot, entries.size(), bbsc_ledger_lots.size());
 }
@@ -11926,17 +12039,21 @@ void SyncBbscLedgerSlot() {
         bbsc_ledger_host_counts.clear();
         bbsc_ledger_lots.clear();
         bbsc_ledger_retro.clear();
+        bbsc_ledger_trip.clear();
     }
     bbsc_ledger_slot = slot; // what was noted before the slot was known is this character's
     LoadBbscLedgerLocked(*slot);
     bbsc_ledger_dirty = true;
 }
 
+bool BbscLedgerWatched(u32 code); // key / unique: kept by the trip journal, see below
+
 void NoteBbscLedgerGiven(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s32 count) {
     if (image_base == 0 || code == 0 || count <= 0 || !BbscGuestInHostWorld()) {
         return;
     }
     const s32 now_count = BbscLedgerCount(code);
+    const bool kept = BbscLedgerAddable(code) && BbscLedgerWatched(code);
     const s64 now = SteadyNowMs();
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
@@ -11948,6 +12065,10 @@ void NoteBbscLedgerGiven(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s
         bbsc_ledger.push_back({source, BbscLedgerState::Given, 0, lot, flag, code, count, now,
                                now + 1'500});
         bbsc_ledger_host_counts[code] = now_count;
+        if (kept) {
+            auto& want = bbsc_ledger_trip[code];
+            want = std::max(want, std::max(now_count, count));
+        }
         bbsc_ledger_dirty = true;
     }
     LOG_INFO(Debug, "BBSC ledger: {} {:#x} x{} given in the host's world (lot {}, flag {}; {} carried "
@@ -12208,35 +12329,40 @@ bool BbscLedgerWatched(u32 code) {
     return goods_type == 1 || goods_type == 6;
 }
 
-// The trip's watched items short of what they were: put back. Returns how many were added.
-size_t PutBackBbscTripItems(std::string_view where) {
-    std::map<u32, s32> expected;
+// The trip journal (bbsc_ledger_trip) against the inventory, every second while a guest (in the
+// host's world or its own Dream, 3 s after a load and alive) and at home until the trip is over.
+// Short of it: put back - after a load or at home always (the game took it, T4/T5); in steady play
+// the received-item journal is never lowered by an inventory recount.
+// Returns how many items were put back; `short_out` the kinds still short (not put back).
+
+
+size_t CheckBbscTripItems(bool steady, std::string_view where, size_t* short_out = nullptr) {
+    std::map<u32, s32> want;
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
-        for (const auto& e : bbsc_ledger) {
-            if (e.state == BbscLedgerState::Given && e.code != 0) {
-                if (const auto it = bbsc_ledger_host_counts.find(e.code);
-                    it != bbsc_ledger_host_counts.end()) {
-                    expected[e.code] = it->second;
-                }
-            }
-        }
+        want = bbsc_ledger_trip;
     }
     size_t added = 0;
-    for (const auto& [code, want] : expected) {
-        if (!BbscLedgerAddable(code) || !BbscLedgerWatched(code)) {
+    size_t still_short = 0;
+    for (const auto& [code, count] : want) {
+        if (count <= 0 || !BbscLedgerAddable(code)) {
             continue;
         }
         const s32 have = BbscLedgerCount(code);
-        if (have >= want) {
+        if (have >= count) {
             continue;
         }
-        const bool ok = AddBbscLedgerItem(code, want - have);
-        added += ok ? static_cast<size_t>(want - have) : 0;
-        LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-at-load: {:#x} {} -> {} {} - {}", code, want, have,
-                    where, ok ? "put back" : "AddItem did not take it");
-        BBSC_TIMELINE("CHECK", "K2-lost-at-load: {:#x} {} -> {} {} - {}", code, want, have, where,
+        const bool ok = AddBbscLedgerItem(code, count - have);
+        added += ok ? static_cast<size_t>(count - have) : 0;
+        still_short += ok ? 0 : 1;
+        LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-at-load: {:#x} {} -> {} {} (journal of the "
+                           "trip) - {}",
+                    code, count, have, where, ok ? "put back" : "AddItem did not take it");
+        BBSC_TIMELINE("CHECK", "K2-lost-at-load: {:#x} {} -> {} {} - {}", code, count, have, where,
                       ok ? "put back" : "not taken");
+    }
+    if (short_out != nullptr) {
+        *short_out = still_short;
     }
     return added;
 }
@@ -12358,93 +12484,132 @@ bool GiveBbscLedgerOwed(BbscLedgerEntry& e) {
     return gives != 0;
 }
 
-// Keys, workshop tools, hunter badges and chalices: what the retro sweep may give back (quest items
-// handed to NPCs, Laurence's Skull, the Eye Pendant and the messengers' hats are left out).
+// Keys, workshop tools, hunter badges, chalices and the messengers' ribbons / adornments (4903-4908,
+// T5: the White Messenger Ribbon): what the retro check may give back (quest items handed to NPCs,
+// Laurence's Skull, the Eye Pendant and the flagless messenger hats are left out).
 bool IsBbscRetroGoods(u32 goods) {
     return (goods >= 4000 && goods <= 4021 && goods != 4014 && goods != 4017) ||
            (goods >= 4102 && goods <= 4105) || (goods >= 4110 && goods <= 4120) ||
-           (goods >= 6100 && goods <= 6539);
+           (goods >= 4903 && goods <= 4908) || (goods >= 6100 && goods <= 6539);
 }
 
-// Once per character and run, at the join check: taken in a host's world (guest-items file), not with us.
-void RetroBbscLedger() {
-    static std::string done_for;
+struct BbscRetroLot {
+    s32 lot;
+    u32 flag;  // the entry's get flag
+    u32 goods;
+};
+
+// Every lot entry of ItemLotParam giving a retro goods item under a get flag (built once).
+const std::vector<BbscRetroLot>& BbscRetroLots() {
+    static std::vector<BbscRetroLot> lots;
+    static bool built = false;
+    if (built) {
+        return lots;
+    }
+    const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
+    const u16 count = table != 0 ? ReadValue<u16>(table, 0x0A) : 0;
+    if (count == 0) {
+        return lots;
+    }
+    built = true;
+    for (u32 i = 0; i < count; ++i) {
+        const u64 entry = table + 0x40 + static_cast<u64>(i) * 0x18;
+        const u64 row = BbscCheckedParamRow(table, count, ReadValue<u64>(entry, 8), ItemLotRowSize);
+        if (row == 0) {
+            continue;
+        }
+        const s32 lot = static_cast<s32>(ReadValue<u32>(entry, 0));
+        const s32 lot_flag = ReadValue<s32>(row, 0x80);
+        for (u32 e = 0; e < 8; ++e) {
+            const s32 item = ReadValue<s32>(row, e * 4);
+            const s32 entry_flag = ReadValue<s32>(row, 0x60 + e * 4);
+            const s32 flag = entry_flag > 0 ? entry_flag : lot_flag;
+            if (item > 0 && flag > 0 && ReadValue<u32>(row, 0x20 + e * 4) == 4 &&
+                IsBbscRetroGoods(static_cast<u32>(item))) {
+                lots.push_back({lot, static_cast<u32>(flag), static_cast<u32>(item)});
+            }
+        }
+    }
+    LOG_INFO(Debug, "BBSC ledger: retro check knows {} lot entr(ies) of key items", lots.size());
+    return lots;
+}
+
+// The retro check (T5, user 2026-10-29), at the join (still our own world) and at home: a key item
+// whose get flag is set on this character (our own world's flags), was taken in a host's world
+// (guest-items file) or is in the ledger's one-time lots, but is neither carried nor stored - given
+// back, once per get flag (the ledger keeps the flags it gave). Only in our own world: in a host's
+// world the flags are the host's.
+void RetroBbscLedger(std::string_view why) {
     std::optional<BbscSaveSlot> slot;
+    std::set<s32> journal_lots;
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
         slot = bbsc_ledger_slot;
+        for (const auto& [lot, code] : bbsc_ledger_lots) {
+            journal_lots.insert(lot);
+        }
     }
-    if (!slot.has_value()) {
-        return;
-    }
-    const std::string key = fmt::format("{}-{}", slot->user, slot->slot);
-    if (done_for == key) {
+    const u64 global = GetGlobalState();
+    if (!slot.has_value() || !ReadablePointer(global, 0x1598) || ReadValue<u8>(global, 0x1592) == 0 ||
+        ReadValue<u64>(image_base + EventFlagManPointerOffset, 0) == 0) {
+        LOG_INFO(Debug, "BBSC ledger: retro check skipped ({}: not in our own world)", why);
         return;
     }
     if (!bbsc_loot_loaded) {
         LoadBbscGuestLootFile(); // its slot is the same character now
     }
-    if (!bbsc_loot_slot.has_value() || bbsc_loot_slot->user != slot->user ||
-        bbsc_loot_slot->slot != slot->slot) {
-        done_for = key; // the file of another character was read: nothing to look through
-        return;
-    }
-    done_for = key;
-    std::vector<u32> flags;
-    for (const auto& [group, bytes] : bbsc_loot_saved) {
-        for (size_t b = 0; b < bytes.size(); ++b) {
-            for (u32 bit = 0; bit < 8; ++bit) {
-                if ((bytes[b] & (0x80u >> bit)) != 0) {
-                    flags.push_back(group * 1000 + static_cast<u32>(b) * 8 + bit);
+    std::set<u32> taken;
+    if (bbsc_loot_slot.has_value() && bbsc_loot_slot->user == slot->user &&
+        bbsc_loot_slot->slot == slot->slot) {
+        for (const auto& [group, bytes] : bbsc_loot_saved) {
+            for (size_t b = 0; b < bytes.size(); ++b) {
+                for (u32 bit = 0; bit < 8; ++bit) {
+                    if ((bytes[b] & (0x80u >> bit)) != 0) {
+                        taken.insert(group * 1000 + static_cast<u32>(b) * 8 + bit);
+                    }
                 }
             }
         }
     }
     size_t looked = 0;
     size_t given = 0;
-    for (const u32 flag : flags) {
+    for (const BbscRetroLot& r : BbscRetroLots()) {
         {
             std::scoped_lock lock{bbsc_ledger_mutex};
-            if (!bbsc_ledger_retro.try_emplace(flag, 1).second) {
+            if (bbsc_ledger_retro.contains(r.flag)) {
                 continue;
             }
-            bbsc_ledger_dirty = true;
         }
-        ++looked;
-        const s32 lot = BbscLotOfFlag(flag);
-        const u64 row = BbscLedgerLotRow(lot);
-        if (row == 0) {
+        const char* reason = taken.contains(r.flag)          ? "taken in a host's world"
+                             : journal_lots.contains(r.lot) ? "in the ledger"
+                             : BbscEventFlag(r.flag)        ? "its get flag is set"
+                                                            : nullptr;
+        if (reason == nullptr) {
             continue;
         }
-        const s32 lot_flag = ReadValue<s32>(row, 0x80);
-        for (u32 i = 0; i < 8; ++i) {
-            const s32 item = ReadValue<s32>(row, i * 4);
-            const s32 entry_flag = ReadValue<s32>(row, 0x60 + i * 4);
-            const u32 its_flag = static_cast<u32>(entry_flag > 0 ? entry_flag : lot_flag);
-            if (item <= 0 || ReadValue<u32>(row, 0x20 + i * 4) != 4 || its_flag != flag ||
-                !IsBbscRetroGoods(static_cast<u32>(item))) {
-                continue;
-            }
-            const u32 code = 0x40000000u | static_cast<u32>(item);
-            if (BbscLedgerCount(code) > 0) {
-                continue;
-            }
-            const bool ok = AddBbscLedgerItem(code, 1);
-            ++given;
-            LOG_WARNING(Debug, "BBSC CHECK FAIL K2-retro: goods {} (lot {}, flag {}) was taken in a "
-                               "host's world but is neither carried nor stored - {}",
-                        item, lot, flag, ok ? "given now" : "AddItem did not take it");
-            BBSC_TIMELINE("CHECK", "K2-retro: goods {} (lot {}) given back ({})", item, lot,
-                          ok ? "ok" : "not taken");
-            if (ok) {
-                NoteBbscLedgerLot(lot, code);
-                ShowBbscItemPopup(0x40000000u, static_cast<u32>(item), 1, "item taken as a guest");
-            }
+        ++looked;
+        const u32 code = 0x40000000u | r.goods;
+        if (BbscLedgerCount(code) > 0) {
+            continue;
+        }
+        const bool ok = AddBbscLedgerItem(code, 1);
+        ++given;
+        LOG_WARNING(Debug, "BBSC CHECK FAIL K2-retro: goods {} (lot {}, flag {}) - {}, neither "
+                           "carried nor stored ({}) - {}",
+                    r.goods, r.lot, r.flag, reason, why, ok ? "given now" : "AddItem did not take it");
+        BBSC_TIMELINE("CHECK", "K2-retro: goods {} (lot {}) given back ({}, {})", r.goods, r.lot, why,
+                      ok ? "ok" : "not taken");
+        if (ok) {
+            NoteBbscLedgerLot(r.lot, code);
+
+            std::scoped_lock lock{bbsc_ledger_mutex};
+            bbsc_ledger_retro[r.flag] = 1;
+            bbsc_ledger_dirty = true;
         }
     }
-    LOG_INFO(Debug, "BBSC ledger: retro sweep of user {} slot {} - {} taken flag(s) of {} new, {} "
-                    "key item(s) given back",
-             slot->user, slot->slot, looked, flags.size(), given);
+    LOG_INFO(Debug, "BBSC ledger: retro check of user {} slot {} ({}) - {} key item get flag(s) set, "
+                    "{} key item(s) given back",
+             slot->user, slot->slot, why, looked, given);
 }
 
 // Home again and settled: the trip's given items counted, 5 s after the home load. T4 (user): the
@@ -12474,15 +12639,20 @@ bool ReconcileBbscLedgerAtHome() {
         }
         host = bbsc_ledger_host_counts;
     }
-    if (gained.empty()) {
+    // Key / unique items: the trip journal, put back (T5: the recount the old check compared with
+    // had read 0 after the game took them - "5 item kind(s) still with us" with none of them).
+    size_t trip_short = 0;
+    const size_t trip_back = CheckBbscTripItems(false, "at home", &trip_short);
+    RetroBbscLedger("home");
+    if (gained.empty() && trip_back == 0 && trip_short == 0) {
         return true;
     }
-    size_t lost_items = 0;
+    size_t lost_items = trip_back + trip_short;
     std::vector<BbscLedgerEntry> owed;
     for (const auto& [code, count] : gained) {
         const auto seen = host.find(code);
-        if (!BbscLedgerAddable(code) || seen == host.end()) {
-            continue; // not countable: nothing to compare
+        if (!BbscLedgerAddable(code) || BbscLedgerWatched(code) || seen == host.end()) {
+            continue; // not countable, or kept by the trip journal above
         }
         const s32 home = BbscLedgerCount(code);
         const s32 lost = std::clamp(seen->second - home, 0, count);
@@ -12490,14 +12660,6 @@ bool ReconcileBbscLedgerAtHome() {
             continue;
         }
         lost_items += static_cast<size_t>(lost);
-        if (BbscLedgerWatched(code) && AddBbscLedgerItem(code, lost)) {
-            LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, "
-                               "{} at home (the trip gave {}) - put back",
-                        code, seen->second, home, count);
-            BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} - put back", code,
-                          seen->second, home);
-            continue;
-        }
         LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, {} "
                            "at home (the trip gave {}) - owed until the next join",
                     code, seen->second, home, count);
@@ -12512,9 +12674,14 @@ bool ReconcileBbscLedgerAtHome() {
         owed.push_back(e);
     }
     if (lost_items == 0) {
-        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us",
+        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us "
+                        "(counted against the trip journal)",
                  gained.size());
         BBSC_TIMELINE("CHECK", "OK K2-trip-home: {} item kind(s) still with us", gained.size());
+    } else if (trip_short != 0) {
+        LOG_ERROR(Debug, "BBSC CHECK FAIL K2-trip-home: {} key item kind(s) of the trip still missing "
+                         "after the put-back",
+                  trip_short);
     }
     // The watched (key / unique) entries stay for the later checks of this trip home (30 s, 60 s:
     // TickBbscItemLedger), the rest is done.
@@ -12532,12 +12699,14 @@ bool ReconcileBbscLedgerAtHome() {
     return true;
 }
 
-// The trip home is over (60 s): its entries are done.
+// The trip home is over (60 s): its entries and its journal are done.
 void FinishBbscTripAtHome() {
     std::scoped_lock lock{bbsc_ledger_mutex};
     std::erase_if(bbsc_ledger,
                   [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
     bbsc_ledger_host_counts.clear();
+    bbsc_ledger_trip.clear();
+
     bbsc_ledger_dirty = true;
     WriteBbscLedgerLocked();
 }
@@ -12586,7 +12755,11 @@ void DeliverBbscLedgerAtJoin(std::string_view why) {
         }
         left.push_back(e);
     }
-    RetroBbscLedger();
+    // The last trip's journal, if its 60 s at home did not run out: checked here, in our own world,
+    // and closed - a new trip starts its own.
+    CheckBbscTripItems(false, "at the join (last trip)");
+    FinishBbscTripAtHome();
+    RetroBbscLedger("join");
     std::scoped_lock lock{bbsc_ledger_mutex};
     bbsc_ledger.insert(bbsc_ledger.begin(), left.begin(), left.end());
     bbsc_ledger_dirty = true;
@@ -12866,7 +13039,6 @@ void TickBbscItemLedger() {
     static s64 home_since_ms = 0;
     static int home_checks = 0; // 0 none, 1 at 5 s, 2 at 30 s, 3 at 60 s (done)
     static s64 written_ms = 0;
-    static bool load_checked = true;
     const u64 global = GetGlobalState();
     const s32 state = GetSessionState();
     const bool loading_now = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
@@ -12875,18 +13047,24 @@ void TickBbscItemLedger() {
     } else if (bbsc_ledger_loading) {
         bbsc_ledger_loading = false;
         bbsc_ledger_load_end_ms = now;
-        load_checked = false;
+        home_checks = 0;
+        home_since_ms = 0;
     }
-    if (BbscGuestInHostWorld()) {
+    static s64 trip_checked_ms = 0;
+    if (BbscGuestInHostWorld() || state == 6) {
         home_since_ms = 0;
         home_checks = 0;
-        // 3 s after a load in the host's world, alive: the trip's key items back if it took them.
-        if (!load_checked && !loading_now && now - bbsc_ledger_load_end_ms >= 3'000 &&
+        // Every second, 3 s after a load and alive: the trip journal against the inventory (T5: one
+        // check 3 s after the load ran a moment before the game took the items).
+        if (!loading_now && now - bbsc_ledger_load_end_ms >= 3'000 && now - trip_checked_ms >= 1'000 &&
             GetCharacterHp(GetLocalPlayerCharacter()) > 0) {
-            load_checked = true;
-            PutBackBbscTripItems("after a load in the host's world");
+            trip_checked_ms = now;
+            const bool steady = false; // recounts never lower the received-item journal
+            CheckBbscTripItems(steady, steady ? "in the host's world" : "after a load as a guest");
         }
-        CheckBbscLedgerGiven(now);
+        if (BbscGuestInHostWorld()) {
+            CheckBbscLedgerGiven(now);
+        }
     } else {
         const bool home = (state == 0 || state == 3) && ReadablePointer(global, 0x1593) &&
                           ReadValue<u8>(global, 0x08) == 0 && ReadValue<u8>(global, 0x1592) != 0 &&
@@ -12898,13 +13076,14 @@ void TickBbscItemLedger() {
             home_since_ms = now;
         } else if (slot_known && home_checks == 0 && now - home_since_ms >= 5'000) {
             home_checks = ReconcileBbscLedgerAtHome() ? 1 : 0; // the trip home: counted, put back
-        } else if (home_checks == 1 && now - home_since_ms >= 30'000) {
-            home_checks = 2;
-            PutBackBbscTripItems("at home (30 s)");
-        } else if (home_checks == 2 && now - home_since_ms >= 60'000) {
-            home_checks = 3;
-            PutBackBbscTripItems("at home (60 s)");
-            FinishBbscTripAtHome();
+            trip_checked_ms = now;
+        } else if (home_checks == 1 && now - trip_checked_ms >= 1'000 &&
+                   now - bbsc_ledger_load_end_ms >= 3'000) {
+            trip_checked_ms = now; // every second until 60 s at home (and after a load at home)
+            CheckBbscTripItems(false, "at home");
+            if (now - home_since_ms >= 60'000) {
+                home_checks = 3;
+            }
         }
     }
     std::scoped_lock lock{bbsc_ledger_mutex};
@@ -14832,19 +15011,19 @@ bool BbscTalkEventIsOurs(s64 event) {
     if (first == BbscTalkEventTriggers.end() || first->event != event) {
         return true; // not a talk-driven event
     }
+    // Action-button conditions run in the initiating player's game. Initial resets also run.
+    if (event == 12400840 || event == 12410750 || event == 12410850 || event == 13200055)
+        return true;
     std::scoped_lock lock{bbsc_npc_own_mutex};
-    bool known = false;
+    bool remote = false;
     for (auto it = first; it != BbscTalkEventTriggers.end() && it->event == event; ++it) {
-        const auto own = bbsc_npc_own.find(it->flag);
-        if (own == bbsc_npc_own.end()) {
-            continue;
-        }
-        known = true;
-        if (own->second != 0) {
-            return true;
-        }
+        const auto owner = bbsc_action_owner.find(it->flag);
+        if (owner == bbsc_action_owner.end()) continue;
+        if (owner->second) return true;
+        remote = true;
     }
-    return !known; // none of its triggers is ours (or none is kept: the game's own way)
+    return !remote; // no action yet: initialization; values of flags never establish ownership
+
 }
 
 void PS4_SYSV_ABI BbscEventBank2003Hook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
@@ -14855,9 +15034,7 @@ void PS4_SYSV_ABI BbscEventBank2003Hook(u64 /*tag*/, const GuestRegisterSnapshot
     }
     const u64 instance = registers->rsi;
     const s64 now = SteadyNowMs();
-    if (bbsc_event_run.instance == instance && now - bbsc_event_run.since_ms < 2'000) {
-        return;
-    }
+    // Re-evaluate provenance: an action may have started since the previous instruction.
     bbsc_event_run.instance = instance;
     bbsc_event_run.since_ms = now;
     bbsc_event_run.event = ReadablePointer(instance, 0xC0) ? BbscEventIdOf(instance) : -1;
@@ -14902,6 +15079,10 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
                             IsBbscTalkDrivenEvent(bbsc_event_run.event);
     NoteBbscTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx),
                      caller_offset, talk_event);
+    if (talk_event && static_cast<u8>(registers->rdx) != 0) {
+        std::scoped_lock owner_lock{bbsc_npc_own_mutex};
+        bbsc_action_owner[static_cast<u32>(registers->rsi)] = true;
+    }
     NoteBbscNpcOwnFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
     if (caller_offset == BbscTalkSetFlagReturnOffset) {
         NoteBbscLocalTalkFlag(static_cast<u32>(registers->rsi), static_cast<u8>(registers->rdx));
@@ -15189,6 +15370,12 @@ void TickBbscLifeBroadcast() {
     last_ms = now;
     const s32 state = GetSessionState();
     if (state != 3 && state != 6) {
+        const u64 global = GetGlobalState();
+        if (state == 0 && ReadablePointer(global, 0x1598) &&
+            ReadValue<u8>(global, 0x08) == 0 && ReadValue<u8>(global, 0x1592) != 0) {
+            std::scoped_lock life_lock{bbsc_life_mutex};
+            bbsc_peer_life.clear();
+        }
         return;
     }
     u32 player_id = bbsc_life_own_id.load();
@@ -15197,7 +15384,10 @@ void TickBbscLifeBroadcast() {
         bbsc_life_own_id = player_id;
     }
     const u64 player = GetLocalPlayerCharacter();
-    const bool dead = bbsc_spectate_active || (player != 0 && GetCharacterHp(player) <= 0);
+    const u64 global = GetGlobalState();
+    if (!player || !ReadablePointer(global, 0x10) || ReadValue<u8>(global, 0x08) != 0 ||
+        GetCharacterHp(player) < 0) return; // unknown/loading is never an alive or dead report
+    const bool dead = bbsc_spectate_active || GetCharacterHp(player) == 0;
     struct {
         u8 magic[4] = {'S', 'H', 'A', 'D'};
         u8 type = 0x23;
@@ -15213,6 +15403,10 @@ void TickBbscLifeBroadcast() {
     Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet, sizeof(packet));
     if (dead != last_dead) {
         last_dead = dead;
+        if (dead) {
+            bbsc_revivals_at_own_death = bbsc_peer_revivals.load();
+        }
+        bbsc_own_dead = dead;
         LOG_INFO(Debug, "BBSC life: told the others we are {} (session state {})",
                  dead ? "dead" : "alive", state);
     }
@@ -15539,11 +15733,133 @@ void TickBbscGuestTypeWatch() {
 // it (rest: lamp update 0x012F5C40 at 0x012F8259 once its rest timer +0xA0 runs out, travel
 // 0x019423A0, 0x0131E4A0/0x01312FF0/0x01321440/0x01338340); which one did is not known. Every change
 // is logged with the lamp being used ([0x05127ACC]), so the next log shows the moment.
+// T5 (2026-10-29, guest): at 17:21:08 the guest joined while the host was in the Dream, its
+// respawn point became the Dream's lamp and stayed so; the wipe at 17:27:36 then reloaded the guest
+// into the Dream first (its own respawn point), the follow took it to the host after. User: while a
+// guest is in a session its respawn point does not change (put back at the end), and a wipe reload
+// goes straight to the host's map / lamp. So from the first tick in state 6 (not an invader) the
+// point we had is held; any change is put back (BBSC CHECK FAIL RESPAWN-guest-changed), except
+// while we are dead: then it is the host's last lamp (from the follow packets; aux 101163 for a
+// lamp outside the Dream, 101200 in it, as every logged value), so the death reload's map choice
+// (0x01332BC0) picks the host's map. Out of the session (state 0, not loading) our own is put back.
+constexpr s32 BbscLampAux = 101163;
+constexpr s32 BbscDreamLampAux = 101200;
+
+s64 bbsc_guest_respawn_own = 0;
+bool bbsc_guest_respawn_held = false;
+bool bbsc_guest_respawn_released = false; // the guest left the session by itself: not held again
+
+void CaptureBbscGuestRespawnPoint() {
+    const u64 global = GetGlobalState();
+    if (!ReadablePointer(global, 0x1598) || bbsc_guest_respawn_held) return;
+    bbsc_guest_respawn_own = ReadValue<s64>(global, 0x1528);
+    bbsc_guest_respawn_held = true;
+    bbsc_guest_respawn_released = false;
+}
+
+// A dead guest that reloads by itself leaves the session first (TickBbscSpectate): its own respawn
+// point back now, before the reload picks the map.
+void ReleaseBbscGuestRespawnPoint(std::string_view why) {
+    const u64 global = GetGlobalState();
+    bbsc_guest_respawn_released = true;
+    if (!bbsc_guest_respawn_held || !ReadablePointer(global, 0x1598)) {
+        return;
+    }
+    bbsc_guest_respawn_held = false;
+    WriteValue<s64>(global, 0x1528, bbsc_guest_respawn_own);
+    LOG_INFO(Debug, "BBSC respawn point: our own {} back ({})",
+             static_cast<s32>(bbsc_guest_respawn_own & 0xFFFFFFFF), why);
+}
+
+// Returns true when it wrote the respawn point (the watch below then takes the new value quietly).
+bool GuardBbscGuestRespawnPoint(u64 global, s64 value) {
+    s64& own = bbsc_guest_respawn_own;
+    bool& held = bbsc_guest_respawn_held;
+    static s64 written = 0; // the last value BBSC wrote (the host's lamp while dead)
+    const s32 state = GetSessionState();
+    const bool loading = ReadValue<u8>(global, 0x08) != 0;
+    const bool invader = IsInvaderType(GetLocalCharacterType()) || GetLocalPlayerType() == 2;
+    if (state != 6 && state != 7) {
+        bbsc_guest_respawn_released = false;
+    }
+    if (state == 6 && !invader && !bbsc_guest_respawn_released) {
+        if (!held) {
+            if (loading) {
+                return false; // the join load: take it once we stand in the host's world
+            }
+            own = value;
+            held = true;
+            LOG_INFO(Debug, "BBSC respawn point: {} held for the session (a guest's does not change)",
+                     static_cast<s32>(own & 0xFFFFFFFF));
+            return false;
+        }
+        s64 want = own;
+        std::string_view whose = "ours, held for the session";
+        const u64 me = GetLocalPlayerCharacter();
+        if (me != 0 && GetCharacterHp(me) == 0) {
+            s32 host_lamp = -1;
+            {
+                std::scoped_lock lock{bbsc_follow_mutex};
+                if (bbsc_follow_latest.received_ms != 0) {
+                    host_lamp = bbsc_follow_latest.lamp_point;
+                }
+            }
+            if (host_lamp > 0) {
+                const bool dream = BbscMapArea(BbscLampPointMap(host_lamp)) ==
+                                   BbscMapArea(BbscDreamStateMap);
+                want = (static_cast<s64>(dream ? BbscDreamLampAux : BbscLampAux) << 32) |
+                       static_cast<s64>(static_cast<u32>(host_lamp));
+                whose = "the host's last lamp (we are dead: the reload goes to the host)";
+            }
+        }
+        if (value == want) {
+            return false;
+        }
+        WriteValue<s64>(global, 0x1528, want);
+        const bool by_us = value == written || want != own;
+        written = want;
+        if (by_us) {
+            LOG_INFO(Debug, "BBSC respawn point (guest): {} -> {} ({})",
+                     static_cast<s32>(value & 0xFFFFFFFF), static_cast<s32>(want & 0xFFFFFFFF), whose);
+            BBSC_TIMELINE("RESPAWN", "guest respawn point {} -> {} ({})",
+                          static_cast<s32>(value & 0xFFFFFFFF), static_cast<s32>(want & 0xFFFFFFFF),
+                          whose);
+            return true;
+        }
+        LOG_WARNING(Debug, "BBSC CHECK FAIL RESPAWN-guest-changed: a guest's respawn point is {} "
+                           "(session state 6, map {:#x}, loading {}) - set to {} ({})",
+                    static_cast<s32>(value & 0xFFFFFFFF), GetCurrentPackedMap(), loading,
+                    static_cast<s32>(want & 0xFFFFFFFF), whose);
+        BBSC_TIMELINE("CHECK", "RESPAWN-guest-changed: {} -> {} ({})",
+                      static_cast<s32>(value & 0xFFFFFFFF), static_cast<s32>(want & 0xFFFFFFFF),
+                      whose);
+        return true;
+    }
+    if (!held || state == 6 || state == 7 || loading) {
+        return false;
+    }
+    held = false;
+    if ((state != 0 && state != 3) || value == own) {
+        return false;
+    }
+    WriteValue<s64>(global, 0x1528, own);
+    LOG_INFO(Debug, "BBSC respawn point: session over - our own {} back (was {})",
+             static_cast<s32>(own & 0xFFFFFFFF), static_cast<s32>(value & 0xFFFFFFFF));
+    BBSC_TIMELINE("RESPAWN", "session over - our own respawn point {} back",
+                  static_cast<s32>(own & 0xFFFFFFFF));
+    return true;
+}
+
 void TickBbscRespawnPointWatch() {
     static s64 last_value = 0;
     static bool have = false;
     const u64 global = GetGlobalState();
     if (!ReadablePointer(global, 0x1598)) {
+        return;
+    }
+    if (GuardBbscGuestRespawnPoint(global, ReadValue<s64>(global, 0x1528))) {
+        last_value = ReadValue<s64>(global, 0x1528);
+        have = true;
         return;
     }
     const s64 value = ReadValue<s64>(global, 0x1528);

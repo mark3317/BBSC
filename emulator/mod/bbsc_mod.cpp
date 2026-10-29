@@ -977,6 +977,38 @@ void LogCineInput(const CinematicInput& c, bool front, bool i, bool j, bool k, b
     LOG_INFO(Debug, "BBSC cinematic camera input: {}", line);
 }
 
+// Read the same SDL3 state bbport updates, including controllers opened by bbport.
+void ReadCineSdl(bool& i, bool& j, bool& k, bool& l, float& rx, float& ry) {
+    const HMODULE dll = GetModuleHandleW(L"SDL3.dll");
+    if (!dll) return;
+    using Keys = const bool* (*)(int*);
+    using Pads = unsigned* (*)(int*);
+    using FromId = void* (*)(unsigned);
+    using Axis = short (*)(void*, int);
+    using Free = void (*)(void*);
+    auto keys = reinterpret_cast<Keys>(GetProcAddress(dll, "SDL_GetKeyboardState"));
+    auto pads = reinterpret_cast<Pads>(GetProcAddress(dll, "SDL_GetGamepads"));
+    auto from = reinterpret_cast<FromId>(GetProcAddress(dll, "SDL_GetGamepadFromID"));
+    auto axis = reinterpret_cast<Axis>(GetProcAddress(dll, "SDL_GetGamepadAxis"));
+    auto free = reinterpret_cast<Free>(GetProcAddress(dll, "SDL_free"));
+    int count = 0;
+    if (keys) {
+        const bool* state = keys(&count);
+        if (state && count > 15) { i = state[12]; j = state[13]; k = state[14]; l = state[15]; }
+    }
+    if (pads && from && axis && free) {
+        unsigned* ids = pads(&count);
+        for (int n = 0; ids && n < count; ++n) {
+            void* pad = from(ids[n]);
+            if (!pad) continue;
+            auto normalized = [](short v) { return std::abs(v) < 6000 ? 0.0f : v / 32768.0f; };
+            rx = normalized(axis(pad, 2)); ry = normalized(axis(pad, 3));
+            break;
+        }
+        free(ids);
+    }
+}
+
 CinematicInput TakeCinematicInput() {
     std::scoped_lock lock{cine_mutex};
     DWORD pid = 0;
@@ -1012,10 +1044,13 @@ CinematicInput TakeCinematicInput() {
     c.roll_left = down(VK_OEM_COMMA);
     c.roll_right = down(VK_OEM_PERIOD);
     c.roll_reset = CineKeyPressed(VK_OEM_2, down(VK_OEM_2));
-    c.look_up = down(VK_UP);
-    c.look_down = down(VK_DOWN);
-    c.look_left = down(VK_LEFT);
-    c.look_right = down(VK_RIGHT);
+    bool key_i = false, key_j = false, key_k = false, key_l = false;
+    float sdl_rx = 0, sdl_ry = 0;
+    if (front) ReadCineSdl(key_i, key_j, key_k, key_l, sdl_rx, sdl_ry);
+    c.look_up = down(VK_UP) || key_i;
+    c.look_down = down(VK_DOWN) || key_k;
+    c.look_left = down(VK_LEFT) || key_j;
+    c.look_right = down(VK_RIGHT) || key_l;
     c.wheel = (CineKeyPressed(VK_PRIOR, down(VK_PRIOR)) ? 1 : 0) -
               (CineKeyPressed(VK_NEXT, down(VK_NEXT)) ? 1 : 0) + p.speed_steps +
               cine_wheel.exchange(0);
@@ -1035,8 +1070,8 @@ CinematicInput TakeCinematicInput() {
     c.pad_move_x = p.lx;
     c.pad_move_y = -p.ly; // stick up = smaller y = forward
     c.pad_rise = ((p.buttons & PadR1) ? 1.0f : 0.0f) - ((p.buttons & PadL1) ? 1.0f : 0.0f);
-    c.pad_look_x = p.rx;
-    c.pad_look_y = -p.ry;
+    c.pad_look_x = front ? sdl_rx : 0;
+    c.pad_look_y = front ? -sdl_ry : 0;
     c.pad_zoom = p.r2 - p.l2;
     // Mouse look, no button needed: the cursor's movement, put back in the middle of the game
     // window each frame (hidden there by CineWindowProc).
