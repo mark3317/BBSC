@@ -6738,6 +6738,16 @@ void TickBbscOwnWorld() {
 void RestoreBbscOwnWorldAtLoad() {
     if (!bbsc_own_world.empty()) {
         RestoreBbscOwnWorld("during the home load");
+        return;
+    }
+    // T4 (2026-10-29, guest quit during a join): the next run waited 15 s at home before it read the
+    // file an earlier run left - the game was closed after 16 s and had saved the host's world in
+    // the meantime. A file left by a crash or quit is now put back right here, before the map's
+    // events read the flags (TickBbscOwnWorld's 15 s check stays as the fallback).
+    if (image_base != 0 && BbscHomeForOwnWorld()) {
+        if (const auto slot = BbscActiveSaveSlot(); slot.has_value()) {
+            RecoverBbscOwnWorldFile(*slot);
+        }
     }
 }
 
@@ -11969,6 +11979,67 @@ void FinishBbscLedgerContext() {
 }
 
 // While a guest in the host's world: given items are looked for 1.5 s later, counts kept.
+// T4 (2026-10-29, runs/20261029-124126): every load in the host's world - a death, a follow load,
+// the Dream - took the key items the guest got on this trip (+4114 at a boss kill, -4114 at the
+// next load; the same for 4000, 4110, 4103, 4011), and the trip home switched the bag to our own
+// slots without them (the bag's slot array [bag+0x58] is one for the phantom, another for home).
+// User: the game does it, so after every load in the host's world and after the trip home the
+// mod puts the trip's key and unique items back (goods types 1 and 6, weapons, attire), quietly;
+// it never removes anything. Counts are frozen around a load; a key item handed to an NPC (count
+// down while no load ran) lowers what is expected.
+bool bbsc_ledger_loading = false;
+s64 bbsc_ledger_load_end_ms = 0;
+
+bool BbscLedgerWatched(u32 code) {
+    const u32 type = code >> 28;
+    if (type == 0 || type == 1) {
+        return true; // a weapon or attire
+    }
+    if (type != 4) {
+        return false;
+    }
+    static u64 table = 0;
+    if (table == 0) {
+        table = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
+    }
+    const u64 row = table != 0 ? BbscParamRow(table, code & 0x0FFFFFFFu, 0x40) : 0;
+    const u8 goods_type = row != 0 ? ReadValue<u8>(row, 58) : 0;
+    return goods_type == 1 || goods_type == 6;
+}
+
+// The trip's watched items short of what they were: put back. Returns how many were added.
+size_t PutBackBbscTripItems(std::string_view where) {
+    std::map<u32, s32> expected;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        for (const auto& e : bbsc_ledger) {
+            if (e.state == BbscLedgerState::Given && e.code != 0) {
+                if (const auto it = bbsc_ledger_host_counts.find(e.code);
+                    it != bbsc_ledger_host_counts.end()) {
+                    expected[e.code] = it->second;
+                }
+            }
+        }
+    }
+    size_t added = 0;
+    for (const auto& [code, want] : expected) {
+        if (!BbscLedgerAddable(code) || !BbscLedgerWatched(code)) {
+            continue;
+        }
+        const s32 have = BbscLedgerCount(code);
+        if (have >= want) {
+            continue;
+        }
+        const bool ok = AddBbscLedgerItem(code, want - have);
+        added += ok ? static_cast<size_t>(want - have) : 0;
+        LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-at-load: {:#x} {} -> {} {} - {}", code, want, have,
+                    where, ok ? "put back" : "AddItem did not take it");
+        BBSC_TIMELINE("CHECK", "K2-lost-at-load: {:#x} {} -> {} {} - {}", code, want, have, where,
+                      ok ? "put back" : "not taken");
+    }
+    return added;
+}
+
 void CheckBbscLedgerGiven(s64 now) {
     struct Due {
         size_t index;
@@ -11985,7 +12056,10 @@ void CheckBbscLedgerGiven(s64 now) {
         }
     }
     static s64 counted_ms = 0;
-    const bool recount = now - counted_ms >= 2'000;
+    // Not during a load and not right after one (until the check after it ran): a load in the
+    // host's world takes the trip's key items (T4) and the count here is what they should be.
+    const bool recount = now - counted_ms >= 2'000 && !bbsc_ledger_loading &&
+                         now - bbsc_ledger_load_end_ms >= 6'000;
     if (due.empty() && !recount) {
         return;
     }
@@ -12172,8 +12246,9 @@ void RetroBbscLedger() {
              slot->user, slot->slot, looked, flags.size(), given);
 }
 
-// Home again and settled: the trip's given items counted once, 5 s after the home load - read
-// only. Test 3 (2026-10-29, docs/fixes/T3-results.md): the White Messenger Ribbon picked up as a
+// Home again and settled: the trip's given items counted, 5 s after the home load. T4 (user): the
+// trip's key and unique items are put back here and at 30 s / 60 s (PutBackBbscTripItems), the
+// rest is owed until the next join; the mod never removes anything. Test 3 (2026-10-29, docs/fixes/T3-results.md): the White Messenger Ribbon picked up as a
 // phantom was gone 5 s after the trip home; put back there by the mod (an earlier build), it was
 // missing again while the guest was in the host's world on the next join and back at home after
 // it. So the game keeps the key items of our own world apart while we are a phantom and puts them
@@ -12214,6 +12289,14 @@ bool ReconcileBbscLedgerAtHome() {
             continue;
         }
         lost_items += static_cast<size_t>(lost);
+        if (BbscLedgerWatched(code) && AddBbscLedgerItem(code, lost)) {
+            LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, "
+                               "{} at home (the trip gave {}) - put back",
+                        code, seen->second, home, count);
+            BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} - put back", code,
+                          seen->second, home);
+            continue;
+        }
         LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, {} "
                            "at home (the trip gave {}) - owed until the next join",
                     code, seen->second, home, count);
@@ -12232,14 +12315,30 @@ bool ReconcileBbscLedgerAtHome() {
                  gained.size());
         BBSC_TIMELINE("CHECK", "OK K2-trip-home: {} item kind(s) still with us", gained.size());
     }
+    // The watched (key / unique) entries stay for the later checks of this trip home (30 s, 60 s:
+    // TickBbscItemLedger), the rest is done.
     std::scoped_lock lock{bbsc_ledger_mutex};
-    std::erase_if(bbsc_ledger,
-                  [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
-    bbsc_ledger_host_counts.clear();
+    std::erase_if(bbsc_ledger, [](const BbscLedgerEntry& e) {
+        return e.state == BbscLedgerState::Given &&
+               (!BbscLedgerAddable(e.code) || !BbscLedgerWatched(e.code));
+    });
+    std::erase_if(bbsc_ledger_host_counts, [](const auto& entry) {
+        return !BbscLedgerAddable(entry.first) || !BbscLedgerWatched(entry.first);
+    });
     bbsc_ledger.insert(bbsc_ledger.end(), owed.begin(), owed.end());
     bbsc_ledger_dirty = true;
     WriteBbscLedgerLocked();
     return true;
+}
+
+// The trip home is over (60 s): its entries are done.
+void FinishBbscTripAtHome() {
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    std::erase_if(bbsc_ledger,
+                  [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
+    bbsc_ledger_host_counts.clear();
+    bbsc_ledger_dirty = true;
+    WriteBbscLedgerLocked();
 }
 
 // The join check, once per summon, when the guest accepts it (lua JoinSession_White) - still in its
@@ -12456,15 +12555,18 @@ void TickBbscKeyItemCensus(s64 now) {
 }
 
 // Hooks that only log (tags: 0 the command handler 0x014D3DC0, 1 the bag clear 0x014D0030,
-// 2 the removal by item 0x014D0BE0, 3 the removal by slot 0x014D0310).
-constexpr std::array<u64, 4> BbscItemResearchSites{0x014D3DC0, 0x014D0030, 0x014D0BE0, 0x014D0310};
+// 2 the removal by item 0x014D0BE0, 3 the removal by slot 0x014D0310, 4 the save writer 0x0156AA50 -
+// T4: does a guest's save in a session write the host's world and the phantom's bag slots).
+constexpr std::array<u64, 5> BbscItemResearchSites{0x014D3DC0, 0x014D0030, 0x014D0BE0, 0x014D0310,
+                                                   0x0156AA50};
 
 void PS4_SYSV_ABI BbscItemResearchHook(u64 tag, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || tag >= BbscItemResearchSites.size()) {
         return;
     }
     const u32 arg = static_cast<u32>(registers->rsi);
-    const bool always = (tag == 0 && arg >= 23 && arg <= 25) || tag == 1;
+    const bool always = (tag == 0 && arg >= 23 && arg <= 25) || tag == 1 ||
+                        (tag == 4 && GetSessionState() != 0);
     if (!always && !BbscKeyCensusActive()) {
         return;
     }
@@ -12486,6 +12588,12 @@ void PS4_SYSV_ABI BbscItemResearchHook(u64 tag, const GuestRegisterSnapshot* reg
             return;
         }
         what = fmt::format("args {:#x} {:#x} {:#x}", registers->rsi, registers->rdx, registers->rcx);
+    } else if (tag == 4) {
+        const u64 global = GetGlobalState();
+        const u64 carried = BbscCarriedInventory();
+        what = fmt::format("own world {}, bag slots {:#x}",
+                           ReadablePointer(global, 0x1598) ? ReadValue<u8>(global, 0x1592) : 0xFF,
+                           carried != 0 ? ReadValue<u64>(carried, 0x58) : 0);
     } else {
         what = fmt::format("{} {}", tag == 0 ? "message" : "flag", arg);
     }
@@ -12500,9 +12608,9 @@ void PS4_SYSV_ABI BbscItemResearchHook(u64 tag, const GuestRegisterSnapshot* reg
     const u64 ret1 = ReadablePointer(frame + 8, 8) ? ReadValue<u64>(frame, 8) : 0;
     const u64 frame2 = ReadablePointer(frame, 8) ? ReadValue<u64>(frame, 0) : 0;
     const u64 ret2 = ReadablePointer(frame2 + 8, 8) ? ReadValue<u64>(frame2, 8) : 0;
-    static constexpr std::array<std::string_view, 4> Names{
+    static constexpr std::array<std::string_view, 5> Names{
         "inventory command 0x014D3DC0", "bag clear 0x014D0030", "remove by item 0x014D0BE0",
-        "remove by slot 0x014D0310"};
+        "remove by slot 0x014D0310", "save writer 0x0156AA50"};
     LOG_INFO(Debug, "BBSC research: {} - {} (object {:#x}, session state {}, callers {:#x} <- {:#x} "
                     "<- {:#x})",
              Names[tag], what, registers->rdi, GetSessionState(), off(ret0), off(ret1), off(ret2));
@@ -12539,13 +12647,28 @@ void TickBbscItemLedger() {
         slot_known = bbsc_ledger_slot.has_value();
     }
     static s64 home_since_ms = 0;
-    static bool home_counted = false;
+    static int home_checks = 0; // 0 none, 1 at 5 s, 2 at 30 s, 3 at 60 s (done)
     static s64 written_ms = 0;
+    static bool load_checked = true;
     const u64 global = GetGlobalState();
     const s32 state = GetSessionState();
+    const bool loading_now = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
+    if (loading_now) {
+        bbsc_ledger_loading = true;
+    } else if (bbsc_ledger_loading) {
+        bbsc_ledger_loading = false;
+        bbsc_ledger_load_end_ms = now;
+        load_checked = false;
+    }
     if (BbscGuestInHostWorld()) {
         home_since_ms = 0;
-        home_counted = false;
+        home_checks = 0;
+        // 3 s after a load in the host's world, alive: the trip's key items back if it took them.
+        if (!load_checked && !loading_now && now - bbsc_ledger_load_end_ms >= 3'000 &&
+            GetCharacterHp(GetLocalPlayerCharacter()) > 0) {
+            load_checked = true;
+            PutBackBbscTripItems("after a load in the host's world");
+        }
         CheckBbscLedgerGiven(now);
     } else {
         const bool home = (state == 0 || state == 3) && ReadablePointer(global, 0x1593) &&
@@ -12556,8 +12679,15 @@ void TickBbscItemLedger() {
             home_since_ms = 0;
         } else if (home_since_ms == 0) {
             home_since_ms = now;
-        } else if (!home_counted && slot_known && now - home_since_ms >= 5'000) {
-            home_counted = ReconcileBbscLedgerAtHome(); // once per trip home, read only
+        } else if (slot_known && home_checks == 0 && now - home_since_ms >= 5'000) {
+            home_checks = ReconcileBbscLedgerAtHome() ? 1 : 0; // the trip home: counted, put back
+        } else if (home_checks == 1 && now - home_since_ms >= 30'000) {
+            home_checks = 2;
+            PutBackBbscTripItems("at home (30 s)");
+        } else if (home_checks == 2 && now - home_since_ms >= 60'000) {
+            home_checks = 3;
+            PutBackBbscTripItems("at home (60 s)");
+            FinishBbscTripAtHome();
         }
     }
     std::scoped_lock lock{bbsc_ledger_mutex};
@@ -13203,7 +13333,9 @@ u8 bbsc_dream_type_skip = 0;
 // from its compile-time check instead. Game thread only.
 std::array<u64, 64> bbsc_dream_type_conditions{};
 size_t bbsc_dream_type_next = 0;
-std::array<s64, 32> bbsc_dream_type_logged{};
+// T4 (2026-10-29): with 32 slots full every further call was logged - 4.9 million lines in 30 min
+// (a 410 MB log, the guest's frame rate down to 17). Each event once per load, at most 4096.
+std::vector<s64> bbsc_dream_type_logged;
 
 void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr) {
@@ -13256,12 +13388,9 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
     }
     WriteValue<u8>(condition, 0x10, static_cast<u8>(ReadValue<u8>(condition, 0x10) | 1));
     bbsc_dream_type_skip = 1;
-    if (event > 0 && std::ranges::find(bbsc_dream_type_logged, event) ==
-                         bbsc_dream_type_logged.end()) {
-        if (const auto free = std::ranges::find(bbsc_dream_type_logged, 0);
-            free != bbsc_dream_type_logged.end()) {
-            *free = event;
-        }
+    if (event > 0 && bbsc_dream_type_logged.size() < 4096 &&
+        std::ranges::find(bbsc_dream_type_logged, event) == bbsc_dream_type_logged.end()) {
+        bbsc_dream_type_logged.push_back(event);
         LOG_INFO(Debug, "BBSC Dream: event {} runs for the guest as for the host", event);
     }
 }
@@ -13449,7 +13578,7 @@ void TickBbscDream() {
         TickBbscDreamTools(true);
         bbsc_dream_talk_logged = 0;
         bbsc_dream_tools_logged = false;
-        bbsc_dream_type_logged.fill(0);
+        bbsc_dream_type_logged.clear();
     }
 }
 
@@ -19613,7 +19742,15 @@ static_assert(sizeof(BbscCutscenePacket) == 0x60);
 thread_local bool bbsc_cutscene_replaying = false;
 std::mutex bbsc_cutscene_mutex;
 std::deque<BbscCutscenePacket> bbsc_cutscene_queue;          // from the host, for the game thread
-std::unordered_map<s32, s64> bbsc_cutscene_own_ms;           // our own requests, by cutscene id
+// T4 (2026-10-29, Father Gascoigne): the host's cutscene 24010010 played here at 13:12:47, and the
+// guest's own fog event 12411802 asked for it again at 13:13:35 - twice. Now a cutscene plays once
+// per load here, whichever comes first: our own request is skipped (bbsc_cutscene_skip: the
+// request site's hook skips the call) when the host's already played since the last load, and the
+// host's is not replayed when our own game played it. Safe for the fog events: 2002[03] does not
+// hold the event (12411802: the boss is enabled right after it, read with tools/gamedata/emevd.py).
+std::unordered_map<s32, u32> bbsc_cutscene_seen; // cutscene id -> load generation it played in
+std::atomic<u32> bbsc_load_generation{0};          // +1 at the end of every load (game tick)
+u8 bbsc_cutscene_skip = 0;
 
 bool BbscCutscenesEnabled() {
     static const bool enabled = [] {
@@ -19641,7 +19778,18 @@ void OnBbscCutsceneRequestHook(u64 offset, const GuestRegisterSnapshot& register
     const s32 state = GetSessionState();
     if (state == 6) {
         std::scoped_lock lock{bbsc_cutscene_mutex};
-        bbsc_cutscene_own_ms[cutscene] = SteadyNowMs();
+        const u32 generation = bbsc_load_generation.load();
+        const auto seen = bbsc_cutscene_seen.find(cutscene);
+        if (seen != bbsc_cutscene_seen.end() && seen->second == generation) {
+            bbsc_cutscene_skip = 1; // the game's own request does not run
+            LOG_INFO(Debug, "BBSC cutscenes: our own cutscene {} skipped - the host's played here "
+                            "already since the last load",
+                     cutscene);
+            BBSC_TIMELINE("CUTSCENE", "our own cutscene {} skipped: the host's played already",
+                          cutscene);
+            return;
+        }
+        bbsc_cutscene_seen[cutscene] = generation;
         return;
     }
     if (state != 3) {
@@ -19834,6 +19982,15 @@ void OnBbscKeyItemsPacket(const void* data, std::size_t size) {
 
 namespace {
 void TickBbscCutsceneReplay() {
+    {
+        static bool was_loading = false;
+        const u64 global = GetGlobalState();
+        const bool loading = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
+        if (was_loading && !loading) {
+            ++bbsc_load_generation; // a new load: its cutscenes may play again
+        }
+        was_loading = loading;
+    }
     BbscCutscenePacket packet{};
     {
         std::scoped_lock lock{bbsc_cutscene_mutex};
@@ -19856,12 +20013,16 @@ void TickBbscCutsceneReplay() {
     }
     {
         std::scoped_lock lock{bbsc_cutscene_mutex};
-        const auto own = bbsc_cutscene_own_ms.find(packet.cutscene);
-        if (own != bbsc_cutscene_own_ms.end() && SteadyNowMs() - own->second < 15'000) {
-            BBSC_TIMELINE("CUTSCENE", "the host's cutscene {}: our game asked for it too", 
-                          packet.cutscene);
+        const u32 generation = bbsc_load_generation.load();
+        const auto seen = bbsc_cutscene_seen.find(packet.cutscene);
+        if (seen != bbsc_cutscene_seen.end() && seen->second == generation) {
+            LOG_INFO(Debug, "BBSC cutscenes: the host's cutscene {} not replayed - it played here "
+                            "already since the last load",
+                     packet.cutscene);
+            BBSC_TIMELINE("CUTSCENE", "the host's cutscene {}: played here already", packet.cutscene);
             return;
         }
+        bbsc_cutscene_seen[packet.cutscene] = generation;
     }
     static std::array<u8, 64> rcx_buffer{};
     std::memcpy(rcx_buffer.data(), packet.rcx_bytes, sizeof(packet.rcx_bytes));
@@ -20924,8 +21085,11 @@ void InstallReverseEngineeringTrace() {
             continue;
         }
         const auto expected = std::span<const u8>{site.prologue.data(), site.prologue_size};
+        // The cutscene request sites can skip the game's own call (bbsc_cutscene_skip).
         if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + site.offset), expected,
-                                  index, TraceEntry)) {
+                                  index, TraceEntry,
+                                  BbscCutsceneVariant(site.offset) >= 0 ? &bbsc_cutscene_skip
+                                                                        : nullptr)) {
             LOG_ERROR(Debug, "Failed to install Bloodborne RE hook {} at {:#x}", site.name,
                       site.offset);
             continue;
