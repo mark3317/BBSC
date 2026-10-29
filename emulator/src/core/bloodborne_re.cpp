@@ -12881,10 +12881,12 @@ void DeliverBbscLedgerAtJoin(std::string_view why) {
     const auto stored = BbscKeyItemsIn(BbscStorageInventory());
     std::scoped_lock lock{bbsc_ledger_mutex};
     for (const auto& [id, count] : carried) {
+        if (!IsBbscRetroGoods(id)) continue; // do not pin quest offerings consumed by NPCs
         const u32 code = 0x40000000u | id;
         bbsc_ledger_trip[code] = std::max(bbsc_ledger_trip[code], count);
     }
     for (const auto& [id, count] : stored) {
+        if (!IsBbscRetroGoods(id)) continue;
         const u32 code = 0x40000000u | id;
         // The journal compares carried + stored; do not create duplicates of stored keys.
         const auto it = std::ranges::find(carried, id, &std::pair<u32, s32>::first);
