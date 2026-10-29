@@ -14906,6 +14906,7 @@ void FlushBbscSessionJournals() {
     CaptureBbscGuestLoot();
     WriteBbscGuestLootFile();
     WriteBbscOwnWorldFile();
+    WriteBbscPendingProgress(); // include the last boss/world updates before the title unload
     std::optional<BbscSaveSlot> slot;
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
