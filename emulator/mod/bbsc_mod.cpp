@@ -705,6 +705,24 @@ HWND cine_window = nullptr;          // the subclassed game window (SDL's "SDL_a
 WNDPROC cine_window_proc = nullptr;  // its own window procedure
 std::atomic<bool> cine_mouse_owned{false}; // the camera is on and has the mouse
 std::atomic<int> cine_wheel{0};      // wheel notches since the last TakeCinematicInput
+// 2026-10-29 (user: "the camera does not turn while watching"): bbport's mouse camera puts SDL in
+// relative mouse mode (gpu/shim/window.cpp) - the cursor stays put and the movement comes as raw
+// input only, so the cursor delta below was always 0. The raw movement CineWindowProc keeps from
+// the game is counted here and used instead whenever there is any.
+std::atomic<int> cine_raw_dx{0};
+std::atomic<int> cine_raw_dy{0};
+
+// SDL's own relative motion (bbport ships SDL3.dll): there whichever way SDL takes its raw input.
+using SdlRelativeMouseFn = u32 (*)(float* x, float* y);
+SdlRelativeMouseFn SdlRelativeMouse() {
+    static const SdlRelativeMouseFn fn = [] {
+        const HMODULE sdl = GetModuleHandleW(L"SDL3.dll");
+        return sdl != nullptr ? reinterpret_cast<SdlRelativeMouseFn>(
+                                    GetProcAddress(sdl, "SDL_GetRelativeMouseState"))
+                              : nullptr;
+    }();
+    return fn;
+}
 
 LRESULT CALLBACK CineWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (cine_mouse_owned) {
@@ -756,6 +774,10 @@ LRESULT CALLBACK CineWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM
                                            RI_MOUSE_BUTTON_3_UP | RI_MOUSE_BUTTON_4_UP |
                                            RI_MOUSE_BUTTON_5_UP;
                     release = (raw.data.mouse.usButtonFlags & Ups) != 0;
+                    if ((raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                        cine_raw_dx += raw.data.mouse.lLastX; // the camera's, not the game's
+                        cine_raw_dy += raw.data.mouse.lLastY;
+                    }
                 }
                 if (!release) {
                     return DefWindowProcW(window, message, wparam, lparam);
@@ -958,7 +980,22 @@ CinematicInput TakeCinematicInput() {
     if (window != nullptr && GetClientRect(window, &client) && GetCursorPos(&now)) {
         POINT center{(client.left + client.right) / 2, (client.top + client.bottom) / 2};
         ClientToScreen(window, &center);
-        if (cine_looking) {
+        const int raw_dx = cine_raw_dx.exchange(0);
+        const int raw_dy = cine_raw_dy.exchange(0);
+        float sdl_dx = 0.0f;
+        float sdl_dy = 0.0f;
+        if (const SdlRelativeMouseFn relative = SdlRelativeMouse(); relative != nullptr) {
+            relative(&sdl_dx, &sdl_dy); // also resets it: the first frame below drops what piled up
+        }
+        if (!cine_looking) {
+            // The camera's first frame (or the window back in front): no jump.
+        } else if (sdl_dx != 0.0f || sdl_dy != 0.0f) {
+            c.mouse_dx = sdl_dx;
+            c.mouse_dy = sdl_dy;
+        } else if (raw_dx != 0 || raw_dy != 0) {
+            c.mouse_dx = static_cast<float>(raw_dx); // relative mouse mode: the raw movement
+            c.mouse_dy = static_cast<float>(raw_dy);
+        } else if (cine_looking) {
             c.mouse_dx = static_cast<float>(now.x - cine_anchor.x);
             c.mouse_dy = static_cast<float>(now.y - cine_anchor.y);
         }

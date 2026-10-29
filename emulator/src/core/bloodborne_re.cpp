@@ -7296,8 +7296,7 @@ constexpr u64 NowLoadingCloseOffset = 0x0176D3C0;
 constexpr u64 NowLoadingSetStateOffset = 0x0176D320;
 constexpr float BbscCurtainFadeOutS = 0.6f;
 constexpr float BbscCurtainFadeInS = 0.8f;
-constexpr s64 BbscCurtainHoldMs = 2'500;      // black + loading screen, the "load"
-constexpr s64 BbscCurtainShowWaitMs = 1'500;  // give up waiting for the loading screen to show
+constexpr s64 BbscCurtainHoldMs = 2'500;      // black, the "load"
 constexpr s64 BbscCurtainCloseWaitMs = 3'000; // give up waiting for it to close
 constexpr s64 BbscCurtainLimitMs = 15'000;    // whatever happens, the screen comes back
 
@@ -7555,23 +7554,10 @@ void TickBbscLoadCover() {
         }
         if (!bbsc_load_cover.game_screen_seen) {
             WriteValue<s32>(menu, 0x808, 2);
-        } else if (!BbscCurtainActive()) {
-            // 2026-10-05 (tester): "it shows me pop in for a second and then it shows me the load
-            // screen and then it shows me" - between the summon load and the join's second reload
-            // (and after a load, until the guest is placed) the black plate did not hide the map.
-            // The game's loading screen closed with its load, so BBSC opens it again (the death
-            // curtain's kind) and keeps it up until EndBbscLoadCover; a load in between runs its
-            // own on top. HYPOTHESIS until a test shows no pop-in.
-            bbsc_loading_close_ms = 0; // the cover owns the loading screen now
-            if (BbscLoadingScreen(true)) {
-                if (!bbsc_load_cover.own_screen) {
-                    LOG_INFO(Debug, "BBSC load cover: loading screen kept up until the guest is "
-                                    "placed ({})",
-                             bbsc_load_cover.why);
-                }
-                bbsc_load_cover.own_screen = true;
-            }
         }
+        // 2026-10-29 (PT-4): between the loads (and after them, until the guest is placed) the
+        // cover no longer opens the game's loading screen itself - the black plate below covers
+        // it (a missed close left the logo over the loaded game, see the death curtain).
     }
     if (now - bbsc_load_cover.started_ms < static_cast<s64>(BbscLoadCoverFadeOutS * 1000.0f)) {
         return; // our own fade-out is still running
@@ -7651,21 +7637,22 @@ void TickBbscDeathCurtain() {
             }
             return;
         }
-        bbsc_curtain.shown = BbscLoadingScreen(true);
+        // 2026-10-29 (user, PT-4: "the logo screen stays over the loaded game after a death"):
+        // BBSC no longer opens the game's loading screen for a load that is not one - closing it
+        // depends on the NowLoading menu script's handshake, and a missed close left the logo up.
+        // The curtain is the black plate only; real loads show the game's own screen as always.
+        bbsc_curtain.shown = false;
         BbscCurtainStepTo(BbscCurtainStep::Loading, now);
         return;
     case BbscCurtainStep::Loading:
-        if (!bbsc_curtain.shown) {
-            bbsc_curtain.shown = BbscLoadingScreen(true); // the stage flow also asks every frame
-        }
-        if (in_step < BbscCurtainHoldMs || (!bbsc_curtain.shown && in_step < BbscCurtainHoldMs +
-                                                                      BbscCurtainShowWaitMs)) {
+        if (in_step < BbscCurtainHoldMs) {
             return;
         }
-        if (!bbsc_curtain.shown) {
-            LOG_WARNING(Debug, "BBSC death curtain: the loading screen did not show, closing anyway");
+        if (BbscLoadingScreenState() != 0) {
+            BbscCurtainStepTo(BbscCurtainStep::Closing, now); // someone else's screen: close it
+            return;
         }
-        BbscCurtainStepTo(BbscCurtainStep::Closing, now);
+        EndBbscDeathCurtain(now, "black hold over");
         return;
     case BbscCurtainStep::Closing:
         if (BbscLoadingScreen(false)) {
@@ -8959,6 +8946,26 @@ void TickBbscSpectate() {
              now - bbsc_spectate_since_ms, reason);
     bbsc_spectate_active = false;
     bbsc_spectate_releasing = true;
+    if (session_state == 6) {
+        // PT-2 (playtest 2026-10-27: guests thrown into the Hunter's Dream after a boss wipe, unable
+        // to do anything): a guest's own death reload goes to ITS respawn point (often the Dream,
+        // see 2026-10-04 above) - with the session kept that is the host's session in our own
+        // Dream, a soft lock. A guest that has to reload by itself is out of the co-op anyway, so
+        // the session ends first (patches lifted, CSMultiPlayMan::Stop) and the reload is then the
+        // game's own trip home.
+        SuspendBbscPersistenceOnce("a dead guest reloads by itself: the co-op ends first");
+        const u64 session_manager = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
+        if (ReadablePointer(session_manager, 0x128)) {
+            using Stop = u8 PS4_SYSV_ABI (*)(u64 session_manager);
+            const u8 stopped =
+                reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(session_manager);
+            LOG_INFO(Debug, "BBSC spectate: the guest leaves the session before its own reload "
+                            "(Stop -> {})",
+                     stopped);
+            BBSC_TIMELINE("DEATH", "dead guest reloads by itself: session ended first (Stop -> {})",
+                          stopped);
+        }
+    }
     RequestBbscDeathReload(reason);
     bbsc_spectate_releasing = false;
 }
