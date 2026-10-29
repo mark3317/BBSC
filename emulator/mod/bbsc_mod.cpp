@@ -724,6 +724,22 @@ SdlRelativeMouseFn SdlRelativeMouse() {
     return fn;
 }
 
+// 2026-10-29 (test: "the camera does not turn with I J K L while watching"): the keys the camera
+// reads itself. Others reach the game while it is on: bbport turns its key bindings into the pad
+// (camera keys = the right stick), and PadReadState hands that pad to the camera, not the hunter.
+bool CineOwnsKey(int vk) {
+    switch (vk) {
+    case 'W': case 'A': case 'S': case 'D': case 'E': case 'Q': case 'C': case 'Z': case 'X':
+    case 'V': case 'F': case VK_SPACE: case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: case VK_MENU:
+    case VK_LMENU: case VK_RMENU: case VK_OEM_COMMA: case VK_OEM_PERIOD: case VK_OEM_2:
+    case VK_OEM_4: case VK_OEM_6: case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT:
+    case VK_TAB: case VK_PRIOR: case VK_NEXT: case VK_F1:
+        return true;
+    default:
+        return false;
+    }
+}
+
 LRESULT CALLBACK CineWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (cine_mouse_owned) {
         if (message == WM_MOUSEWHEEL) {
@@ -740,8 +756,13 @@ LRESULT CALLBACK CineWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM
         // the camera is on, presses and movement stop here; the emulator (SDL) never sees them.
         // Releases still go through, so a key held when the camera came on is not left stuck.
         // The camera reads the keys itself (GetAsyncKeyState), so it is not affected. Alt+F4 passes.
+        // Keys the camera does not use go through (CineOwnsKey: bbport binds them to the pad).
         switch (message) {
         case WM_KEYDOWN:
+            if (!CineOwnsKey(static_cast<int>(wparam))) {
+                break; // not a camera key: bbport may bind it (I J K L = right stick), see below
+            }
+            return 0;
         case WM_CHAR:
         case WM_DEADCHAR:
         case WM_SYSCHAR:
@@ -768,7 +789,8 @@ LRESULT CALLBACK CineWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM
                                 sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)) {
                 bool release = false;
                 if (raw.header.dwType == RIM_TYPEKEYBOARD) {
-                    release = (raw.data.keyboard.Flags & RI_KEY_BREAK) != 0;
+                    release = (raw.data.keyboard.Flags & RI_KEY_BREAK) != 0 ||
+                              !CineOwnsKey(raw.data.keyboard.VKey);
                 } else if (raw.header.dwType == RIM_TYPEMOUSE) {
                     constexpr USHORT Ups = RI_MOUSE_BUTTON_1_UP | RI_MOUSE_BUTTON_2_UP |
                                            RI_MOUSE_BUTTON_3_UP | RI_MOUSE_BUTTON_4_UP |

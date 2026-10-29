@@ -12158,14 +12158,41 @@ void RetroBbscLedger() {
              slot->user, slot->slot, looked, flags.size(), given);
 }
 
-// Home again and settled: the trip's given items counted again. Nothing is given at home (user
-// 2026-10-29: items only in the host's world, each player's own) - what is gone is owed until
-// the next join (DeliverBbscLedgerAtJoin).
-void ReconcileBbscLedgerAtHome() {
+// Home again and settled: the trip's given items counted again.
+// Test 2026-10-29 (runs/20261029-040355): the White Messenger Ribbon the guest picked up was still
+// carried 5 s after the trip home (CHECK OK), but not in the save the game wrote 28 s later, and
+// the key item guard below never saw a removal - the game puts a cooperator's inventory back from
+// the snapshot it took at the join, as a whole and at no fixed moment. A key or unique item of the
+// trip (goods types 1 and 6, weapons, attire) is therefore watched for BbscLedgerHomeWatchMs at
+// home: gone, it is put back at once, without a window (it is the item the player picked up, not
+// a gift), and the moment is logged (BBSC CHECK FAIL K2-lost-on-trip-home ... put back). Other
+// items are counted once, 5 s after the trip (a vial used at home is not "lost"); gone, they are
+// owed until the next join (DeliverBbscLedgerAtJoin), as gems and runes are.
+constexpr s64 BbscLedgerHomeWatchMs = 120'000;
+bool bbsc_ledger_home_counted = false; // the once-only count of this trip home is done
+
+bool BbscLedgerWatched(u32 code) {
+    const u32 type = code >> 28;
+    if (type == 0 || type == 1) {
+        return true; // a weapon or attire
+    }
+    if (type != 4) {
+        return false;
+    }
+    static u64 table = 0;
+    if (table == 0) {
+        table = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
+    }
+    const u64 row = table != 0 ? BbscParamRow(table, code & 0x0FFFFFFFu, 0x40) : 0;
+    const u8 goods_type = row != 0 ? ReadValue<u8>(row, 58) : 0;
+    return goods_type == 1 || goods_type == 6;
+}
+
+// since_home_ms: how long we have been home and settled. True when this trip home is done.
+bool ReconcileBbscLedgerAtHome(s64 since_home_ms) {
     std::map<u32, s32> gained; // code -> what the trip gave
     std::map<u32, s32> lot_of; // code -> a lot for a gem's award
     std::map<u32, s32> host;
-    size_t owed = 0;
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
         for (const auto& e : bbsc_ledger) {
@@ -12174,58 +12201,75 @@ void ReconcileBbscLedgerAtHome() {
                 if (e.lot > 0) {
                     lot_of[e.code] = e.lot;
                 }
-            } else {
-                ++owed;
             }
         }
         host = bbsc_ledger_host_counts;
     }
-    if (gained.empty() && owed == 0) {
-        return;
+    if (gained.empty()) {
+        bbsc_ledger_home_counted = false;
+        return true;
     }
-    size_t kept = 0;
+    const bool first = !bbsc_ledger_home_counted;
+    bbsc_ledger_home_counted = true;
     size_t lost_items = 0;
-    std::vector<BbscLedgerEntry> regive;
+    std::vector<BbscLedgerEntry> owed;
     for (const auto& [code, count] : gained) {
         const auto seen = host.find(code);
         if (!BbscLedgerAddable(code) || seen == host.end()) {
-            ++kept; // not countable: nothing to compare
+            continue; // not countable: nothing to compare
+        }
+        const bool watched = BbscLedgerWatched(code);
+        if (!first && !watched) {
             continue;
         }
         const s32 home = BbscLedgerCount(code);
         const s32 lost = std::clamp(seen->second - home, 0, count);
         if (lost == 0) {
-            ++kept;
             continue;
         }
         lost_items += static_cast<size_t>(lost);
+        const bool back = watched && AddBbscLedgerItem(code, lost);
         LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, {} "
-                           "at home (the trip gave {}) - {} owed until the next join",
-                    code, seen->second, home, count, lost);
-        BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} - {} owed", code,
-                      seen->second, home, lost);
-        BbscLedgerEntry e{};
-        e.source = BbscLedgerSource::Give;
-        e.state = BbscLedgerState::Owed;
-        e.code = code;
-        e.count = lost;
-        e.lot = lot_of.contains(code) ? lot_of[code] : 0;
-        regive.push_back(e);
+                           "at home {} s after the trip (the trip gave {}) - {}",
+                    code, seen->second, home, since_home_ms / 1000, count,
+                    back ? "put back" : "owed until the next join");
+        BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} at {} s - {}", code,
+                      seen->second, home, since_home_ms / 1000, back ? "put back" : "owed");
+        if (!back) {
+            BbscLedgerEntry e{};
+            e.source = BbscLedgerSource::Give;
+            e.state = BbscLedgerState::Owed;
+            e.code = code;
+            e.count = lost;
+            e.lot = lot_of.contains(code) ? lot_of[code] : 0;
+            owed.push_back(e);
+            if (watched) {
+                std::scoped_lock lock{bbsc_ledger_mutex};
+                bbsc_ledger_host_counts.erase(code); // owed now: not compared again
+            }
+        }
     }
-    {
-        std::scoped_lock lock{bbsc_ledger_mutex};
+    if (first && lost_items == 0) {
+        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us - "
+                        "key items watched for {} s",
+                 gained.size(), BbscLedgerHomeWatchMs / 1000);
+        BBSC_TIMELINE("CHECK", "OK K2-trip-home: {} item kind(s) still with us", gained.size());
+    }
+    const bool done = since_home_ms >= BbscLedgerHomeWatchMs;
+    std::scoped_lock lock{bbsc_ledger_mutex};
+    bbsc_ledger.insert(bbsc_ledger.end(), owed.begin(), owed.end());
+    if (done) {
         std::erase_if(bbsc_ledger,
                       [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
         bbsc_ledger_host_counts.clear();
-        bbsc_ledger.insert(bbsc_ledger.end(), regive.begin(), regive.end());
+        bbsc_ledger_home_counted = false;
+        LOG_INFO(Debug, "BBSC ledger: the trip home is done ({} s watched)", since_home_ms / 1000);
+    }
+    if (!owed.empty() || done) {
         bbsc_ledger_dirty = true;
+        WriteBbscLedgerLocked();
     }
-    if (lost_items == 0 && !gained.empty()) {
-        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us", kept);
-        BBSC_TIMELINE("CHECK", "OK K2-trip-home: {} item kind(s) still with us", kept);
-    }
-    std::scoped_lock lock{bbsc_ledger_mutex};
-    WriteBbscLedgerLocked();
+    return done;
 }
 
 // Joined a host and settled (5 s in its world, not loading, alive), once per session: the owed
@@ -12428,9 +12472,9 @@ void TickBbscItemLedger() {
             home_since_ms = now;
         } else if (now - home_since_ms >= 5'000 && slot_known) {
             static s64 reconciled_ms = 0;
-            if (now - reconciled_ms >= 5'000) {
+            if (now - reconciled_ms >= 1'000) { // every second while key items are watched
                 reconciled_ms = now;
-                ReconcileBbscLedgerAtHome();
+                ReconcileBbscLedgerAtHome(now - home_since_ms);
             }
         }
     }
@@ -15037,6 +15081,7 @@ void TickBbscRespawnPointWatch() {
         return;
     }
     const bool first = !have;
+    const s64 old_value = last_value;
     const s32 old_point = static_cast<s32>(last_value & 0xFFFFFFFF);
     have = true;
     last_value = value;
@@ -15050,6 +15095,29 @@ void TickBbscRespawnPointWatch() {
     if (first) {
         LOG_INFO(Debug, "BBSC respawn point: {} (aux {})", where, aux);
         return;
+    }
+    // 2026-10-29 (test runs/20261029-040355, host 11:30:43 died at the Cleric Beast, nobody alive):
+    // 5 s after the death, 4 s before SoloPlayDeath_2 picked the reload's map, the respawn point
+    // went from Central Yharnam's lamp to the Dream's - both players woke in the Hunter's Dream.
+    // The writer is still unknown (see above); while we are dead in a session and not in the
+    // Dream, a change to a Dream lamp is put back to the lamp we had (BBSC CHECK FAIL
+    // DEATH-dream-respawn).
+    if (const s32 state = GetSessionState(); state == 3 || state == 6) {
+        const u64 me = GetLocalPlayerCharacter();
+        constexpr u32 DreamArea = BbscMapArea(BbscDreamStateMap);
+        const bool to_dream = BbscMapArea(BbscLampPointMap(point)) == DreamArea;
+        const bool from_dream = BbscMapArea(BbscLampPointMap(old_point)) == DreamArea;
+        if (me != 0 && GetCharacterHp(me) == 0 && to_dream && !from_dream && old_point > 0 &&
+            BbscMapArea(map) != DreamArea) {
+            WriteValue<s64>(global, 0x1528, old_value);
+            last_value = old_value;
+            LOG_WARNING(Debug, "BBSC CHECK FAIL DEATH-dream-respawn: dead in map {:#x} (session state "
+                               "{}), the respawn point went {} -> {} - put back to {}",
+                        map, state, old_point, point, old_point);
+            BBSC_TIMELINE("CHECK", "DEATH-dream-respawn: respawn point {} -> {} while dead - put back",
+                          old_point, point);
+            return;
+        }
     }
     LOG_INFO(Debug, "BBSC respawn point: {} -> {} (aux {}; lamp in use {}, session state {}, map "
                     "{:#x}, loading {})",
