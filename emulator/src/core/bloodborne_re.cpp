@@ -43,6 +43,7 @@
 #include "common/singleton.h"
 #include "core/bbsc_memscan.h"
 #include "core/bbsc_persistence.h"
+#include "core/bbsc_quest_event_rules.h"
 #include "core/bbsc_cinematic.h"
 #include "imgui/bbsc_loading_layer.h"
 #include "core/cpu_patches.h"
@@ -5533,8 +5534,9 @@ u64 BbscFlagGroupStorage(u32 key) {
 // still go home through the journal. Left shared (the host's world): kind 1 flags (doors, bosses,
 // world events), the boss / progress flags, the night phases (1000-1099) and time (9800-9802),
 // the Hunter's Dream (area 21, BBSC's Dream handling), item pickups (kind 5).
+// Also keep the sister's drop gate 72410410, written by EMEVD 12410713 rather than ESD.
 // SHADPS4_BBSC_OWN_NPC_QUESTS=0 turns it off.
-constexpr std::array<u32, 788> BbscNpcQuestFlags{
+constexpr std::array<u32, 789> BbscNpcQuestFlags{
     706, 751, 760, 762, 764, 1102, 1103, 1104, 1105, 1106,
     1108, 1109, 1121, 1122, 1123, 1124, 1140, 1141, 1142, 1143,
     1144, 1145, 1146, 1147, 1148, 1149, 1160, 1161, 1163, 1164,
@@ -5587,7 +5589,7 @@ constexpr std::array<u32, 788> BbscNpcQuestFlags{
     72410350, 72410351, 72410352, 72410353, 72410354, 72410355, 72410356, 72410357, 72410358, 72410359,
     72410360, 72410361, 72410362, 72410363, 72410364, 72410365, 72410366, 72410370, 72410371, 72410380,
     72410382, 72410383, 72410384, 72410385, 72410390, 72410391, 72410392, 72410393, 72410394, 72410400,
-    72410401, 72410402, 72410403, 72410404, 72410405, 72410406, 72410407, 72410412, 72410413, 72410414,
+    72410401, 72410402, 72410403, 72410404, 72410405, 72410406, 72410407, 72410410, 72410412, 72410413, 72410414,
     72410415, 72410416, 72410420, 72410421, 72410422, 72410423, 72410461, 72410462, 72410500, 72410501,
     72410502, 72410503, 72410504, 72410505, 72410506, 72410511, 72410512, 72410513, 72410514, 72410515,
     72410516, 72410520, 72410521, 72410530, 72410540, 72410541, 72410542, 72410543, 72410544, 72410545,
@@ -5626,6 +5628,10 @@ bool BbscOwnNpcQuestsEnabled() {
 
 bool IsBbscNpcQuestFlag(u32 flag) {
     return std::binary_search(BbscNpcQuestFlags.begin(), BbscNpcQuestFlags.end(), flag);
+}
+
+bool IsBbscLocalQuestEvent(s64 event) {
+    return std::binary_search(QuestRules::LocalEvents.begin(), QuestRules::LocalEvents.end(), event);
 }
 
 // The item ledger (see "The item ledger"): who gave an item, for its entries and log lines.
@@ -5736,11 +5742,11 @@ void RevertBbscNpcOwnFlags() {
 // the put-back runs once more at the start of each frame's event update (an event's step 0x012ECDC0,
 // the first one after our tick) and at a talk step: the other player's values are gone before our
 // events and talks look.
-void LocalizeBbscKnockEvent(u64 instance);
+void LocalizeBbscQuestEvent(u64 instance);
 bool bbsc_npc_pass_due = false;
 void PS4_SYSV_ABI BbscNpcPassHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     BBSC_PERF_SCOPE("hook BbscNpcPassHook");
-    if (registers && bbsc_npc_own_active) LocalizeBbscKnockEvent(registers->rdi);
+    if (registers && bbsc_npc_own_active) LocalizeBbscQuestEvent(registers->rdi);
     if (!bbsc_npc_pass_due || !bbsc_npc_own_active) {
         return;
     }
@@ -12581,9 +12587,15 @@ void RetroBbscLedger(std::string_view why) {
                 continue;
             }
         }
+        // Some ItemLot "get" flags are script-controlled drop/availability gates (72410410
+        // starts ON before the sister's quest). Only an actual receipt journal proves those
+        // items were obtained. Ordinary acquisition flags still repair older saves.
+        const bool acquisition_flag =
+            !std::binary_search(QuestRules::ScriptedLotFlags.begin(),
+                                QuestRules::ScriptedLotFlags.end(), r.flag) && BbscEventFlag(r.flag);
         const char* reason = taken.contains(r.flag)          ? "taken in a host's world"
                              : journal_lots.contains(r.lot) ? "in the ledger"
-                             : BbscEventFlag(r.flag)        ? "its get flag is set"
+                             : acquisition_flag            ? "its get flag is set"
                                                             : nullptr;
         if (reason == nullptr) {
             continue;
@@ -13768,7 +13780,8 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
                   (BbscDreamOwnEnabled() && std::ranges::find(BbscDreamOwnGuestEvents, event) !=
                                                 BbscDreamOwnGuestEvents.end()) ||
                   std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end() ||
-                  std::ranges::find(BbscGuestGiftEvents, event) != BbscGuestGiftEvents.end();
+                  std::ranges::find(BbscGuestGiftEvents, event) != BbscGuestGiftEvents.end() ||
+                  IsBbscLocalQuestEvent(event);
         if (allowed && known == bbsc_dream_type_conditions.end()) {
             bbsc_dream_type_conditions[bbsc_dream_type_next] = condition;
             bbsc_dream_type_next = (bbsc_dream_type_next + 1) % bbsc_dream_type_conditions.size();
@@ -15001,6 +15014,7 @@ BbscEventRun bbsc_event_run; // game thread
 u8 bbsc_setflag_skip = 0;
 
 bool IsBbscTalkDrivenEvent(s64 event) {
+    if (IsBbscLocalQuestEvent(event)) return true; // keep its personal flags in the trip journal
     const auto it = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
                                              &BbscTalkEventTrigger::event);
     return it != BbscTalkEventTriggers.end() && it->event == event;
@@ -15009,11 +15023,11 @@ bool IsBbscTalkDrivenEvent(s64 event) {
 // CUSA03173 1.09: bank 2000[2] at 0x017C81E2 writes bool(argument) to event+0x78.
 // Setting 0 is the game's SetNetworkSyncState(false). Do this before the event update,
 // including the initial reset and condition wait. No packet / player notification is emitted.
-void LocalizeBbscKnockEvent(u64 instance) {
+void LocalizeBbscQuestEvent(u64 instance) {
     if (!ReadablePointer(instance, 0xC0) ||
         !HasMemoryAccess(instance + 0x78, 1, MemoryProt::CpuWrite)) return;
     // Cache the instruction range, not just the pointer: the game reuses event instances.
-    struct Cached { u64 ref; u64 first; u64 end; u64 row; s64 event; bool knock; };
+    struct Cached { u64 ref; u64 first; u64 end; u64 row; s64 event; bool local; };
     static std::map<u64, Cached> cache;
     const u64 ref = ReadValue<u64>(instance, 0xA8);
     const u64 instruction = ReadValue<u64>(instance, 0xB0);
@@ -15038,14 +15052,18 @@ void LocalizeBbscKnockEvent(u64 instance) {
             const s64 event = ReadValue<s64>(row, 0);
             if (cache.size() >= 4096) cache.clear();
             it = cache.insert_or_assign(instance, Cached{ref, first, end, row, event,
+                IsBbscLocalQuestEvent(event) ||
                 std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end()}).first;
             break;
         }
     }
-    if (it != cache.end() && it->second.knock) WriteValue<u8>(instance, 0x78, 0);
+    if (it != cache.end() && it->second.local) WriteValue<u8>(instance, 0x78, 0);
 }
 
 bool BbscTalkEventIsOurs(s64 event) {
+    // These events observe the shared environment but only change this player's quest state.
+    // Their remote copy cannot establish ownership of our dog/door trigger or loot visibility.
+    if (IsBbscLocalQuestEvent(event)) return true;
     const auto first = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
                                                 &BbscTalkEventTrigger::event);
     if (first == BbscTalkEventTriggers.end() || first->event != event) {
