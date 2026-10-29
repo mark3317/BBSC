@@ -3467,6 +3467,8 @@ void NoteBbscSessionEnding(std::string_view why); // see "The item ledger"
 void CaptureBbscGuestRespawnPoint();
 void DeliverBbscLedgerAtJoin(std::string_view why); // see "The item ledger"
 void SuspendBbscPersistenceOnce(std::string_view why); // see "quit to title" below
+void FlushBbscSessionJournals();
+std::atomic<bool> bbsc_recover_session_cleanup{false};
 
 void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& registers) {
     const std::string name = ReadGuestAscii(registers.rsi, 64);
@@ -6898,6 +6900,7 @@ bool RecoverBbscOwnWorldFile(const BbscSaveSlot& slot) {
                            u"Отдохните у лампы или перезагрузитесь, чтобы увидеть его."),
                      "own world restored after a crash");
     }
+    bbsc_recover_session_cleanup = true;
     return true;
 }
 
@@ -9429,6 +9432,7 @@ void InstallBbscBossClearHooks() {
 // cut): after BbscPartnerGoneMs with a live session and no remote character at all, the game's own
 // checks are allowed through so the session can end instead of hanging.
 constexpr u64 RegistReturnTitleOffset = 0x0138B990;
+constexpr u64 OnReturnTitleOffset = 0x0138BAF0;
 constexpr s64 BbscQuitTeardownMs = 20'000;
 // Long enough for a partner's slow first load (shader compilation) to never count as "gone".
 constexpr s64 BbscPartnerGoneMs = 180'000;
@@ -9437,6 +9441,15 @@ constexpr s64 BbscPartnerGoneMs = 180'000;
 constexpr s64 BbscInvaderWinMs = 6'000;
 s64 bbsc_persistence_restore_at_ms = 0;
 s64 bbsc_partner_missing_since_ms = 0;
+std::atomic<bool> bbsc_quit_pending{false};
+std::mutex bbsc_peer_left_mutex;
+std::map<u32, bool> bbsc_peer_left_pending;
+s64 bbsc_confirmed_departure_ms = 0;
+
+void SendBbscSessionLeave() {
+    const std::array<u8, 5> packet{'S', 'H', 'A', 'D', 0x2A};
+    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(), packet.size());
+}
 
 void SuspendBbscPersistence(std::string_view why) {
     bbsc_persistence_restore_at_ms = SteadyNowMs() + BbscQuitTeardownMs;
@@ -9520,7 +9533,7 @@ int RemotePlayerCount() {
     return remote;
 }
 
-void PS4_SYSV_ABI BbscQuitToTitleHook(u64, const GuestRegisterSnapshot* registers) {
+void PS4_SYSV_ABI BbscQuitToTitleHook(u64 confirmed, const GuestRegisterSnapshot* registers) {
     BBSC_PERF_SCOPE("hook BbscQuitToTitleHook");
     // Who asked to return to the title matters. A player choosing "quit to title" from the menu
     // and the game bailing out on its own both land here, and only the first should tear the
@@ -9536,6 +9549,11 @@ void PS4_SYSV_ABI BbscQuitToTitleHook(u64, const GuestRegisterSnapshot* register
              caller > image_base ? caller - image_base : caller, GetSessionState(),
              RemotePlayerCount(), GetCurrentPackedMap());
     SuspendBbscPersistence("quit to title");
+    if (confirmed != 0) {
+        FlushBbscSessionJournals();
+        SendBbscSessionLeave();
+        bbsc_quit_pending = true;
+    }
 }
 
 // ---- Stray forced warp on a host (2026-10-07) ---------------------------------------------------
@@ -9954,7 +9972,8 @@ void TickBbscLeaveLocks() {
 // every lock of a leave or a death is looked at (held 5 s -> released, BBSC CHECK FAIL SN-stuck-locks).
 bool BbscDeathLocksHeld() {
     if (const u64 menu = ReadValue<u64>(image_base + 0x05562878, 0);
-        ReadablePointer(menu, 0x2E0) && ReadValue<s32>(menu, 0x2DC) != 0) {
+        ReadablePointer(menu, 0x2F8) &&
+        (ReadValue<s32>(menu, 0x2DC) != 0 || ReadValue<s32>(menu, 0x2F0) != 0)) {
         return true;
     }
     const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
@@ -9965,6 +9984,17 @@ void ReleaseBbscDeathLocks(std::string_view why) {
     bool brake = false;
     bool pending = false;
     u32 leaving = 0;
+    if (const u64 menu = ReadValue<u64>(image_base + 0x05562878, 0);
+        ReadablePointer(menu, 0x2F8) && HasMemoryAccess(menu + 0x2F0, 4, MemoryProt::CpuWrite)) {
+        WriteValue<s32>(menu, 0x2F0, 0); // mission-clear UI lock (same cleanup as BlockClear2_3)
+    }
+    if (ReadValue<u64>(image_base + 0x0553B0D8, 0) != 0 &&
+        ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0) != 0) {
+        using SetFlag = u64 PS4_SYSV_ABI (*)(u64, u32, u8);
+        const auto set = reinterpret_cast<SetFlag>(image_base + 0x0132E5A0);
+        set(0, 4000, 0);
+        set(0, 4092, 0);
+    }
     if (const u64 menu = ReadValue<u64>(image_base + 0x05562878, 0);
         ReadablePointer(menu, 0x2E0) && HasMemoryAccess(menu + 0x2DC, 4, MemoryProt::CpuWrite) &&
         ReadValue<s32>(menu, 0x2DC) != 0) {
@@ -10002,6 +10032,7 @@ void TickBbscStuckLeaveLocks() {
     const s32 state = GetSessionState();
     if (state == 0 && last_state != 0) {
         ended_ms = now;
+        bbsc_recover_session_cleanup = true;
     }
     last_state = state;
     if (ended_ms == 0 || state != 0) {
@@ -10141,7 +10172,9 @@ void TickBbscStrandedGuest() {
         since_ms = now;
         return;
     }
-    if (now - since_ms < BbscStrandedMs) {
+    const s64 grace = bbsc_confirmed_departure_ms != 0 &&
+                              now - bbsc_confirmed_departure_ms < 30'000 ? 1'000 : BbscStrandedMs;
+    if (now - since_ms < grace) {
         return;
     }
     since_ms = 0;
@@ -10400,8 +10433,74 @@ void InstallBbscQuitHook() {
                   RegistReturnTitleOffset);
         return;
     }
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + OnReturnTitleOffset),
+                              std::span<const u8>{Prologue}, 1, BbscQuitToTitleHook)) {
+        LOG_ERROR(Debug, "BBSC quit: failed to hook confirmed OnReturnTitle");
+    }
     LOG_INFO(Debug, "BBSC quit to title ends the session for both players (RegistReturnTitle {:#x})",
              RegistReturnTitleOffset);
+}
+
+// Run engine cleanup only on the game thread, after confirmed departure / return home.
+void TickBbscSessionExit() {
+    const s32 state = GetSessionState();
+    const u64 global = GetGlobalState();
+    if (image_base == 0 || !ReadablePointer(global, 0x1700)) return;
+    const u64 title_man = ReadValue<u64>(image_base + 0x0553B108, 0);
+    const u64 title_request = ReadablePointer(title_man, 0x18) ? ReadValue<u64>(title_man, 0x10) : 0;
+    const bool returning_title = ReadablePointer(title_request, 0x0C) &&
+                                 ReadValue<s32>(title_request, 8) == 2;
+    static bool quit_prepared = false;
+    if (state == 0 && !returning_title) quit_prepared = false;
+    bool stop = false;
+    if ((bbsc_quit_pending.exchange(false) || returning_title) && !quit_prepared &&
+        (state == 3 || state == 4 || state == 6)) {
+        quit_prepared = true;
+        FlushBbscSessionJournals();
+        SendBbscSessionLeave();
+        SuspendBbscPersistence("confirmed return to title");
+        stop = true;
+        LOG_INFO(Debug, "BBSC quit: journals flushed, peers notified; stopping before title load");
+    }
+    std::map<u32, bool> left;
+    {
+        std::scoped_lock lock{bbsc_peer_left_mutex};
+        left.swap(bbsc_peer_left_pending);
+    }
+    for (const auto& [player, host] : left) {
+        const u32 known = BbscPeerLifeCounts().first;
+        if (((state == 4 || state == 6) && host) ||
+            (state == 3 && known == 0 && RemotePlayerCount() <= 1)) {
+            FlushBbscSessionJournals();
+            SuspendBbscPersistenceOnce("confirmed partner departure");
+            bbsc_confirmed_departure_ms = SteadyNowMs();
+            stop = true;
+        }
+        LOG_INFO(Debug, "BBSC session: player {:08x} left (host {}, {} remaining life record(s))",
+                 player, host, known);
+    }
+    if (stop) {
+        const u64 manager = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
+        if (ReadablePointer(manager, 0x128)) {
+            using Stop = u8 PS4_SYSV_ABI (*)(u64);
+            reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(manager);
+        }
+        bbsc_recover_session_cleanup = true;
+    }
+    if (bbsc_recover_session_cleanup.load() && GetSessionState() == 0 &&
+        ReadValue<u8>(global, 0x1592) != 0 && ReadValue<u8>(global, 0x08) == 0 &&
+        GetCharacterHp(GetLocalPlayerCharacter()) > 0 && !returning_title) {
+        // Same remote cleanup used by the game's StageTransition, without another load or quit.
+        const u64 remote = ReadValue<u64>(global, 0x16F8);
+        if (ReadablePointer(remote, 0xA0)) {
+            using Cleanup = void PS4_SYSV_ABI (*)(u64);
+            reinterpret_cast<Cleanup>(image_base + WorldChrManRemoteCleanupOffset)(remote);
+        }
+        ReleaseBbscLeaveLocks("session ended at home");
+        ReleaseBbscDeathLocks("session ended at home");
+        bbsc_recover_session_cleanup = false;
+        LOG_INFO(Debug, "BBSC session: own world cleanup complete after departure / recovery");
+    }
 }
 
 // ---- Guest HP penalty (SpEffectParam 9006) -----------------------------------------------------
@@ -12077,6 +12176,7 @@ void NoteBbscLedgerGiven(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s
             want = std::max(want, std::max(now_count, count));
         }
         bbsc_ledger_dirty = true;
+        if (kept) WriteBbscLedgerLocked(); // a crash right after pickup must keep its receipt
     }
     LOG_INFO(Debug, "BBSC ledger: {} {:#x} x{} given in the host's world (lot {}, flag {}; {} carried "
                     "+ stored now)",
@@ -12724,6 +12824,8 @@ void FinishBbscTripAtHome() {
     WriteBbscLedgerLocked();
 }
 
+std::vector<std::pair<u32, s32>> BbscKeyItemsIn(u64 inventory);
+
 // The join check, once per summon, when the guest accepts it (lua JoinSession_White) - still in its
 // own world, before the summon load sets the own key items apart: the owed items and the retro
 // sweep (key items taken in hosts' worlds earlier, neither carried nor stored) are given here, so
@@ -12773,12 +12875,27 @@ void DeliverBbscLedgerAtJoin(std::string_view why) {
     CheckBbscTripItems(false, "at the join (last trip)");
     FinishBbscTripAtHome();
     RetroBbscLedger("join");
+    // Protect keys already owned before this summon as well as this trip's pickups. A rejoin
+    // otherwise installs an old phantom inventory without them, although the home bag has them.
+    const auto carried = BbscKeyItemsIn(BbscCarriedInventory());
+    const auto stored = BbscKeyItemsIn(BbscStorageInventory());
     std::scoped_lock lock{bbsc_ledger_mutex};
+    for (const auto& [id, count] : carried) {
+        const u32 code = 0x40000000u | id;
+        bbsc_ledger_trip[code] = std::max(bbsc_ledger_trip[code], count);
+    }
+    for (const auto& [id, count] : stored) {
+        const u32 code = 0x40000000u | id;
+        // The journal compares carried + stored; do not create duplicates of stored keys.
+        const auto it = std::ranges::find(carried, id, &std::pair<u32, s32>::first);
+        const s32 carried_count = it == carried.end() ? 0 : it->second;
+        bbsc_ledger_trip[code] = std::max(bbsc_ledger_trip[code], carried_count + count);
+    }
     bbsc_ledger.insert(bbsc_ledger.begin(), left.begin(), left.end());
     bbsc_ledger_dirty = true;
     LOG_INFO(Debug, "BBSC ledger: join check ({}) - {} owed item(s) given in our own world before the "
-                    "summon load, {} left",
-             why, given, left.size());
+                    "summon load, {} left; {} key item kind(s) protected across the join",
+             why, given, left.size(), bbsc_ledger_trip.size());
     BBSC_TIMELINE("ITEMS", "ledger: join check ({}) - {} owed given, {} left", why, given,
                   left.size());
     WriteBbscLedgerLocked();
@@ -14782,6 +14899,20 @@ void WriteBbscTripJournal(const BbscSaveSlot& slot) {
     std::filesystem::rename(temp, path, ec);
 }
 
+void FlushBbscSessionJournals() {
+    SyncBbscLedgerSlot();
+    CaptureBbscGuestLoot();
+    WriteBbscGuestLootFile();
+    WriteBbscOwnWorldFile();
+    std::optional<BbscSaveSlot> slot;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        WriteBbscLedgerLocked();
+        slot = bbsc_ledger_slot;
+    }
+    if (slot.has_value()) WriteBbscTripJournal(*slot);
+}
+
 void FinishBbscTripJournal(const BbscSaveSlot& slot);
 
 bool LoadBbscTripJournal(const BbscSaveSlot& slot) {
@@ -15533,6 +15664,26 @@ void TickBbscUnstuckKey() {
 // GuestItems.ShowTreasure). Taken items keep their flag set and stay off.
 constexpr u64 ItemEnableOffset = 0x017D9E70;
 
+// SetTreasureState (EMEVD 2005[4], 0x0131CEF0) calls EnableItem at 0x0131CF8F.
+// The old pickability repair re-enabled these deliberately hidden quest treasures every second.
+// Remember the actual item object, not only its recycled numeric ID.
+std::map<u32, u64> bbsc_script_hidden_items;
+void PS4_SYSV_ABI BbscTreasureVisibilityHook(u64, const GuestRegisterSnapshot* registers) {
+    if (!registers || !BbscGuestInHostWorld() || !ReadablePointer(registers->rsp, 8) ||
+        ReadValue<u64>(registers->rsp, 0) != image_base + 0x0131CF94 ||
+        !ReadablePointer(registers->rsi, 4)) return;
+    const u32 id = ReadValue<u32>(registers->rsi, 0);
+    using FindItem = u64 PS4_SYSV_ABI (*)(u64 manager, u32 id);
+    const u64 item = reinterpret_cast<FindItem>(image_base + 0x017D81A0)(registers->rdi, id);
+    if (registers->rdx != 0) {
+        bbsc_script_hidden_items.erase(id);
+    } else if (ReadablePointer(item, 0x50)) {
+        bbsc_script_hidden_items[id] = item;
+    }
+    LOG_INFO(Debug, "BBSC quest treasure: item {:#x} {} by its script (object {:#x})", id,
+             registers->rdx != 0 ? "enabled" : "hidden", item);
+}
+
 void TickBbscGuestItemsPickable() {
     static s64 last_ms = 0;
     static u32 logged_total = ~0u;
@@ -15561,13 +15712,17 @@ void TickBbscGuestItemsPickable() {
             }
             const s32 flag = ReadValue<s32>(item, 0x28);
             const bool flag_set = flag > 0 && BbscEventFlag(static_cast<u32>(flag));
+            const u32 id = ReadValue<u32>(item, 0x20);
+            const auto hidden = bbsc_script_hidden_items.find(id);
+            const bool script_hidden = hidden != bbsc_script_hidden_items.end() &&
+                                       hidden->second == item;
             if ((ReadValue<u16>(item, 0x48) & 0x40) == 0) {
-                if (flag_set) {
+                if (flag_set || script_hidden) {
                     ++taken;
                 } else if (off.size() < 256) {
                     off.push_back(ReadValue<u32>(item, 0x20));
                 }
-            } else if (flag_set && stale.size() < 256) {
+            } else if ((flag_set || script_hidden) && stale.size() < 256) {
                 stale.push_back(ReadValue<u32>(item, 0x20));
             }
             item = ReadValue<u64>(item, 0);
@@ -15589,7 +15744,7 @@ void TickBbscGuestItemsPickable() {
             }
         }
         LOG_INFO(Debug,
-                 "BBSC guest items: {} item(s) already taken were still lying here - {} switched off, "
+                 "BBSC guest items: {} taken or script-hidden item(s) were lying here - {} switched off, "
                  "map {:#x} ({})",
                  stale.size(), hidden, GetCurrentPackedMap(), ids);
     }
@@ -16086,6 +16241,10 @@ void InstallBbscFloorGuardAndPickupTrace() {
     static constexpr std::array<u8, 7> ReachSite{0x44, 0x8B, 0x7D, 0xC0, 0x45, 0x85, 0xFF};
     static constexpr std::array<u8, 7> AcceptedSite{0x49, 0x8B, 0x85, 0xB0, 0x03, 0x00, 0x00};
     static constexpr std::array<u8, 6> Prologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + ItemEnableOffset),
+                             std::span<const u8>{Prologue}, 0, BbscTreasureVisibilityHook)) {
+        LOG_ERROR(Debug, "BBSC quest treasure: failed to hook EnableItem");
+    }
     const bool reach =
         InstallGuestCodeHook(reinterpret_cast<void*>(image_base + PickupReachResultOffset),
                              std::span<const u8>{ReachSite}, 0, BbscPickupHook);
@@ -19592,6 +19751,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscPerfReport();
         bbsc_tick_map.store(GetCurrentPackedMap(), std::memory_order_release);
         { BBSC_PERF_NESTED("tick TickBbscTimelineContext"); TickBbscTimelineContext(); }
+        { BBSC_PERF_NESTED("tick TickBbscSessionExit"); TickBbscSessionExit(); }
         { BBSC_PERF_NESTED("tick TickBbscFrameRate"); TickBbscFrameRate(); }
         { BBSC_PERF_NESTED("tick TickBbscGateWatch"); TickBbscGateWatch(); }
         { BBSC_PERF_NESTED("tick TickBbscTransitionIdle"); TickBbscTransitionIdle(); }
@@ -20754,6 +20914,15 @@ void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t seq
     if (changed) {
         LOG_INFO(Debug, "BBSC life: player {:08x} says it is {}", player, dead ? "dead" : "alive");
     }
+}
+
+void OnBbscPeerLeft(std::uint32_t player, bool host) {
+    {
+        std::scoped_lock lock{bbsc_life_mutex};
+        bbsc_peer_life.erase(player);
+    }
+    std::scoped_lock lock{bbsc_peer_left_mutex};
+    bbsc_peer_left_pending[player] = host;
 }
 
 void OnBbscScalePacket(const std::uint16_t (&percent)[5]) {

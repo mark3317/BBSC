@@ -1145,7 +1145,17 @@ def _relay_unregister_client(conn):
             if RELAY_HINT_COUNTS[old_client.session_hint] <= 0:
                 del RELAY_HINT_COUNTS[old_client.session_hint]
         RELAY_ROSTER = tuple(RELAY_CLIENTS.items())
-        return len(RELAY_CLIENTS)
+        count = len(RELAY_CLIENTS)
+        recipients = tuple(peer for _, peer in RELAY_ROSTER
+                           if old_client is not None and old_client.session_hint is not None
+                           and peer.session_hint == old_client.session_hint)
+    # TCP EOF is an actual process/connection departure, not a slow map-load timeout.
+    # This control frame comes only from the relay server, never from a player envelope.
+    if old_client is not None and old_client.sender_hint and old_client.session_hint:
+        payload = struct.pack('<BII', 0x7E, old_client.sender_hint, old_client.session_hint)
+        for peer in recipients:
+            peer.send(payload)
+    return count
 
 
 def _relay_forward(conn, payload):
@@ -1166,7 +1176,7 @@ def _relay_forward(conn, payload):
         # insertion order and socket identities without per-frame list copies.
         roster = RELAY_ROSTER
         sender_client = RELAY_CLIENTS.get(conn)
-        if envelope is not None and sender_client is not None and (observe or routing):
+        if envelope is not None and sender_client is not None:
             sender, session, kind = envelope
             sender_client.sender_hint = sender
             sender_client.seen_envelope = True

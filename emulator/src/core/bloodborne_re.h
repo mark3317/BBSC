@@ -34,6 +34,8 @@ void OnBbscWorldFlagsPacket(const void* packet, std::uint32_t size);
 // BBSC life state: another player says whether it is dead (spectating) or alive. Relay receive
 // thread; only stores it.
 void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t sequence, bool host = false);
+// Confirmed departure; relay receive thread queues cleanup for the game thread.
+void OnBbscPeerLeft(std::uint32_t player, bool host);
 // BBSC scaling: the host's five scaling percentages (enemy HP, boss HP, damage, enemy stagger, boss
 // stagger). Relay receive thread; only stores them.
 void OnBbscScalePacket(const std::uint16_t (&percent)[5]);

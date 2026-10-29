@@ -60,6 +60,8 @@ constexpr u8 HostBossType = 0x27; // "SHAD" 0x27 + s32 the boss on the host's bo
 constexpr u8 KeyItemsType = 0x29; // "SHAD" 0x29 + u32 the host's keys and badges + u32 sequence
 constexpr u8 CutsceneType = 0x28; // "SHAD" 0x28 + the host's cutscene request (bloodborne_re.cpp)
 constexpr u8 PeersType = 0x7F; // server -> client: "N other players are connected", 1 byte count
+constexpr u8 PeerLeftType = 0x7E; // server only: sender + session of a closed TCP connection
+constexpr u8 SessionLeaveType = 0x2A; // explicit departure, before the game changes its role
 // Every frame since 2026-10-06: "SHAD" 0x40 + u32 sender + u32 session (the host's sender id, 0 = in
 // no session) + the packet above. The server sends each frame to everyone connected to it, so the
 // receiver keeps only its own session's packets (see "Relay sessions" in bloodborne_re.cpp).
@@ -256,7 +258,16 @@ DWORD WINAPI WriterThread(void*) {
     }
 }
 
-void Dispatch(const std::vector<u8>& wrapped) {
+void Dispatch(const std::vector<u8>& wrapped, bool from_server = false) {
+    if (from_server && wrapped.size() == 9 && wrapped[0] == PeerLeftType) {
+        u32 player = 0, session = 0;
+        std::memcpy(&player, wrapped.data() + 1, 4);
+        std::memcpy(&session, wrapped.data() + 5, 4);
+        if (session != 0 && session == SessionKey() && player != own_id) {
+            Core::Bloodborne::OnBbscPeerLeft(player, player == session);
+        }
+        return;
+    }
     if (wrapped.size() == 2 && wrapped[0] == PeersType) {
         peers = wrapped[1];
         return;
@@ -286,7 +297,9 @@ void Dispatch(const std::vector<u8>& wrapped) {
     const auto from_our_host = [&] {
         return guest && sender_hosting && sender == Core::Bloodborne::GetBbscRelayHost();
     };
-    if (frame[4] == FollowType && frame.size() >= 0x1E) {
+    if (frame[4] == SessionLeaveType && session != 0 && session == SessionKey()) {
+        Core::Bloodborne::OnBbscPeerLeft(sender, from_our_host());
+    } else if (frame[4] == FollowType && frame.size() >= 0x1E) {
         FollowPacket follow{};
         std::memcpy(&follow, frame.data(), std::min(frame.size(), sizeof(follow)));
         if (sender_hosting) {
@@ -441,7 +454,7 @@ DWORD WINAPI RelayThread(void*) {
             }
             ++frames_in;
             std::scoped_lock dispatch_lock{dispatch_mutex};
-            Dispatch(frame);
+            Dispatch(frame, true);
         }
         u32 dropped = 0;
         {
