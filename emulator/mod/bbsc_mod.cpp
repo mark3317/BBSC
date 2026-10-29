@@ -859,6 +859,9 @@ struct CinePad {
     bool zoom_reset = false;
 };
 CinePad cine_pad;
+// Logged with the camera's input (T3 2026-10-29: keys and stick did not turn the watch camera).
+std::atomic<u32> cine_pad_reads{0};    // PadReadState calls since the last input line
+std::array<u8, 4> cine_pad_raw{};      // the last sticks the game's pad read returned (lx ly rx ry)
 
 float PadAxis(u8 value) {
     const float v = (static_cast<float>(value) - 128.0f) / 127.0f;
@@ -869,6 +872,7 @@ float PadAxis(u8 value) {
 // OrbisPadData: +0 buttons (u32), +4 left stick x/y, +6 right stick x/y, +8 L2, +9 R2 (u8).
 int PS4_SYSV_ABI PadReadState(s32 handle, u8* data) {
     const int result = original_pad_read(handle, data);
+    ++cine_pad_reads;
     if (result != 0 || data == nullptr) {
         return result;
     }
@@ -887,6 +891,7 @@ int PS4_SYSV_ABI PadReadState(s32 handle, u8* data) {
         cine_pad = CinePad{.last_buttons = buttons};
         return result;
     }
+    std::memcpy(cine_pad_raw.data(), data + 4, 4);
     cine_pad.buttons = buttons;
     cine_pad.lx = PadAxis(data[4]);
     cine_pad.ly = PadAxis(data[5]);
@@ -929,6 +934,35 @@ bool CineKeyPressed(int key, bool down) {
     const bool pressed = down && !cine_was_down[key];
     cine_was_down[key] = down;
     return pressed;
+}
+
+const char* cine_mouse_from = "none";
+
+// Where the camera's input came from, once a second when it changes (caller holds cine_mutex).
+void LogCineInput(const CinematicInput& c, bool front, bool i, bool j, bool k, bool l) {
+    static ULONGLONG last_ms = 0;
+    static std::string last_line;
+    static int lines = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last_ms < 1'000 || lines >= 300) {
+        return;
+    }
+    last_ms = now;
+    const std::string line = fmt::format(
+        "window in front {}, keys I J K L {}{}{}{}, pad reads {} (sticks lx {} ly {} rx {} ry {}), "
+        "pad look {:.2f},{:.2f}, mouse {:.0f},{:.0f} from {}",
+        front, i ? 'I' : '-', j ? 'J' : '-', k ? 'K' : '-', l ? 'L' : '-',
+        cine_pad_reads.exchange(0), cine_pad_raw[0], cine_pad_raw[1], cine_pad_raw[2],
+        cine_pad_raw[3], c.pad_look_x, c.pad_look_y, c.mouse_dx, c.mouse_dy, cine_mouse_from);
+    cine_mouse_from = "none";
+    // The pad read count changes every second: compare without it.
+    const std::string key = line.substr(0, line.find("pad reads")) + line.substr(line.find("(sticks"));
+    if (key == last_line) {
+        return;
+    }
+    last_line = key;
+    ++lines;
+    LOG_INFO(Debug, "BBSC cinematic camera input: {}", line);
 }
 
 CinematicInput TakeCinematicInput() {
@@ -1014,12 +1048,17 @@ CinematicInput TakeCinematicInput() {
         } else if (sdl_dx != 0.0f || sdl_dy != 0.0f) {
             c.mouse_dx = sdl_dx;
             c.mouse_dy = sdl_dy;
+            cine_mouse_from = "SDL";
         } else if (raw_dx != 0 || raw_dy != 0) {
             c.mouse_dx = static_cast<float>(raw_dx); // relative mouse mode: the raw movement
             c.mouse_dy = static_cast<float>(raw_dy);
-        } else if (cine_looking) {
+            cine_mouse_from = "raw input";
+        } else {
             c.mouse_dx = static_cast<float>(now.x - cine_anchor.x);
             c.mouse_dy = static_cast<float>(now.y - cine_anchor.y);
+            if (c.mouse_dx != 0.0f || c.mouse_dy != 0.0f) {
+                cine_mouse_from = "cursor";
+            }
         }
         cine_anchor = center;
         cine_looking = true;
@@ -1029,6 +1068,7 @@ CinematicInput TakeCinematicInput() {
         cine_looking = false; // another window is in front: the mouse is the user's
         cine_mouse_owned = false;
     }
+    LogCineInput(c, front, down('I'), down('J'), down('K'), down('L'));
     return c;
 }
 

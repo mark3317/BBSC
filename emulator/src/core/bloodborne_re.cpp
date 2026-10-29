@@ -3322,6 +3322,7 @@ std::atomic<u32> bbsc_tick_map{0};
 
 void BbscLeaveItemUsed(std::string_view event); // see "Silencing Blank" below
 void NoteBbscSessionEnding(std::string_view why); // see "The item ledger"
+void DeliverBbscLedgerAtJoin(std::string_view why); // see "The item ledger"
 void SuspendBbscPersistenceOnce(std::string_view why); // see "quit to title" below
 
 void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& registers) {
@@ -3338,6 +3339,7 @@ void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& regist
         KeepBbscHomeSpot(); // where we stand now is where the trip home goes back to
     }
     if (name == "JoinSession_White" && GetSessionState() != 3) {
+        DeliverBbscLedgerAtJoin(name); // the join check: still our own world, before the load
         CaptureBbscOwnWorldBeforeJoin(); // first: the load resets the map's item flags
         StartBbscLoadCover("summon");
     }
@@ -3346,7 +3348,7 @@ void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& regist
     }
     if (name.starts_with("OnLeave") || name == "OnRoomTimeOut" ||
         name.find("Disconnect") != std::string::npos || name.find("Banish") != std::string::npos) {
-        NoteBbscSessionEnding(name); // key items stay with a guest (see "The item ledger")
+        NoteBbscSessionEnding(name); // the key item research window (see "The item ledger")
     }
 }
 
@@ -7296,7 +7298,7 @@ constexpr u64 NowLoadingCloseOffset = 0x0176D3C0;
 constexpr u64 NowLoadingSetStateOffset = 0x0176D320;
 constexpr float BbscCurtainFadeOutS = 0.6f;
 constexpr float BbscCurtainFadeInS = 0.8f;
-constexpr s64 BbscCurtainHoldMs = 2'500;      // black, the "load"
+constexpr s64 BbscCurtainHoldMs = 500;        // black after the respawn (T3: 6-8 s was too long)
 constexpr s64 BbscCurtainCloseWaitMs = 3'000; // give up waiting for it to close
 constexpr s64 BbscCurtainLimitMs = 15'000;    // whatever happens, the screen comes back
 
@@ -7529,7 +7531,7 @@ void TickBbscLoadCover() {
             const s64 since = now - bbsc_load_cover.load_over_ms;
             const bool respawned =
                 !BbscCurtainActive() && GetCharacterHp(GetLocalPlayerCharacter()) > 0;
-            if ((respawned && since >= 2'000) || since >= 20'000) {
+            if (respawned || since >= 20'000) { // T3: no extra 2 s of black after the respawn
                 EndBbscLoadCover(respawned ? "wipe reload done, guest respawned"
                                            : "wipe reload done, time limit after the load");
                 return;
@@ -7648,9 +7650,11 @@ void TickBbscDeathCurtain() {
         if (in_step < BbscCurtainHoldMs) {
             return;
         }
-        if (BbscLoadingScreenState() != 0) {
-            BbscCurtainStepTo(BbscCurtainStep::Closing, now); // someone else's screen: close it
-            return;
+        if (const u64 g = GetGlobalState(); BbscLoadingScreenState() != 0 &&
+                                            ReadablePointer(g, 0x10) && ReadValue<u8>(g, 0x08) == 0) {
+            // Someone else's screen left up after its load (T3): never waited for - closed in the
+            // background. During a load it is the load's own and stays.
+            KeepClosingBbscLoadingScreen("death curtain");
         }
         EndBbscDeathCurtain(now, "black hold over");
         return;
@@ -8903,6 +8907,14 @@ void TickBbscSpectate() {
         }
         if (!respawn_why.empty()) {
             BbscApplyDeathPenalty(respawn_why);
+            // T3 (2026-10-29, guest after a wipe): the load cover was still black when the curtain
+            // started on top of it - the guest stood at the lamp 6-8 s in the dark. With a cover
+            // up the screen is black already: respawn now and take the cover down with it.
+            if (bbsc_load_cover.active && BbscRespawnInPlace(respawn_why)) {
+                EndBbscLoadCover("respawned under the cover");
+                bbsc_spectate_active = false;
+                return;
+            }
             if (StartBbscDeathCurtain(respawn_why) || BbscRespawnInPlace(respawn_why)) {
                 bbsc_spectate_active = false;
                 return;
@@ -11387,18 +11399,20 @@ s64 BbscCurrentEventRunId();
 //     worked, so that window is the record of the game's own pickups and awards; BBSC's own adds
 //     note theirs. 1.5 s later it must be carried or stored (BBSC CHECK FAIL K2-window-no-item
 //     otherwise, and it is owed). Its count is kept while we are in the host's world.
-//   * Home again and settled (5 s): every given item is counted once more. Fewer than in the host's
-//     world means the trip home took them (while a guest, the save is the own-world snapshot) -
-//     BBSC CHECK FAIL K2-lost-on-trip-home, and the difference (at most what the trip gave) is
-//     given back. Then the given entries are done.
-//   * "Owed": to give at home, once - a talk's item window without its add, an award the host's
-//     world could not make, the old trip journal's lists, items lost on the way.
+//   * Home again and settled (5 s): every given item is counted once more, read only. Fewer than in
+//     the host's world means the trip home took them (the game keeps our own world's key items apart
+//     while we are a phantom and brings them back at home, see ReconcileBbscLedgerAtHome) - BBSC
+//     CHECK FAIL K2-lost-on-trip-home, and they are owed. The mod never removes an item or blocks a
+//     removal (user, 2026-10-29).
+//   * "Owed": given once, at the next join, while we are still in our own world (lua
+//     JoinSession_White, DeliverBbscLedgerAtJoin) - a talk's item window without its add, an award
+//     the host's world could not make, the old trip journal's lists, items lost on the way.
 //   * One-time lots (with a get flag) a character got: an award of one again while its item is
 //     still here is skipped and its flags set (BBSC CHECK FAIL K3-repeat), for the host too; and the
 //     get flags our own award sets are ours for the NPC quest flag guard (see RevertBbscNpcOwnFlags).
-//   * Once per character and run, at home: the guest-items file (items taken in hosts' worlds) is
-//     looked through for keys, workshop tools, badges and chalices that are neither carried nor
-//     stored - those are given (the players who lost one before this fix, user decision).
+//   * At the join check too, once per character and run: the guest-items file (items taken in hosts'
+//     worlds) is looked through for keys, workshop tools, badges and chalices that are neither
+//     carried nor stored - those are given (the players who lost one before this fix, user decision).
 // File: <mod>/item-ledger/ledger-<user>-<slot>.bin (written at most every 2 s while it changes).
 enum class BbscLedgerState : u8 { Given = 1, Owed = 2 };
 
@@ -12077,7 +12091,7 @@ bool IsBbscRetroGoods(u32 goods) {
            (goods >= 6100 && goods <= 6539);
 }
 
-// Once per character and run, at home: taken in a host's world (guest-items file), not with us.
+// Once per character and run, at the join check: taken in a host's world (guest-items file), not with us.
 void RetroBbscLedger() {
     static std::string done_for;
     std::optional<BbscSaveSlot> slot;
@@ -12158,38 +12172,17 @@ void RetroBbscLedger() {
              slot->user, slot->slot, looked, flags.size(), given);
 }
 
-// Home again and settled: the trip's given items counted again.
-// Test 2026-10-29 (runs/20261029-040355): the White Messenger Ribbon the guest picked up was still
-// carried 5 s after the trip home (CHECK OK), but not in the save the game wrote 28 s later, and
-// the key item guard below never saw a removal - the game puts a cooperator's inventory back from
-// the snapshot it took at the join, as a whole and at no fixed moment. A key or unique item of the
-// trip (goods types 1 and 6, weapons, attire) is therefore watched for BbscLedgerHomeWatchMs at
-// home: gone, it is put back at once, without a window (it is the item the player picked up, not
-// a gift), and the moment is logged (BBSC CHECK FAIL K2-lost-on-trip-home ... put back). Other
-// items are counted once, 5 s after the trip (a vial used at home is not "lost"); gone, they are
-// owed until the next join (DeliverBbscLedgerAtJoin), as gems and runes are.
-constexpr s64 BbscLedgerHomeWatchMs = 120'000;
-bool bbsc_ledger_home_counted = false; // the once-only count of this trip home is done
-
-bool BbscLedgerWatched(u32 code) {
-    const u32 type = code >> 28;
-    if (type == 0 || type == 1) {
-        return true; // a weapon or attire
-    }
-    if (type != 4) {
-        return false;
-    }
-    static u64 table = 0;
-    if (table == 0) {
-        table = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
-    }
-    const u64 row = table != 0 ? BbscParamRow(table, code & 0x0FFFFFFFu, 0x40) : 0;
-    const u8 goods_type = row != 0 ? ReadValue<u8>(row, 58) : 0;
-    return goods_type == 1 || goods_type == 6;
-}
-
-// since_home_ms: how long we have been home and settled. True when this trip home is done.
-bool ReconcileBbscLedgerAtHome(s64 since_home_ms) {
+// Home again and settled: the trip's given items counted once, 5 s after the home load - read
+// only. Test 3 (2026-10-29, docs/fixes/T3-results.md): the White Messenger Ribbon picked up as a
+// phantom was gone 5 s after the trip home; put back there by the mod (an earlier build), it was
+// missing again while the guest was in the host's world on the next join and back at home after
+// it. So the game keeps the key items of our own world apart while we are a phantom and puts them
+// back at the trip home, dropping what the phantom picked up. The user: the mod only ever adds
+// items, never removes or blocks a removal, and checks once, at the join. So what is gone here is
+// only noted (BBSC CHECK FAIL K2-lost-on-trip-home) and owed until the next join, where it is
+// given while we are still in our own world (DeliverBbscLedgerAtJoin) - into the set the game
+// keeps for home.
+bool ReconcileBbscLedgerAtHome() {
     std::map<u32, s32> gained; // code -> what the trip gave
     std::map<u32, s32> lot_of; // code -> a lot for a gem's award
     std::map<u32, s32> host;
@@ -12206,11 +12199,8 @@ bool ReconcileBbscLedgerAtHome(s64 since_home_ms) {
         host = bbsc_ledger_host_counts;
     }
     if (gained.empty()) {
-        bbsc_ledger_home_counted = false;
         return true;
     }
-    const bool first = !bbsc_ledger_home_counted;
-    bbsc_ledger_home_counted = true;
     size_t lost_items = 0;
     std::vector<BbscLedgerEntry> owed;
     for (const auto& [code, count] : gained) {
@@ -12218,64 +12208,57 @@ bool ReconcileBbscLedgerAtHome(s64 since_home_ms) {
         if (!BbscLedgerAddable(code) || seen == host.end()) {
             continue; // not countable: nothing to compare
         }
-        const bool watched = BbscLedgerWatched(code);
-        if (!first && !watched) {
-            continue;
-        }
         const s32 home = BbscLedgerCount(code);
         const s32 lost = std::clamp(seen->second - home, 0, count);
         if (lost == 0) {
             continue;
         }
         lost_items += static_cast<size_t>(lost);
-        const bool back = watched && AddBbscLedgerItem(code, lost);
         LOG_WARNING(Debug, "BBSC CHECK FAIL K2-lost-on-trip-home: {:#x} - {} in the host's world, {} "
-                           "at home {} s after the trip (the trip gave {}) - {}",
-                    code, seen->second, home, since_home_ms / 1000, count,
-                    back ? "put back" : "owed until the next join");
-        BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} at {} s - {}", code,
-                      seen->second, home, since_home_ms / 1000, back ? "put back" : "owed");
-        if (!back) {
-            BbscLedgerEntry e{};
-            e.source = BbscLedgerSource::Give;
-            e.state = BbscLedgerState::Owed;
-            e.code = code;
-            e.count = lost;
-            e.lot = lot_of.contains(code) ? lot_of[code] : 0;
-            owed.push_back(e);
-            if (watched) {
-                std::scoped_lock lock{bbsc_ledger_mutex};
-                bbsc_ledger_host_counts.erase(code); // owed now: not compared again
-            }
-        }
+                           "at home (the trip gave {}) - owed until the next join",
+                    code, seen->second, home, count);
+        BBSC_TIMELINE("CHECK", "K2-lost-on-trip-home: {:#x} {} -> {} - owed until the next join",
+                      code, seen->second, home);
+        BbscLedgerEntry e{};
+        e.source = BbscLedgerSource::Give;
+        e.state = BbscLedgerState::Owed;
+        e.code = code;
+        e.count = lost;
+        e.lot = lot_of.contains(code) ? lot_of[code] : 0;
+        owed.push_back(e);
     }
-    if (first && lost_items == 0) {
-        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us - "
-                        "key items watched for {} s",
-                 gained.size(), BbscLedgerHomeWatchMs / 1000);
+    if (lost_items == 0) {
+        LOG_INFO(Debug, "BBSC CHECK OK K2-trip-home: {} item kind(s) of the trip still with us",
+                 gained.size());
         BBSC_TIMELINE("CHECK", "OK K2-trip-home: {} item kind(s) still with us", gained.size());
     }
-    const bool done = since_home_ms >= BbscLedgerHomeWatchMs;
     std::scoped_lock lock{bbsc_ledger_mutex};
+    std::erase_if(bbsc_ledger,
+                  [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
+    bbsc_ledger_host_counts.clear();
     bbsc_ledger.insert(bbsc_ledger.end(), owed.begin(), owed.end());
-    if (done) {
-        std::erase_if(bbsc_ledger,
-                      [](const BbscLedgerEntry& e) { return e.state == BbscLedgerState::Given; });
-        bbsc_ledger_host_counts.clear();
-        bbsc_ledger_home_counted = false;
-        LOG_INFO(Debug, "BBSC ledger: the trip home is done ({} s watched)", since_home_ms / 1000);
-    }
-    if (!owed.empty() || done) {
-        bbsc_ledger_dirty = true;
-        WriteBbscLedgerLocked();
-    }
-    return done;
+    bbsc_ledger_dirty = true;
+    WriteBbscLedgerLocked();
+    return true;
 }
 
-// Joined a host and settled (5 s in its world, not loading, alive), once per session: the owed
-// items are given here, in the host's world, and the retro sweep looks for key items taken in hosts'
-// worlds before. Given now, they are noted as given (so the next trip home checks them too).
-void DeliverBbscLedgerAtJoin() {
+// The join check, once per summon, when the guest accepts it (lua JoinSession_White) - still in its
+// own world, before the summon load sets the own key items apart: the owed items and the retro
+// sweep (key items taken in hosts' worlds earlier, neither carried nor stored) are given here, so
+// they are in the set the game brings back at home.
+void DeliverBbscLedgerAtJoin(std::string_view why) {
+    const u64 global = GetGlobalState();
+    bool slot_known = false;
+    {
+        std::scoped_lock lock{bbsc_ledger_mutex};
+        slot_known = bbsc_ledger_slot.has_value();
+    }
+    if (image_base == 0 || !slot_known || !ReadablePointer(global, 0x1598) ||
+        ReadValue<u8>(global, 0x1592) == 0) {
+        LOG_INFO(Debug, "BBSC ledger: join check skipped ({}: {})", why,
+                 slot_known ? "not in our own world" : "the save slot is not known yet");
+        return;
+    }
     std::vector<BbscLedgerEntry> todo;
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
@@ -12292,9 +12275,6 @@ void DeliverBbscLedgerAtJoin() {
     for (auto& e : todo) {
         if (GiveBbscLedgerOwed(e)) {
             ++given;
-            if (e.code != 0 && BbscLedgerAddable(e.code)) {
-                NoteBbscLedgerGiven(e.source, e.lot, e.flag, e.code, e.count);
-            }
             continue;
         }
         if (++e.tries >= 3) {
@@ -12310,110 +12290,234 @@ void DeliverBbscLedgerAtJoin() {
     std::scoped_lock lock{bbsc_ledger_mutex};
     bbsc_ledger.insert(bbsc_ledger.begin(), left.begin(), left.end());
     bbsc_ledger_dirty = true;
-    LOG_INFO(Debug, "BBSC ledger: join check - {} owed item(s) given in the host's world, {} left",
-             given, left.size());
-    BBSC_TIMELINE("ITEMS", "ledger: join check - {} owed given, {} left", given, left.size());
+    LOG_INFO(Debug, "BBSC ledger: join check ({}) - {} owed item(s) given in our own world before the "
+                    "summon load, {} left",
+             why, given, left.size());
+    BBSC_TIMELINE("ITEMS", "ledger: join check ({}) - {} owed given, {} left", why, given,
+                  left.size());
     WriteBbscLedgerLocked();
 }
 
-// ---- Key items stay with a guest at the session's end (2026-10-29) ------------------------------
-// Test 2026-10-29 06:03:45 (runs/20261029-055243): the White Messenger Ribbon the guest picked up in
-// the host's world was gone the moment the co-op ended (6 -> 7 -> 0, before any load); the Blood
-// Stone Shard, bullets and vials of the same trip stayed. The game takes a cooperator's key items
-// (EquipParamGoods goodsType 1) when the session ends. The user: an item is picked up in the host's
-// world like any other and is that player's own. So from a session end's start (a leave / room
-// timeout / disconnect lua event, or session state 7) until 8 s after the state left 6, the
-// inventory's count change 0x014D94A0(inventory, slot, delta < 0, &over) and slot free
-// 0x014DAB20(inventory, slot, 1) are skipped for a key item in our carried items (what called them
-// is logged: the remover is still to be named). Not while simply in a session: a talk that takes a
-// quest item (the Small Hair Ornament) still works.
-constexpr u64 BbscInventoryChangeOffset = 0x014D94A0;
-constexpr u64 BbscInventoryFreeOffset = 0x014DAB20;
-std::atomic<s64> bbsc_ledger_leave_ms{0}; // a session end began
-u8 bbsc_key_keep_skip = 0;
+// ---- Research: a guest's key items around a session (2026-10-29, K2-snapshot-plan.md, A) ------
+// Read only; the mod does not touch the inventory here. From a session's start until 180 s after
+// it ended (and 180 s after a session end began), every 250 ms: the key items (goodsType 1) in the
+// carried items and the storage box, and the inventory's own tables and the player data pointer.
+// Any change is logged ("BBSC research: key items ..."), so a test shows when the game sets them
+// apart and puts them back, and whether that is a removal, a table swap or a new object. Next to
+// it the game's item functions are logged (hooks that only log): the inventory command handler
+// 0x014D3DC0 (static read 2026-10-29: 23 = give every non-key goods up to its max, 24 = every key
+// goods, 25 = empty the bag through 0x014D0030 - debug commands, kept to rule them out), the bag
+// clear 0x014D0030 and the removals by slot / by item 0x014D0310 / 0x014D0BE0 of a key item.
+constexpr s64 BbscKeyCensusMs = 250;
+constexpr s64 BbscKeyCensusAfterMs = 180'000;
+std::atomic<s64> bbsc_ledger_leave_ms{0};  // a session end began (lua leave events)
+std::atomic<s64> bbsc_key_census_until_ms{0};
 u64 BbscInventorySlotEntry(u64 inventory, u32 slot); // see "Restock"
 
 void NoteBbscSessionEnding(std::string_view why) {
     const s32 state = GetSessionState();
     if (state != 6 && state != 7) {
-        return; // only a guest's session end takes its key items
+        return;
     }
     bbsc_ledger_leave_ms = SteadyNowMs();
-    LOG_INFO(Debug, "BBSC items: the session ends ({}, state {}) - key items stay with us", why, state);
+    bbsc_key_census_until_ms = SteadyNowMs() + BbscKeyCensusAfterMs;
+    LOG_INFO(Debug, "BBSC research: the session ends ({}, state {}) - key items watched for {} s", why,
+             state, BbscKeyCensusAfterMs / 1000);
 }
 
-bool BbscKeepKeyItemsNow() {
-    if (GetSessionState() == 7) {
-        return true;
-    }
-    const s64 leave = bbsc_ledger_leave_ms.load();
-    return leave != 0 && SteadyNowMs() - leave < 8'000;
+bool BbscKeyCensusActive() {
+    return GetSessionState() != 0 || SteadyNowMs() < bbsc_key_census_until_ms.load();
 }
 
-void PS4_SYSV_ABI BbscInventoryTakeHook(u64 tag, const GuestRegisterSnapshot* registers) {
-    if (registers == nullptr || (tag == 0 && static_cast<s32>(registers->rdx) >= 0)) {
-        return; // an add
+// The goods ids with goodsType 1, sorted (once, from the game's own EquipParamGoods).
+const std::vector<u32>& BbscKeyGoodsIds() {
+    static std::vector<u32> ids;
+    if (!ids.empty()) {
+        return ids;
     }
-    const u64 inventory = registers->rdi;
-    if (inventory == 0 || inventory != BbscCarriedInventory()) {
-        return;
+    const u64 table = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
+    const u16 count = table != 0 ? ReadValue<u16>(table, 0x0A) : 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u64 entry = table + 0x40 + static_cast<u64>(i) * 0x18;
+        const u64 row = BbscCheckedParamRow(table, count, ReadValue<u64>(entry, 8), 0x40);
+        if (row != 0 && ReadValue<u8>(row, 58) == 1) {
+            ids.push_back(ReadValue<u32>(entry, 0));
+        }
     }
-    const s32 state = GetSessionState();
-    const bool keep = BbscKeepKeyItemsNow();
-    if (!keep && state != 6) {
-        return;
-    }
-    const u64 entry = BbscInventorySlotEntry(inventory, static_cast<u32>(registers->rsi));
-    const u32 key = entry != 0 ? ReadValue<u32>(entry, 0) : 0;
+    std::ranges::sort(ids);
+    return ids;
+}
+
+bool BbscIsKeyGoodsKey(u32 key) {
     const u32 kind = key & 0xF0000000u;
-    if (kind != 0xB0000000u && kind != 0x40000000u) {
-        return; // not goods
-    }
-    const u32 goods = key & 0x0FFFFFFFu;
-    static u64 table = 0; // the game's own table: stable once loaded (each shot and vial comes here)
-    if (table == 0) {
-        table = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
-    }
-    const u64 row = table != 0 ? BbscParamRow(table, goods, 0x40) : 0;
-    if (row == 0 || ReadValue<u8>(row, 58) != 1) {
-        return; // not a key item
-    }
-    const u64 ret0 = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
-    const u64 ret1 = ReadablePointer(registers->rbp + 8, 8) ? ReadValue<u64>(registers->rbp, 8) : 0;
-    const auto off = [](u64 a) { return a >= image_base ? a - image_base : a; };
-    static std::vector<u64> logged;
-    const u64 seen = (static_cast<u64>(goods) << 8) | (tag << 1) | (keep ? 1u : 0u);
-    if (logged.size() < 128 && std::ranges::find(logged, seen) == logged.end()) {
-        logged.push_back(seen);
-        LOG_INFO(Debug, "BBSC items: key item {} {} (session state {}, {}, callers {:#x} <- {:#x}) - {}",
-                 goods, tag == 0 ? "count lowered" : "slot freed", state,
-                 keep ? "the session is ending" : "in the session", off(ret0), off(ret1),
-                 keep ? "KEPT" : "as the game does");
-        BBSC_TIMELINE("ITEMS", "key item {} {} at state {} (callers {:#x} <- {:#x}) - {}", goods,
-                      tag == 0 ? "count lowered" : "slot freed", state, off(ret0), off(ret1),
-                      keep ? "kept" : "taken");
-    }
-    if (keep) {
-        bbsc_key_keep_skip = 1;
-    }
+    return (kind == 0xB0000000u || kind == 0x40000000u) &&
+           std::ranges::binary_search(BbscKeyGoodsIds(), key & 0x0FFFFFFFu);
 }
 
-void InstallBbscKeyItemGuard() {
+// (goods id, count) of every key item in an inventory, sorted.
+std::vector<std::pair<u32, s32>> BbscKeyItemsIn(u64 inventory) {
+    std::vector<std::pair<u32, s32>> out;
+    if (inventory == 0 || !ReadablePointer(inventory, 0x90)) {
+        return out;
+    }
+    const u32 slots = std::min<u32>(std::max(ReadValue<u32>(inventory, 0x88) + 1,
+                                             ReadValue<u32>(inventory, 0x10)),
+                                    4096);
+    for (u32 slot = 0; slot < slots; ++slot) {
+        const u64 entry = BbscInventorySlotEntry(inventory, slot);
+        const u32 key = entry != 0 ? ReadValue<u32>(entry, 0) : 0;
+        if (key != 0 && BbscIsKeyGoodsKey(key)) {
+            out.emplace_back(key & 0x0FFFFFFFu, ReadValue<s32>(entry, 8));
+        }
+    }
+    std::ranges::sort(out);
+    return out;
+}
+
+std::string BbscKeyItemsDiff(const std::vector<std::pair<u32, s32>>& before,
+                             const std::vector<std::pair<u32, s32>>& now) {
+    std::string out;
+    for (const auto& [id, count] : now) {
+        const auto it = std::ranges::find_if(before, [id](const auto& p) { return p.first == id; });
+        if (it == before.end()) {
+            out += fmt::format(" +{}x{}", id, count);
+        } else if (it->second != count) {
+            out += fmt::format(" {}:{}->{}", id, it->second, count);
+        }
+    }
+    for (const auto& [id, count] : before) {
+        if (std::ranges::none_of(now, [id](const auto& p) { return p.first == id; })) {
+            out += fmt::format(" -{}", id);
+        }
+    }
+    return out;
+}
+
+void TickBbscKeyItemCensus(s64 now) {
+    static s64 last_ms = 0;
+    static std::vector<std::pair<u32, s32>> carried_before;
+    static std::vector<std::pair<u32, s32>> stored_before;
+    static std::array<u64, 6> tables_before{};
+    static bool have = false;
+    static int lines = 0;
+    if (now - last_ms < BbscKeyCensusMs || image_base == 0) {
+        return;
+    }
+    last_ms = now;
+    if (GetSessionState() != 0) {
+        bbsc_key_census_until_ms = std::max(bbsc_key_census_until_ms.load(), now + BbscKeyCensusAfterMs);
+    }
+    if (!BbscKeyCensusActive()) {
+        have = false;
+        return;
+    }
+    const u64 game_data = ReadValue<u64>(image_base + 0x0553B130, 0);
+    const u64 player_data = ReadablePointer(game_data, 0x10) ? ReadValue<u64>(game_data, 8) : 0;
+    const u64 carried = BbscCarriedInventory();
+    const u64 global_now = GetGlobalState();
+    const bool loading = !ReadablePointer(global_now, 0x10) || ReadValue<u8>(global_now, 0x08) != 0;
+    const u64 stored = !loading && GetLocalPlayerCharacter() != 0 ? BbscStorageInventory() : 0;
+    const std::array<u64, 6> tables{player_data, carried,
+                                    carried != 0 ? ReadValue<u64>(carried, 0x58) : 0,
+                                    carried != 0 ? ReadValue<u64>(carried, 0x48) : 0,
+                                    carried != 0 ? ReadValue<u64>(carried, 0x78) : 0, stored};
+    const auto carried_now = BbscKeyItemsIn(carried);
+    const auto stored_now = stored != 0 ? BbscKeyItemsIn(stored) : stored_before;
+    if (!have) {
+        have = true;
+        carried_before = carried_now;
+        stored_before = stored_now;
+        tables_before = tables;
+        LOG_INFO(Debug, "BBSC research: key items watched - {} carried, {} stored (state {}, player "
+                        "data {:#x})",
+                 carried_now.size(), stored_now.size(), GetSessionState(), player_data);
+        return;
+    }
+    const std::string carried_diff = BbscKeyItemsDiff(carried_before, carried_now);
+    const std::string stored_diff = BbscKeyItemsDiff(stored_before, stored_now);
+    const bool moved = tables != tables_before;
+    if ((carried_diff.empty() && stored_diff.empty() && !moved) || lines >= 400) {
+        return;
+    }
+    ++lines;
+    const u64 global = GetGlobalState();
+    LOG_INFO(Debug, "BBSC research: key items carried [{} ] stored [{} ]{} (state {}, own world {}, "
+                    "loading {}, map {:#x}, player data {:#x}, bag tables {:#x}/{:#x}/{:#x})",
+             carried_diff, stored_diff, moved ? " - INVENTORY TABLES CHANGED" : "",
+             GetSessionState(),
+             ReadablePointer(global, 0x1598) ? ReadValue<u8>(global, 0x1592) : 0xFF,
+             ReadablePointer(global, 0x10) ? ReadValue<u8>(global, 0x08) : 0xFF,
+             GetCurrentPackedMap(), player_data, tables[2], tables[3], tables[4]);
+    BBSC_TIMELINE("RESEARCH", "key items carried [{} ] stored [{} ]{} (state {})", carried_diff,
+                  stored_diff, moved ? " tables changed" : "", GetSessionState());
+    carried_before = carried_now;
+    stored_before = stored_now;
+    tables_before = tables;
+}
+
+// Hooks that only log (tags: 0 the command handler 0x014D3DC0, 1 the bag clear 0x014D0030,
+// 2 the removal by item 0x014D0BE0, 3 the removal by slot 0x014D0310).
+constexpr std::array<u64, 4> BbscItemResearchSites{0x014D3DC0, 0x014D0030, 0x014D0BE0, 0x014D0310};
+
+void PS4_SYSV_ABI BbscItemResearchHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || tag >= BbscItemResearchSites.size()) {
+        return;
+    }
+    const u32 arg = static_cast<u32>(registers->rsi);
+    const bool always = (tag == 0 && arg >= 23 && arg <= 25) || tag == 1;
+    if (!always && !BbscKeyCensusActive()) {
+        return;
+    }
+    std::string what;
+    if (tag == 3) {
+        // (bag object = player data + 0x1D0, slot, ...): the bag is the object + 0x158.
+        const u64 entry = ReadablePointer(registers->rdi, 0x160)
+                              ? BbscInventorySlotEntry(registers->rdi + 0x158, arg)
+                              : 0;
+        const u32 key = entry != 0 ? ReadValue<u32>(entry, 0) : 0;
+        if (!BbscIsKeyGoodsKey(key)) {
+            return;
+        }
+        what = fmt::format("key item {} (slot {}, count {})", key & 0x0FFFFFFFu, arg,
+                           ReadValue<s32>(entry, 8));
+    } else if (tag == 2) {
+        if (!BbscIsKeyGoodsKey(static_cast<u32>(registers->rdx)) &&
+            !BbscIsKeyGoodsKey(static_cast<u32>(registers->rsi))) {
+            return;
+        }
+        what = fmt::format("args {:#x} {:#x} {:#x}", registers->rsi, registers->rdx, registers->rcx);
+    } else {
+        what = fmt::format("{} {}", tag == 0 ? "message" : "flag", arg);
+    }
+    static int lines = 0;
+    if (lines >= 200) {
+        return;
+    }
+    ++lines;
+    const auto off = [](u64 a) { return a >= image_base ? a - image_base : a; };
+    const u64 ret0 = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
+    const u64 frame = registers->rbp;
+    const u64 ret1 = ReadablePointer(frame + 8, 8) ? ReadValue<u64>(frame, 8) : 0;
+    const u64 frame2 = ReadablePointer(frame, 8) ? ReadValue<u64>(frame, 0) : 0;
+    const u64 ret2 = ReadablePointer(frame2 + 8, 8) ? ReadValue<u64>(frame2, 8) : 0;
+    static constexpr std::array<std::string_view, 4> Names{
+        "inventory command 0x014D3DC0", "bag clear 0x014D0030", "remove by item 0x014D0BE0",
+        "remove by slot 0x014D0310"};
+    LOG_INFO(Debug, "BBSC research: {} - {} (object {:#x}, session state {}, callers {:#x} <- {:#x} "
+                    "<- {:#x})",
+             Names[tag], what, registers->rdi, GetSessionState(), off(ret0), off(ret1), off(ret2));
+    BBSC_TIMELINE("RESEARCH", "{} - {} (state {}, caller {:#x})", Names[tag], what,
+                  GetSessionState(), off(ret0));
+}
+
+void InstallBbscItemResearchHooks() {
     static constexpr std::array<u8, 6> Prologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
-    const bool change =
-        image_base != 0 &&
-        InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscInventoryChangeOffset),
-                             std::span<const u8>{Prologue}, 0, BbscInventoryTakeHook,
-                             &bbsc_key_keep_skip);
-    const bool free =
-        image_base != 0 &&
-        InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscInventoryFreeOffset),
-                             std::span<const u8>{Prologue}, 1, BbscInventoryTakeHook,
-                             &bbsc_key_keep_skip);
-    if (!change || !free) {
-        LOG_ERROR(Debug, "BBSC items: key item guard hooks failed (change {}, free {}) - a guest "
-                         "loses its key items at the session end",
-                  change, free);
+    for (size_t tag = 0; tag < BbscItemResearchSites.size(); ++tag) {
+        if (image_base == 0 ||
+            !InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscItemResearchSites[tag]),
+                                  std::span<const u8>{Prologue}, tag, BbscItemResearchHook)) {
+            LOG_ERROR(Debug, "BBSC research: item hook {:#x} failed", BbscItemResearchSites[tag]);
+        }
     }
 }
 
@@ -12428,54 +12532,32 @@ void TickBbscItemLedger() {
         slot_ms = now;
         SyncBbscLedgerSlot();
     }
-    // A session end the lua events did not name (state 6 left): the guard's window from here.
-    static s32 last_state = 0;
-    const s32 state = GetSessionState();
-    if (last_state == 6 && state != 6 && now - bbsc_ledger_leave_ms.load() > 8'000) {
-        bbsc_ledger_leave_ms = now;
-    }
-    last_state = state;
+    TickBbscKeyItemCensus(now);
     bool slot_known = false;
     {
         std::scoped_lock lock{bbsc_ledger_mutex};
         slot_known = bbsc_ledger_slot.has_value();
     }
     static s64 home_since_ms = 0;
-    static s64 guest_since_ms = 0;
-    static bool joined_checked = false;
+    static bool home_counted = false;
     static s64 written_ms = 0;
     const u64 global = GetGlobalState();
-    const bool settled = ReadablePointer(global, 0x1593) && ReadValue<u8>(global, 0x08) == 0 &&
-                         GetCharacterHp(GetLocalPlayerCharacter()) > 0 &&
-                         ReadValue<u64>(image_base + EventFlagManPointerOffset, 0) != 0;
+    const s32 state = GetSessionState();
     if (BbscGuestInHostWorld()) {
         home_since_ms = 0;
+        home_counted = false;
         CheckBbscLedgerGiven(now);
-        if (!settled) {
-            guest_since_ms = 0;
-        } else if (guest_since_ms == 0) {
-            guest_since_ms = now;
-        } else if (!joined_checked && slot_known && now - guest_since_ms >= 5'000) {
-            joined_checked = true;
-            DeliverBbscLedgerAtJoin();
-        }
     } else {
-        guest_since_ms = 0;
-        if (state != 6) {
-            joined_checked = false; // the next session checks again
-        }
-        const bool home = (state == 0 || state == 3) && settled &&
-                          ReadValue<u8>(global, 0x1592) != 0;
+        const bool home = (state == 0 || state == 3) && ReadablePointer(global, 0x1593) &&
+                          ReadValue<u8>(global, 0x08) == 0 && ReadValue<u8>(global, 0x1592) != 0 &&
+                          GetCharacterHp(GetLocalPlayerCharacter()) > 0 &&
+                          ReadValue<u64>(image_base + EventFlagManPointerOffset, 0) != 0;
         if (!home) {
             home_since_ms = 0;
         } else if (home_since_ms == 0) {
             home_since_ms = now;
-        } else if (now - home_since_ms >= 5'000 && slot_known) {
-            static s64 reconciled_ms = 0;
-            if (now - reconciled_ms >= 1'000) { // every second while key items are watched
-                reconciled_ms = now;
-                ReconcileBbscLedgerAtHome(now - home_since_ms);
-            }
+        } else if (!home_counted && slot_known && now - home_since_ms >= 5'000) {
+            home_counted = ReconcileBbscLedgerAtHome(); // once per trip home, read only
         }
     }
     std::scoped_lock lock{bbsc_ledger_mutex};
@@ -13642,6 +13724,28 @@ bool BbscWatchCamera(u64 director, u64 render, const Bbsc::CinematicInput& in, s
     bbsc_watch.yaw +=
         std::clamp(turn_x, -1.0f, 1.0f) * TurnRadPerSecond * dt * bbsc_cine.right_sign;
     bbsc_watch.pitch += std::clamp(turn_y, -1.0f, 1.0f) * TurnRadPerSecond * dt;
+    {
+        // T3 (2026-10-29): the keys and the stick did not turn the watch camera - what reaches it is
+        // logged once a second when it changes (bbsc_mod.cpp logs where it came from).
+        static s64 input_ms = 0;
+        static std::string last_line;
+        static int lines = 0;
+        if (now - input_ms >= 1'000 && lines < 300) {
+            input_ms = now;
+            const std::string line = fmt::format(
+                "mouse {:.0f},{:.0f} arrows {}{}{}{} A/D {}{} pad look {:.2f},{:.2f} pad move {:.2f},{:.2f} "
+                "-> turn {:.2f},{:.2f}",
+                in.mouse_dx, in.mouse_dy, in.look_left ? 'L' : '-', in.look_right ? 'R' : '-',
+                in.look_up ? 'U' : '-', in.look_down ? 'D' : '-', in.left ? 'A' : '-',
+                in.right ? 'D' : '-', in.pad_look_x, in.pad_look_y, in.pad_move_x, in.pad_move_y,
+                turn_x, turn_y);
+            if (line != last_line) {
+                last_line = line;
+                ++lines;
+                LOG_INFO(Debug, "BBSC watch camera input: {}", line);
+            }
+        }
+    }
     bbsc_watch.pitch = std::clamp(bbsc_watch.pitch, -1.35f, 0.6f);
     // Closer / farther: wheel (PageUp / PageDown, d-pad up / down in the mod), W / S, left stick.
     for (int i = 0; i < std::abs(in.wheel); ++i) {
@@ -20838,7 +20942,7 @@ void InstallReverseEngineeringTrace() {
     InstallBbscEchoPathHooks();
     InstallBbscDreamHooks();
     InstallBbscFloorGuardAndPickupTrace();
-    InstallBbscKeyItemGuard();
+    InstallBbscItemResearchHooks();
     InstallBbscCinematicHook();
     InstallBbscQuitHook();
     InstallBbscDeathTraceHooks();
