@@ -11069,6 +11069,16 @@ void ShowBbscItemPopup(u32 type, u32 id, s32 count, std::string_view what) {
 bool bbsc_popup_hook_ready = false; // see "Awards to a guest in the host's world"
 void NoteBbscLedgerOwed(BbscLedgerSource source, s32 lot, u32 flag, u32 code, s32 count,
                         std::string_view why); // see "The item ledger"
+bool GiveBbscPickedLotEntry(u64 row, s32 lot, u32 pick, BbscLedgerSource source); // "The item ledger"
+
+// isGuestDrop (EquipParamGoods +71 bit 3): Blood Vials and Quicksilver Bullets only. The game itself
+// drops those on an enemy's body for a cooperator - test 2026-10-29: BBSC's roll gave them at the
+// kill and the guest picked them up from the body again.
+bool BbscGoodsIsGuestDrop(u32 goods) {
+    const u64 table = BbscGameParamTable("EQUIP_PARAM_GOODS_ST");
+    const u64 row = table != 0 ? BbscParamRow(table, goods, 0x48) : 0;
+    return row != 0 && ((ReadValue<u8>(row, 71) >> 3) & 1) != 0;
+}
 
 void GiveBbscGuestDrop(s32 lot, u32 name) {
     const BbscLedgerSource source = name != 0 ? BbscLedgerSource::Drop : BbscLedgerSource::Award;
@@ -11114,6 +11124,12 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
                  lot, pick + 1, flag);
         return;
     }
+    if (name != 0 && category == 4 && BbscGoodsIsGuestDrop(static_cast<u32>(item))) {
+        LOG_INFO(Debug, "BBSC guest drop: lot {} rolled goods {} x{} - the game drops it on the body "
+                        "for us, not given twice",
+                 lot, item, count);
+        return;
+    }
     if (category == 0 || category == 1) {
         // 2026-10-27 (user: every reward at once in the host's world): weapons (0) and attire (1)
         // go straight into the items as a talk's c1_52 puts them, AddItem 0x014CDFD0(player data +
@@ -11152,10 +11168,13 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
         return;
     }
     if (category != 4) {
-        // Blood gems and runes (8), category 15: only the award makes them. A lot holding them is
-        // given by the game's own award in the host's world (BbscGuestAwardHook); this is only
-        // reached when that award gave nothing - then the ledger owes it until home (the list of
-        // 64 lots in memory, which dropped the rest silently, is gone).
+        // Blood gems and runes (8), category 15: only the award makes them - the game's award of
+        // just the entry rolled here (one roll, at once in the host's world, user 2026-10-29). When
+        // it gives nothing the ledger owes it until home (the list of 64 lots in memory, which
+        // dropped the rest silently, is gone).
+        if (BbscGuestInHostWorld() && GiveBbscPickedLotEntry(row, lot, pick, source)) {
+            return;
+        }
         NoteBbscLedgerOwed(source, lot, flag > 0 ? static_cast<u32>(flag) : 0, 0, 1,
                            category == 8 ? "blood gem / rune" : "category 15 item");
         LOG_INFO(Debug, "BBSC guest drop: a {} (id {}, lot {}) - awarded once we are home",
@@ -11339,7 +11358,8 @@ struct BbscLedgerContext {
 };
 std::optional<BbscLedgerContext> bbsc_ledger_context;
 bool bbsc_ledger_regive = false;     // BBSC's own award at home: never a repeat
-bool bbsc_ledger_drop_award = false; // TickBbscGuestDrops awards an enemy's lot
+bool bbsc_ledger_drop_award = false;   // the award below is an enemy's drop
+bool bbsc_ledger_picked_award = false; // GiveBbscPickedLotEntry runs the award of one entry
 std::unordered_map<u32, s64> bbsc_ledger_own_flags; // NPC quest get flag -> our own award's time
 constexpr u64 BbscGiveWindowReturn1 = 0x017D934D; // after the give's two window calls
 constexpr u64 BbscGiveWindowReturn2 = 0x017D94CC;
@@ -12203,6 +12223,38 @@ void TickBbscItemLedger() {
     }
 }
 
+// One rolled entry of a lot through the game's award (a blood gem / rune for a guest in the host's
+// world): the row's other weights are 0 for the call and put back at once (the game's own row; the
+// award runs here, on the game thread). One roll - BBSC's - and the gem at once. True when the award
+// gave something.
+bool GiveBbscPickedLotEntry(u64 row, s32 lot, u32 pick, BbscLedgerSource source) {
+    const u64 item_man = ReadValue<u64>(image_base + BbscItemManPointer, 0);
+    if (item_man == 0 || row == 0 || pick >= 8) {
+        return false;
+    }
+    std::array<u16, 8> weights{};
+    for (u32 i = 0; i < 8; ++i) {
+        weights[i] = ReadValue<u16>(row, 0x40 + i * 2);
+        WriteValue<u16>(row, 0x40 + i * 2, static_cast<u16>(i == pick ? 1 : 0));
+    }
+    bbsc_ledger_picked_award = true;
+    bbsc_ledger_drop_award = source == BbscLedgerSource::Drop;
+    using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+    reinterpret_cast<AwardItemLot>(image_base + BbscAwardItemLot)(item_man, lot, 0);
+    bbsc_ledger_picked_award = false;
+    bbsc_ledger_drop_award = false;
+    for (u32 i = 0; i < 8; ++i) {
+        WriteValue<u16>(row, 0x40 + i * 2, weights[i]);
+    }
+    const u32 gives = bbsc_ledger_context.has_value() ? bbsc_ledger_context->gives : 0;
+    LOG_INFO(Debug, "BBSC guest drop: lot {} entry {} (blood gem / rune) through the game's award - "
+                    "{} item window(s)",
+             lot, pick + 1, gives);
+    BBSC_TIMELINE("ITEMS", "guest drop: lot {} entry {} by the game's award ({} item(s))", lot,
+                  pick + 1, gives);
+    return gives != 0;
+}
+
 void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || !bbsc_popup_hook_ready) {
         return;
@@ -12235,7 +12287,8 @@ void PS4_SYSV_ABI BbscGuestAwardHook(u64 /*tag*/, const GuestRegisterSnapshot* r
         // does): blood gems and runes are made only by the game's award - it runs here as for the
         // host. If a sure lot gives nothing, FinishBbscLedgerContext gives it the BBSC way.
         const u32 flag = BbscLotMainFlag(row);
-        bbsc_ledger_context->check = BbscLotIsSure(row) && !(flag != 0 && BbscEventFlag(flag));
+        bbsc_ledger_context->check = !bbsc_ledger_picked_award && BbscLotIsSure(row) &&
+                                     !(flag != 0 && BbscEventFlag(flag));
         bbsc_guest_award_active = !BbscItemPopupEnabled(); // popups off: BBSC's notice instead
         LOG_INFO(Debug, "BBSC guest award: item lot {} (blood gem / rune) in the host's world - the "
                         "game's award runs",
@@ -12288,18 +12341,7 @@ void TickBbscGuestDrops() {
         ReadValue<u8>(global, 0x08) != 0 || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
         return; // dropped: no longer a guest, loading or dead
     }
-    const u64 item_man = ReadValue<u64>(image_base + BbscItemManPointer, 0);
     for (const auto& [lot, name] : due) {
-        // A lot that may hold a blood gem: one roll by the game's award (BbscGuestAwardHook lets it
-        // run), so the guest gets gems at once and with the game's chances.
-        const u64 row = BbscLedgerLotRow(lot);
-        if (row != 0 && item_man != 0 && BbscLotHasGem(row)) {
-            bbsc_ledger_drop_award = true;
-            using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
-            reinterpret_cast<AwardItemLot>(image_base + BbscAwardItemLot)(item_man, lot, 0);
-            bbsc_ledger_drop_award = false;
-            continue;
-        }
         GiveBbscGuestDrop(lot, name);
     }
 }
