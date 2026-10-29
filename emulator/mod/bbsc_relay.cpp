@@ -307,7 +307,7 @@ void Dispatch(const std::vector<u8>& wrapped) {
         u32 sequence = 0;
         std::memcpy(&player, frame.data() + 5, 4);
         std::memcpy(&sequence, frame.data() + 10, 4);
-        Core::Bloodborne::OnBbscLifePacket(player, frame[9], sequence);
+        Core::Bloodborne::OnBbscLifePacket(sender, frame[9], sequence, from_our_host());
     } else if (frame[4] == ScaleType && frame.size() >= 15) {
         if (from_our_host()) {
             std::uint16_t percent[5]{};

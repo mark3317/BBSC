@@ -5715,7 +5715,7 @@ void RevertBbscNpcOwnFlags() {
                 continue;
             }
             bbsc_action_owner[flag] = false;
-        SetBbscNpcFlagBit(storage, flag, own->second != 0);
+            SetBbscNpcFlagBit(storage, flag, own->second != 0);
             ++reverted;
             static std::vector<u32> logged;
             if (logged.size() < 256 && std::ranges::find(logged, flag) == logged.end()) {
@@ -5736,9 +5736,11 @@ void RevertBbscNpcOwnFlags() {
 // the put-back runs once more at the start of each frame's event update (an event's step 0x012ECDC0,
 // the first one after our tick) and at a talk step: the other player's values are gone before our
 // events and talks look.
+void LocalizeBbscKnockEvent(u64 instance);
 bool bbsc_npc_pass_due = false;
-void PS4_SYSV_ABI BbscNpcPassHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
+void PS4_SYSV_ABI BbscNpcPassHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     BBSC_PERF_SCOPE("hook BbscNpcPassHook");
+    if (registers && bbsc_npc_own_active) LocalizeBbscKnockEvent(registers->rdi);
     if (!bbsc_npc_pass_due || !bbsc_npc_own_active) {
         return;
     }
@@ -9087,25 +9089,24 @@ void TickBbscSpectate() {
                 return;
             }
             bbsc_spectate_wipe_warped = true;
-            const u64 real_host = FindRemoteHostCharacter();
-            const u64 host = real_host != 0 && GetCharacterHp(real_host) > 0
-                                 ? real_host
-                                 : FindLivingPartnerCharacter();
-            const auto host_transform = ReadCharacterTransform(host);
-            if (host_transform.has_value()) {
-                SummonPlacementDescriptor to{};
-                to.packed_region = GetCurrentPackedMap();
-                to.x = host_transform->position[0] + 1.0f;
-                to.y = host_transform->position[1];
-                to.z = host_transform->position[2];
-                to.heading = host_transform->rotation[1];
-                if (RequestBbscSessionWarp(GetGlobalState(), to, "wipe")) {
-                    return; // the load builds a new character: "a load ended the boss fight"
-                }
+            // Use the host's own placement packet: a remote character may still be in the old
+            // map after the host reloads. Never combine its coordinates with our current map.
+            BbscFollowMessage target{};
+            { std::scoped_lock lock{bbsc_follow_mutex}; target = bbsc_follow_latest; }
+            if (target.received_ms == 0 || now - target.received_ms > BbscFollowStaleMs ||
+                !IsUsablePackedMap(target.packed_map)) {
+                bbsc_spectate_wipe_warped = false;
+                return; // wait for host placement; no speculative teleport
             }
-            LOG_WARNING(Debug, "BBSC spectate: wipe reload could not be requested, respawning "
-                               "in place instead");
-            respawn_why = "the host reloaded after the wipe";
+            SummonPlacementDescriptor to{};
+            to.packed_region = target.packed_map;
+            to.x = target.x + 1.0f;
+            to.y = target.y;
+            to.z = target.z;
+            to.heading = target.heading;
+            if (RequestBbscSessionWarp(GetGlobalState(), to, "wipe")) return;
+            bbsc_spectate_wipe_warped = false;
+            return; // retry; never fall back into a different map
         } else if (bbsc_boss_killed_ms >= bbsc_spectate_since_ms) {
             if (bbsc_boss_cleared_since_ms == 0) {
                 bbsc_boss_cleared_since_ms = now;
@@ -14593,7 +14594,7 @@ void KeepBbscGuestTalkBits(u32 key, const u8* before, u8* live) {
 
 void PS4_SYSV_ABI BbscTalkStepBeginHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     BBSC_PERF_SCOPE("hook BbscTalkStepBeginHook");
-    BbscNpcPassHook(0, registers);
+    BbscNpcPassHook(0, nullptr);
     bbsc_in_talk_step = true;
     bbsc_talk_step_id = 0;
     // RBX = the talk record + 0x28; +0x10 is its condition evaluator, the talk id at +0x10.
@@ -15003,6 +15004,45 @@ bool IsBbscTalkDrivenEvent(s64 event) {
     const auto it = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
                                              &BbscTalkEventTrigger::event);
     return it != BbscTalkEventTriggers.end() && it->event == event;
+}
+
+// CUSA03173 1.09: bank 2000[2] at 0x017C81E2 writes bool(argument) to event+0x78.
+// Setting 0 is the game's SetNetworkSyncState(false). Do this before the event update,
+// including the initial reset and condition wait. No packet / player notification is emitted.
+void LocalizeBbscKnockEvent(u64 instance) {
+    if (!ReadablePointer(instance, 0xC0) ||
+        !HasMemoryAccess(instance + 0x78, 1, MemoryProt::CpuWrite)) return;
+    // Cache the instruction range, not just the pointer: the game reuses event instances.
+    struct Cached { u64 ref; u64 first; u64 end; u64 row; s64 event; bool knock; };
+    static std::map<u64, Cached> cache;
+    const u64 ref = ReadValue<u64>(instance, 0xA8);
+    const u64 instruction = ReadValue<u64>(instance, 0xB0);
+    auto it = cache.find(instance);
+    if (it == cache.end() || it->second.ref != ref || instruction < it->second.first ||
+        instruction >= it->second.end || !ReadablePointer(it->second.row, 8) ||
+        ReadValue<s64>(it->second.row, 0) != it->second.event) {
+        if (!ReadablePointer(ref, 0x10)) return;
+        const u64 file = ReadValue<u64>(ref, 8);
+        if (!ReadablePointer(file, 0x90)) return;
+        const s64 count = ReadValue<s64>(file, 0x10);
+        const u64 events = file + ReadValue<u64>(file, 0x18);
+        const u64 instructions = file + ReadValue<u64>(file, 0x28);
+        if (count <= 0 || count > 100'000 ||
+            !HasMemoryAccess(events, count * 0x30, MemoryProt::CpuRead)) return;
+        it = cache.end();
+        for (s64 n = 0; n < count; ++n) {
+            const u64 row = events + n * 0x30;
+            const u64 first = instructions + ReadValue<u64>(row, 0x10);
+            const u64 end = first + ReadValue<u64>(row, 8) * 0x20;
+            if (instruction < first || instruction >= end) continue;
+            const s64 event = ReadValue<s64>(row, 0);
+            if (cache.size() >= 4096) cache.clear();
+            it = cache.insert_or_assign(instance, Cached{ref, first, end, row, event,
+                std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end()}).first;
+            break;
+        }
+    }
+    if (it != cache.end() && it->second.knock) WriteValue<u8>(instance, 0x78, 0);
 }
 
 bool BbscTalkEventIsOurs(s64 event) {
@@ -20675,7 +20715,7 @@ std::int32_t GetBbscRelaySessionState() {
     return bbsc_relay_session_state.load();
 }
 
-void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t sequence) {
+void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t sequence, bool host) {
     if (player == bbsc_life_own_id.load()) {
         return;
     }
@@ -20688,7 +20728,7 @@ void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t seq
             return; // older than what we have
         }
         changed = life.received_ms == 0 || life.dead != dead;
-        if (life.received_ms != 0 && life.dead != 0 && dead == 0) {
+        if (host && life.received_ms != 0 && life.dead != 0 && dead == 0) {
             ++bbsc_peer_revivals;
         }
         life = {dead, sequence, SteadyNowMs()};
