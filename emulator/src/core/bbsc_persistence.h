@@ -14,7 +14,7 @@ namespace Core::Bbsc {
 // any environment variable, so the build runs straight from a launcher. Everything still only
 // applies to CUSA03173 01.09 (checked where each feature installs). Experimental switches stay
 // off, and so is the boot intro (SHADPS4_BBSC_INTRO=1 brings it back). Setting a variable always wins: "0" turns a default off, any other value turns it on.
-inline constexpr std::array<std::string_view, 36> DefaultOnSwitches{
+inline constexpr std::array<std::string_view, 33> DefaultOnSwitches{
     "SHADPS4_BBSC_SHARED_PROGRESS",     // merge the host's progress into the guest's world (adds only)
     "SHADPS4_BBSC_WARP_TOGETHER",        // the guest follows the host through a lamp warp
     "SHADPS4_BBSC_WORLD_SYNC",           // ...and loads the host's map with the host's world flags
@@ -26,7 +26,6 @@ inline constexpr std::array<std::string_view, 36> DefaultOnSwitches{
     "SHADPS4_BBSC_DREAM",                // a guest uses the Doll, workshop and messengers in the host's Dream
     "SHADPS4_BBSC_DREAM_OWN",            // ...and sees its OWN Dream there (no host's Dream flags)
     "SHADPS4_BBSC_DEATH_PENALTY",        // a kept death still drops a bloodstain and the echoes
-    "SHADPS4_BBSC_TRACE_WALLS",          // log which map objects get shown/made solid (fog walls)
     "SHADPS4_BBSC_LAMP",                 // the lamp prompt works in co-op (clears the +0x4B gate)
     "SHADPS4_BBSC_NO_HP_PENALTY",        // clears the summoned guest's 30% max HP cut (effect 9006)
     "SHADPS4_BBSC_NO_FOG_WALLS",         // co-op area fog walls hidden, leaving the area allowed
@@ -35,7 +34,6 @@ inline constexpr std::array<std::string_view, 36> DefaultOnSwitches{
     "SHADPS4_BBSC_WARP_JOIN",            // after a cross-map join, one more real reload (lighting)
     "SHADPS4_BLOODBORNE_SEAMLESS_COOP",  // Wozzardman's seamless summon
     "SHADPS4_BLOODBORNE_RE_TRACE",       // installs the BBSC hooks (and the trace logs)
-    "SHADPS4_CAPTURE_BLOODBORNE_SUMMON", // summon capture files for collect-logs
     "SHADPS4_BBSC_PERSIST",              // keep the session through loads and deaths
     "SHADPS4_BBSC_PERSIST_MATCHCHECK",   // ignore the post-load matching check kick
     "SHADPS4_BBSC_REJOIN",               // guest rejoin / reinsert after a kept death
@@ -49,7 +47,6 @@ inline constexpr std::array<std::string_view, 36> DefaultOnSwitches{
     "SHADPS4_BBSC_INVADE_ANYWHERE",      // every world open to invaders (Bell Maiden SpEffect 9020)
     "SHADPS4_BBSC_AREA_LIST_CAP",        // fewer messages/bloodstains per request (Panic 265 crash)
     "SHADPS4_BBSC_WORLD_SYNC_ALL",       // the host's flags for every area, not just the one it is in
-    "SHADPS4_BBSC_TIMELINE",             // a short bbsc-timeline-*.txt of what happened, next to the logs
     "SHADPS4_BBSC_BELLS_ANYWHERE",       // the kit's bells ring anywhere (Dream too); role / Insight still count
 };
 
