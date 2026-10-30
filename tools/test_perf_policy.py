@@ -111,6 +111,10 @@ int main() {
     assert(BbscQuietMessage(30, 105199)); // boss (network state remains independent)
     assert(BbscQuietMessage(30, 15000011)); // follow/rejoin
     assert(!BbscQuietMessage(30, 14000)); // actionable bell confirmation
+    assert(BbscHideBanner(u"[BBSC:silent]"));
+    assert(BbscHideBanner(u"?ActionEventInfo?"));
+    assert(!BbscHideBanner(u"Player joined your game."));
+    assert(!BbscHideBanner(u"PvP включено."));
     assert(!BbscQuietMessage(200, 302000)); // item/menu name
     std::cout << "param reload/cache and notification policy: PASS\n";
 }
@@ -119,7 +123,8 @@ with tempfile.TemporaryDirectory(prefix="bbsc-perf-test-") as tmp:
     source = Path(tmp) / "test.cpp"
     binary = Path(tmp) / "test.exe"
     source.write_text(prefix + function("u64 BbscGameParamTable(std::string_view type)") +
-                      function("bool BbscQuietMessage(u32 category, u32 id)") + main, encoding="utf-8")
+                      function("bool BbscQuietMessage(u32 category, u32 id)") +
+                      function("bool BbscHideBanner(std::u16string_view text)") + main, encoding="utf-8")
     subprocess.run([os.environ.get("CXX", "g++"), "-std=c++20", "-O2", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 print(f"functional trace dispatch coverage: PASS ({len(required)} offsets + cutscenes)")

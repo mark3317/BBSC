@@ -1,5 +1,11 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
+> **T11, 30 October: test regressions under repair, not deployed.**
+> Host-first wipe spectator cleanup, resolved banner draw filter, native chest
+> availability and immediate native summon loading screen. See
+> [T11-test-regressions](fixes/T11-test-regressions.md). T10 test had Research logs
+> enabled (168/168 hooks); production trace reduction was not exercised.
+
 > **T10, 30 October: performance/notification audit, deployed to PC + laptop.**
 > Diagnostic-only hot hooks are opt-in; obsolete boss-banner transport removed;
 > reload-safe param slot cache, dead shop guard removed, personal-event policy

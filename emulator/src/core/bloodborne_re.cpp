@@ -4377,6 +4377,8 @@ s64 bbsc_boss_killed_ms = 0;
 bool bbsc_boss_at_own_death = false;
 std::atomic<u32> bbsc_load_generation{0}; // incremented after an actual load completes
 u32 bbsc_spectate_load_generation = 0;
+u64 bbsc_spectate_character = 0;
+bool bbsc_spectate_saw_loading = false;
 void ClearBbscBossContext(std::string_view why);
 
 void NoteBbscBossBar() {
@@ -7677,12 +7679,17 @@ void StartBbscLoadCover(std::string_view why) {
     if (!BbscLoadCoverEnabled() || image_base == 0 || bbsc_load_cover.active) {
         return; // one cover spans a summon and its second reload
     }
-    BbscFadeTo(1.0f, BbscLoadCoverFadeOutS); // no plate during a load: the tick blacks it later
     bbsc_load_cover = {};
     bbsc_load_cover.active = true;
     bbsc_load_cover.started_ms = SteadyNowMs();
     bbsc_load_cover.why = std::string{why};
-    LOG_INFO(Debug, "BBSC load cover: fading out ({})", why);
+    if (why == "summon" && ReadValue<u64>(image_base + MenuManPointerOffset, 0) != 0) {
+        BbscLoadingScreen(true);
+        bbsc_load_cover.own_screen = true;
+    } else {
+        BbscFadeTo(1.0f, BbscLoadCoverFadeOutS);
+    }
+    LOG_INFO(Debug, "BBSC load cover: started ({}, native screen {})", why, bbsc_load_cover.own_screen);
     BBSC_TIMELINE("LOAD", "load cover: fading out ({})", why);
 }
 
@@ -7762,6 +7769,12 @@ void TickBbscLoadCover() {
                 LOG_INFO(Debug, "BBSC load cover: the game's loading screen is up (kind {})",
                          ReadValue<s32>(menu, 0x808));
             }
+            return;
+        }
+        if (bbsc_load_cover.own_screen) {
+            // The summon and placement reload may be separate stage transitions.
+            // Keep the native loading UI across that gap; EndBbscLoadCover owns its close.
+            BbscLoadingScreen(true);
             return;
         }
         if (!bbsc_load_cover.game_screen_seen) {
@@ -9008,6 +9021,8 @@ void BeginBbscCoopDeath(std::string_view name, s32 session_state) {
     bbsc_spectate_name = name;
     bbsc_spectate_since_ms = SteadyNowMs();
     bbsc_spectate_load_generation = bbsc_load_generation.load();
+    bbsc_spectate_character = GetLocalPlayerCharacter();
+    bbsc_spectate_saw_loading = false;
     bbsc_spectate_alone_since_ms = 0;
     bbsc_spectate_logged_wait = false;
     bbsc_spectate_saw_wipe = guest_waits_for_host;
@@ -9078,6 +9093,25 @@ void TickBbscSpectate() {
     const s64 now = SteadyNowMs();
     const s32 session_state = GetSessionState();
     const bool session_alive = session_state == 3 || session_state == 6;
+    const u64 current_global = GetGlobalState();
+    const bool global_ready = ReadablePointer(current_global, 0x1598);
+    const bool loading_now = global_ready && ReadValue<u8>(current_global, 0x08) != 0;
+    bbsc_spectate_saw_loading |= loading_now;
+    const u64 current_character = GetLocalPlayerCharacter();
+    const bool load_completed = bbsc_load_generation.load() != bbsc_spectate_load_generation ||
+                                bbsc_spectate_saw_loading ||
+                                (bbsc_spectate_character != 0 && current_character != bbsc_spectate_character);
+    if (global_ready && !loading_now && load_completed &&
+        ReadablePointer(current_character, 0x3B8) && GetCharacterHp(current_character) > 0) {
+        bbsc_spectate_active = false;
+        bbsc_spectate_releasing = false;
+        bbsc_spectate_saw_loading = false;
+        Bbsc::CinematicForceOff();
+        ClearBbscBossContext("living character after death load");
+        ReleaseBbscDeathLocks("living character after death load");
+        LOG_INFO(Debug, "BBSC spectate: completed death load, living local character - camera released");
+        return;
+    }
     std::string_view reason;
     if (session_state == 6 && !bbsc_spectate_saw_wipe &&
         bbsc_boss_killed_ms < bbsc_spectate_since_ms &&
@@ -15538,11 +15572,9 @@ void TickBbscUnstuckKey() {
 
 // 2026-10-01 test: the guest saw items it could not pick up. The prompt search 0x017D9FB0 takes
 // every item with +0x48 bit 0x40 and has no session check of its own, so an item without the bit
-// is "seen but not pickable". User rule: every item the guest can see must be pickable. Once a
-// second, for a guest in the host's world, every map item whose pickup flag (+0x28, -1 = none) is
-// not set gets switched on through the game's own enable 0x017D9E70(item manager, &id, 1), which
-// also handles the item's group and its glow (its treasure refusal for guests is patched out,
-// GuestItems.ShowTreasure). Taken items keep their flag set and stay off.
+// Availability belongs to native treasure/chest/script logic. Never force a disabled
+// item on: that exposes unopened chest contents. The periodic pass only hides taken
+// or explicitly script-hidden items; the GuestItems byte patches permit native guest pickup.
 constexpr u64 ItemEnableOffset = 0x017D9E70;
 
 // SetTreasureState (EMEVD 2005[4], 0x0131CEF0) calls EnableItem at 0x0131CF8F.
@@ -15582,7 +15614,6 @@ void TickBbscGuestItemsPickable() {
     // 2026-10-11 squad test (item 0x53 taken again after a rejoin, 19:54:29): an item that was
     // already lying in the map when the item view marked it taken stayed pickable - the view only
     // stops items from being spawned. Such an item (shown, its taken flag set) is switched off.
-    std::vector<u32> off;
     std::vector<u32> stale;
     u32 taken = 0;
     for (size_t list = 0; list < 3; ++list) {
@@ -15600,8 +15631,6 @@ void TickBbscGuestItemsPickable() {
             if ((ReadValue<u16>(item, 0x48) & 0x40) == 0) {
                 if (flag_set || script_hidden) {
                     ++taken;
-                } else if (off.size() < 256) {
-                    off.push_back(ReadValue<u32>(item, 0x20));
                 }
             } else if ((flag_set || script_hidden) && stale.size() < 256) {
                 stale.push_back(ReadValue<u32>(item, 0x20));
@@ -15611,10 +15640,6 @@ void TickBbscGuestItemsPickable() {
     }
     using EnableItem = u64 PS4_SYSV_ABI (*)(u64 manager, u32* id, u32 on);
     const auto enable = reinterpret_cast<EnableItem>(image_base + ItemEnableOffset);
-    u32 switched = 0;
-    for (u32 id : off) {
-        switched += enable(manager, &id, 1) != 0 ? 1 : 0;
-    }
     if (!stale.empty()) {
         u32 hidden = 0;
         std::string ids;
@@ -15629,12 +15654,9 @@ void TickBbscGuestItemsPickable() {
                  "map {:#x} ({})",
                  stale.size(), hidden, GetCurrentPackedMap(), ids);
     }
-    const u32 total = static_cast<u32>(off.size()) * 1000 + taken;
-    if (switched != 0 || total != logged_total) {
-        logged_total = total;
-        LOG_INFO(Debug,
-                 "BBSC guest items: {} item(s) made pickable, {} left off (already taken), map {:#x}",
-                 switched, taken, GetCurrentPackedMap());
+    if (taken != logged_total) {
+        logged_total = taken;
+        LOG_INFO(Debug, "BBSC guest items: {} taken or script-hidden; native availability preserved", taken);
     }
 }
 
@@ -16551,68 +16573,55 @@ void BbscAnnounce(const char16_t* text, std::string_view what) {
 // Quiet mod messages carry a sentinel text; clear pending before the menu draws an empty banner.
 // Real joins/leaves must stay visible even during a summon, so there is no blanket quiet timer.
 // Explicit notices are limited to PvP and connection loss by BbscAnnounce.
-constexpr u64 BannerMenuUpdateOffset = 0x01BFF910;
-constexpr u64 BannerPendingOffset = 0x055813D8; // u8: 1 = a banner is queued
-constexpr u64 BannerTextOffset = 0x055813E0;    // const char16_t*: its text
+constexpr u64 BannerDrawTextOffset = 0x01BFFBA7;
+u64 PS4_SYSV_ABI BbscSilentBannerDraw(u64, u64, u64, u64) { return 0; }
 
-std::string BbscBannerText() {
-    // Every banner in the 2026-10-06 logs read "" as a pointer: the producers copy the text INTO the
-    // banner block (see "Co-op banner lines": "copied into the banner ... 0x055813D8 on"), so the
-    // bytes at 0x055813E0 are the characters themselves when they are not a readable pointer.
-    // HYPOTHESIS until a log shows real banner text.
-    u64 text = ReadValue<u64>(image_base + BannerTextOffset, 0);
-    if (!ReadablePointer(text, 2)) {
-        text = image_base + BannerTextOffset;
-    }
-    std::string out;
-    for (size_t i = 0; i < 120 && ReadablePointer(text + i * 2, 2); ++i) {
-        const u16 c = ReadValue<u16>(text, i * 2);
-        if (c == 0) {
-            break;
-        }
-        out.push_back(c == '\n' ? ' ' : (c < 0x80 ? static_cast<char>(c) : '?'));
-    }
-    return out;
+u64 BbscSilentBannerVtable() {
+    static const std::array<u64, 40> table = [] {
+        std::array<u64, 40> entries{};
+        entries[0x138 / sizeof(u64)] = reinterpret_cast<u64>(&BbscSilentBannerDraw);
+        return entries;
+    }();
+    return reinterpret_cast<u64>(table.data());
 }
 
-void PS4_SYSV_ABI BbscBannerMenuHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
-    BBSC_PERF_SCOPE("hook BbscBannerMenuHook");
-    if (registers == nullptr || ReadValue<u8>(image_base + BannerPendingOffset, 0) != 1) {
-        return;
+std::u16string BbscBannerDrawText(u64 pointer) {
+    std::u16string text;
+    for (size_t i = 0; i < 512 && ReadablePointer(pointer + i * 2, 2); ++i) {
+        const auto ch = ReadValue<char16_t>(pointer, i * 2);
+        if (ch == 0) break;
+        text.push_back(ch);
     }
-    static std::string last_text;
-    static s64 last_ms = 0;
-    const std::string text = BbscBannerText();
-    const bool own = bbsc_banner_own_pending;
+    return text;
+}
+
+bool BbscHideBanner(std::u16string_view text) {
+    return text.empty() || text.find(u"[BBSC:silent]") != std::u16string_view::npos ||
+           text.find(u"?ActionEventInfo?") != std::u16string_view::npos;
+}
+
+void PS4_SYSV_ABI BbscBannerMenuHook(u64, const GuestRegisterSnapshot* registers) {
+    if (!registers) return;
+    // 01BFFBA7: call [rax+138h], RDX is the resolved UTF-16 string passed to the UI.
+    // The global at 055813E0 is a string container, not a wchar pointer.
+    const auto text = BbscBannerDrawText(registers->rdx);
+    if (BbscHideBanner(text)) {
+        // Redirect only this virtual draw call. A skip_flag would RET from the middle
+        // of the menu function with its stack frame still present.
+        const_cast<GuestRegisterSnapshot*>(registers)->rax = BbscSilentBannerVtable();
+        WriteValue<float>(registers->r15, 0xB30, 0.0f);
+        LOG_INFO(Debug, "BBSC banner: suppressed at resolved text draw ({} UTF-16 units)", text.size());
+    }
     bbsc_banner_own_pending = false;
-    // Suppress the entire banner, not just its text (no empty window).
-    const bool silent = text == "[BBSC:silent]";
-    const bool hide = silent || (!own && text == "?ActionEventInfo?");
-    if (hide) {
-        WriteValue<u8>(image_base + BannerPendingOffset, 0, 0);
-    }
-    const s64 now = SteadyNowMs();
-    if (text != last_text || now - last_ms > 2'000 || hide) {
-        LOG_INFO(Debug, "BBSC banner: \"{}\" {} (session state {})", text,
-                 hide ? (silent ? "hidden - quiet notifications" : "hidden - missing message") : (own ? "shown (BBSC's own)" : "shown"),
-                 GetSessionState());
-    }
-    last_text = text;
-    last_ms = now;
 }
 
 void InstallBbscBannerHook() {
-    if (image_base == 0 || !BbscMessagesEnabled()) {
-        return;
+    if (image_base == 0 || !BbscMessagesEnabled()) return;
+    static constexpr std::array<u8, 6> Call{0xFF, 0x90, 0x38, 0x01, 0x00, 0x00};
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BannerDrawTextOffset),
+                              std::span<const u8>{Call}, 0, BbscBannerMenuHook)) {
+        LOG_ERROR(Debug, "BBSC banner: failed to hook resolved text draw");
     }
-    static constexpr std::array<u8, 6> PushR15{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
-    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BannerMenuUpdateOffset),
-                              std::span<const u8>{PushR15}, 0, BbscBannerMenuHook)) {
-        LOG_ERROR(Debug, "BBSC banner: failed to hook the banner menu update {:#x}",
-                  BannerMenuUpdateOffset);
-        return;
-    }
-    LOG_INFO(Debug, "BBSC banner: banners logged; the ones a joining guest gets are hidden");
 }
 
 // ---- Death watchdog and death-step trace --------------------------------------------------------
