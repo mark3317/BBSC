@@ -1,5 +1,10 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T16 deployed PC + laptop**: consume host arrival after sharing map, preventing repeated
+> follow loads on Cathedral Ward border. Code c75b1d6, tests PASS, build exit=0.
+> Host crash confirmed Windows GPU TDR 141/nvlddmkm Blackwell, not fixed by this patch.
+> See [T16](fixes/T16-follow-border.md). Saves unchanged.
+
 > **T15 deployed to PC + laptop**, override and active-package hashes verified.
 > See [T15](fixes/T15-loading-and-NPCs.md). Gameplay confirmation pending.
 > **User preference:** after future fixes and successful builds, deploy immediately to

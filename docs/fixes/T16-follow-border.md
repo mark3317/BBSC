@@ -12,3 +12,8 @@ from co-op/progress mismatch not established. Do not claim this code fixes TDR.
 
 Test in game: join an advanced host, cross Cathedral Ward/Central Yharnam border repeatedly,
 then host travels by lamp: guest should still follow the new load. Saves remain untouched.
+
+Build exit=0; follow eligibility C++ expression fixture and existing 15 session scenarios PASS.
+Deployed to PC/laptop (closed), override and active DLL hashes verified.
+DLL SHA256 BAE2F4B8F5526D86E105BFBBC85D6A581869B86CBC845D50138F1CA625A2DCA9.
+Gameplay validation pending.
