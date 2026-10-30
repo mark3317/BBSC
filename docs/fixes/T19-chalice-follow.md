@@ -53,7 +53,18 @@ PASS: test_chalice_scope (реальные capture/injection, протокол �
 в memory fixture), test_follow_arrival, test_post_load_recovery,
 test_perf_policy, test_pending_work. Это не игровой результат: native resource
 loading, непрерывность соединения и сохранность сейва после игры требуют прогона.
-Сборка/деплой и их хеши записываются после выполнения.
+Сборка `c00fa6c`: build-mod-bbport exit=0, без ошибок компиляции. Установлена
+на закрытые ПК и ноут (override + активный пакет), 12 SHA256-проверок PASS:
+
+| Файл | SHA256 |
+|---|---|
+| bbsc.dll | `A1DCCB2BD6BCBA11FCC422039F5906B411CD824839F66C264F1F4D88B6AD0477` |
+| bbsc-launch.exe | `7A9C1676F72BD7931AABEFDBB40591554918C482F210FED69961F87AD3E140D3` |
+| mod.json | `225AA89F630F694DA3CD7D9041A702A022D3E179A585AA36486A54FD34CD4909` |
+
+Сейвы/настройки не изменялись; сервер и порт не пересобирались/не заменялись.
+После сборки дополнительно сохранены проверки T18: отказ записи scoped loot
+не уничтожает старый namespace, а смена follow identity запрещает старый снимок.
 
 Persistent ritual instance ID и точный layer ID ещё не введены: revision действует
 только в процессе хоста и не заменяет постоянный идентификатор нового ритуала.

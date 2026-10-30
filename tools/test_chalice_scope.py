@@ -183,6 +183,20 @@ int main() {
     assert(!selected[5] && memory[0x50010]==42); // own altar fields not changed
     BbscWorldSnapshot stale;
     assert(BbscHostBlockSnapshot(current,stale) && BbscChaliceSnapshotMatches(stale));
+    enabled=false; assert(!BbscChaliceLoadReady(current)); enabled=true;
+    auto other=a; other.channel=43;
+    OnBbscHostFollowPacket(current,0,0,0,0,2,-1,other);
+    assert(!BbscChaliceLoadReady(current)); // an old complete snapshot cannot override follow identity
+    OnBbscHostFollowPacket(current,0,0,0,0,3,-1,a);
+    assert(SelectBbscLootScope(current)); const auto first=bbsc_loot_dungeon;
+    assert(first.find("-chalice-")==0);
+    bbsc_loot_dirty=true; bbsc_loot_groups[52900]=1;
+    fail_write=true; assert(!SelectBbscLootScope(0x18000000));
+    assert(bbsc_loot_dungeon==first && bbsc_loot_groups.size()==1);
+    fail_write=false; assert(SelectBbscLootScope(0x18000000));
+    assert(bbsc_loot_dungeon.empty() && bbsc_loot_groups.empty());
+    assert(Chalice::IsLootGroup(52900) && !Chalice::IsLootGroup(52400));
+    assert(!Chalice::IsLootGroup(12900));
 
     // A new load with the same virtual map/key requires the matching new flag generation.
     auto newer=mount; newer.revision=2; newer.parts[0]=9920000;
@@ -205,7 +219,7 @@ int main() {
     newer.map=0x1d010000;
     std::memcpy(descriptor.data()+8,&newer,sizeof(newer));
     OnBbscChaliceMountPacket(descriptor.data(),descriptor.size());
-    OnBbscHostFollowPacket(newer.map,0,0,0,0,2,-1,a);
+    OnBbscHostFollowPacket(newer.map,0,0,0,0,4,-1,a);
     assert(!BbscChaliceNeedsLoad(newer.map));
     assert(BbscChaliceArrivalReady(newer.map)); // resident walking keeps loot capture enabled
     // A delayed descriptor cannot roll the loader back to an older revision.
