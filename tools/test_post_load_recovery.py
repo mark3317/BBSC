@@ -69,6 +69,7 @@ u8 Stop(u64) { ++stopped; state=0; return 1; }
 u64 MultiPlayStopRequestOffset=reinterpret_cast<u64>(&Stop)-image_base;
 '''
 functions = '\n'.join(function(sig) for sig in (
+    'void TickBbscLoadState()',
     'bool IsInvaderType(s32 type)',
     'bool SetOwnWorldRestoreType(s32 type, s32* previous)',
     'void CancelBbscReinsert(std::string_view why)',
@@ -87,6 +88,13 @@ int main(int argc,char**argv) {
     memory[image_base+MatchingStatePointerOffset]=0x700000;
     memory[slots+0x8C]=static_cast<u64>(-1);
     memory[local+0xA4]=1; memory[player+0x78]=1;
+    if(test=="load_observer") {
+        memory[global+8]=1; TickBbscLoadState();
+        global=0; TickBbscLoadState(); assert(bbsc_load_generation==0);
+        global=0x200000; memory[global+8]=0; TickBbscLoadState();
+        assert(bbsc_load_generation==1); TickBbscLoadState();
+        assert(bbsc_load_generation==1); return 0;
+    }
     if(test=="override") {
         ArmBbscReinsertV8(); assert(bbsc_v8_original_type==0);
         ArmBbscReinsertV8(); assert(bbsc_v8_original_type==0);
@@ -135,7 +143,7 @@ with tempfile.TemporaryDirectory(prefix='bbsc-recovery-') as tmp:
     cpp=Path(tmp)/'fixture.cpp'; exe=Path(tmp)/'fixture.exe'
     cpp.write_text(prefix+functions+fixture,encoding='utf-8')
     subprocess.run([os.environ.get('CXX','g++'),'-std=c++20','-O0',str(cpp),'-o',str(exe)],check=True)
-    for scenario in ('override','boss_without_load','home','home_pending','dead','healthy',
+    for scenario in ('load_observer','override','boss_without_load','home','home_pending','dead','healthy',
                      'missing','failed_revive','host_missing','loading','joining','invader','title','lua_unavailable'):
         subprocess.run([str(exe),scenario],check=True,timeout=5)
         print(scenario+': PASS')

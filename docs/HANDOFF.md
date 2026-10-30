@@ -5,7 +5,8 @@
 > with phantom type=1 (bell rejected player type). Cancel kept-death override before
 > teardown; reconcile local character/camera after completed loads independently of
 > remote creation; normalize phantom at home; dead/missing guests can return home.
-> No save changes. Regression fixtures pass. Build status below in
+> No save changes. All 15 fixture scenarios pass; final mod build exit=0, no warnings.
+> Code `8ff3435` + `7ed971b`. Details/hash in
 > [T14-post-load-recovery](fixes/T14-post-load-recovery.md); gameplay confirmation pending.
 
 
