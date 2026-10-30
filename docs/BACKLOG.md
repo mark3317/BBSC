@@ -4,7 +4,10 @@
 > notifications, numeric scaling/cache and research-only diagnostic scans (`addfd08`).
 > Build exit=0, zero warnings; 12 deployed-file hash checks PASS; concurrency,
 > scaling and existing recovery/follow checks PASS. Research OFF, saves unchanged.
-> Gameplay/FPS confirmation pending. See [T17](fixes/T17-event-work.md).
+> User reports gameplay generally works. Run 20261030-161747: PC crash coincides
+> with nvlddmkm 153 + WER LiveKernelEvent 141/Blackwell at 16:27:49; GPU TDR
+> confirmed, root cause unresolved. Guest returned home and retained trip items.
+> PC median 59.7 game ticks/s; no matched baseline for speedup. See [T17](fixes/T17-event-work.md).
 
 
 > **30.10, T14:** повторный софтлок после одновременной смерти вне босса подтверждён:
