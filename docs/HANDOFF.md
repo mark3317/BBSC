@@ -1,6 +1,6 @@
 # HANDOFF — состояние работы и что дальше
 
-> **T12, 30 October: PC startup fixed in PORT f4f0028, installed on PC only.**
+> **T12, 30 October: PC startup fixed in PORT f4f0028, installed/verified on PC + laptop.**
 > Signaling initialization rollback deadlocked joining a dispatch worker while
 > owning its mutex. Removed unused ioctl socket; release lock before workers.
 > T11 DLL + Research OFF reaches title menu; left running, no world loaded.

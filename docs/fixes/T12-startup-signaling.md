@@ -29,3 +29,8 @@ and reaches the title menu, confirmed visually at 60 FPS. Game left at title;
 no world loaded or save restored in this diagnosis. Laptop runtime not changed.
 Saves remain forest-host on both machines as copied earlier. Multiplayer gameplay
 and startup error handling on an actual failed network remain separate checks.
+
+Follow-up: user authorized laptop update. Same runtime installed and SHA256 verified
+on laptop. Backup: C:/Games/Bloodborne/bbport-coop/bin/bb-probe.exe.bak-signaling-20261030-115448.
+No game/launcher was running. Save and launcher settings unchanged. Runtime now
+matches PC. Laptop startup/gameplay with the new runtime not exercised by agent.
