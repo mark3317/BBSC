@@ -120,3 +120,24 @@ control is the same port/config/character in launcher Offline mode without BBSC,
 then travel to Dream and return/title transitions. Do not attribute the fault to
 GPU hardware, NVIDIA alone or a particular BBSC hook from timing correlation.
 No settings, saves, binaries or driver changed during collection.
+
+## Offline/no-BBSC control — 16:37–16:39 Moscow
+
+User reports same Dream-travel crash in launcher Offline mode. Saved play_mode is
+`offline`, latest last_run.log starts 16:37:59, no new BBSC logs/captures were
+created after the previous 16:35:36 process. Launcher playSelected routes Offline
+to normal play(), not coopPlay(). Both DLSS settings remain OFF. This is strong
+control evidence that BBSC injection is not required; no live module snapshot was
+possible after process exit. Other game mods remain: pc-menu and Xbox prompts.
+
+New GPU errors: nvlddmkm 153 at 16:39:04 and 16:39:09. New WER 141 at 16:39:13,
+report 1efae228-6e54-4c83-a894-b0e740685d95, WATCHDOG-20261030-1639.dmp.
+The 16:39:19 archive entry instead belongs to the PREVIOUS 16:36 incident; do not
+count it as another crash. Collected as `20261030-163700-offline`.
+
+Next isolation target is shared renderer/driver path, not T17 queue logic.
+Driver 621.01 still installed. Controlled driver replacement/rollback followed by
+same Offline Dream route is appropriate; not performed automatically. No evidence
+yet distinguishes driver, port resource lifetime/synchronization, other game mods
+or hardware instability. WATCHDOG folder access denied in current process;
+dumps not analyzed. No binary/settings/save changes during this investigation.
