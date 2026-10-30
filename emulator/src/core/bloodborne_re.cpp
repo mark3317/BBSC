@@ -4747,6 +4747,8 @@ bool BbscWarpJoinEnabled() {
 bool BbscChaliceLoadReady(u32 map);
 bool PrepareBbscChaliceLoad(u32 map);
 void CancelBbscChaliceLoad();
+bool BbscChaliceJoinNeedsFollow();
+bool bbsc_chalice_transition_owned = false; // synchronous game-thread request, not a network flag
 
 bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std::string_view why) {
     if (Chalice::IsMap(to.packed_region) && !PrepareBbscChaliceLoad(to.packed_region)) {
@@ -4788,7 +4790,10 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
         WriteValue<s32>(rules, 0x84, 3);
     }
     StartBbscLoadCover(why); // already on for the summon when this is the cross-map second reload
+    const bool previous_owner = bbsc_chalice_transition_owned;
+    bbsc_chalice_transition_owned = true;
     const u64 result = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset)();
+    bbsc_chalice_transition_owned = previous_owner;
     LOG_INFO(Debug,
              "BBSC {} warp: full reload requested into map {:#x} at ({:.2f}, {:.2f}, {:.2f}), "
              "result {}",
@@ -4834,6 +4839,20 @@ void TickBbscJoinTeleport() {
         bbsc_join_teleport_done = true;
         return;
     }
+    if (BbscChaliceJoinNeedsFollow()) {
+        // A summon can finish with a valid host transform while the guest still has its old map.
+        // Never put dungeon coordinates into that map. The scoped follow owns the recovery load.
+        done = true;
+        bbsc_join_teleport_done = true;
+        bbsc_cross_map_join.store(false, std::memory_order_release);
+        {
+            std::scoped_lock lock{seamless_placement_mutex};
+            bbsc_connect_first_placement.reset();
+        }
+        LOG_WARNING(Debug, "BBSC chalice: initial summon has not mounted the host dungeon; handing off to scoped follow without teleporting");
+        BBSC_TIMELINE("CHALICE", "initial summon: scoped follow owns recovery; no cross-world teleport");
+        return;
+    }
     // The host, not just any living partner: with 3+ hunters the first one found can be another
     // guest, who may be anywhere (2026-10-06).
     const u64 real_host = FindRemoteHostCharacter();
@@ -4869,7 +4888,7 @@ void TickBbscJoinTeleport() {
     // same-map join does not need it, and the reload after every summon was what turned the guest
     // into "Beckoner" (Eryk, 2026-09-23).
     if (BbscWarpJoinEnabled() && bbsc_cross_map_join.load(std::memory_order_acquire) &&
-        !warp_requested) {
+        !warp_requested && !Chalice::IsMap(GetCurrentPackedMap())) {
         SummonPlacementDescriptor to{};
         to.packed_region = GetCurrentPackedMap();
         to.x = host_transform->position[0] + 1.0f;
@@ -5076,6 +5095,33 @@ bool bbsc_chalice_context_hook_ready = false;
 bool bbsc_chalice_value_hook_ready = false;
 bool bbsc_chalice_flag_hook_ready = false;
 u8 bbsc_chalice_value_skip = 0;
+bool bbsc_chalice_transition_hook_ready = false;
+u8 bbsc_chalice_transition_skip = 0;
+
+u32 BbscChaliceInitialJoinMap() {
+    if (bbsc_join_teleport_done) return 0;
+    const auto claim = BbscConnectFirstHost();
+    return claim && Chalice::IsMap(claim->packed_region) ? claim->packed_region : 0;
+}
+
+// A native replicated warp into m29 still carries the guest's old summoned map. In T19 it
+// reloaded the Dream first. Already joined, living cooperators use the scoped follow instead.
+// Initial summons, death/home loads, invaders and our own explicit requests keep their path.
+void PS4_SYSV_ABI BbscChaliceTransitionHook(u64, const GuestRegisterSnapshot* registers) {
+    if (!registers || bbsc_chalice_transition_owned || !bbsc_join_teleport_done ||
+        GetSessionState() != 6 || GetLocalPlayerType() != 1) return;
+    const u64 global = GetGlobalState();
+    if (!ReadablePointer(global, 0x1593) || ReadValue<u8>(global, 0x1592) != 0 ||
+        ReadValue<u8>(global, 0x08) != 0 ||
+        !Chalice::IsMap(ReadValue<u32>(global, 0x0C)) ||
+        GetCharacterHp(GetLocalPlayerCharacter()) <= 0) return;
+    // Acknowledge the native request before it sets global+08 or tears down any character.
+    // The host's fresh mount + snapshot will authorize the one actual follow load.
+    const_cast<GuestRegisterSnapshot*>(registers)->rax = 1;
+    bbsc_chalice_transition_skip = 1;
+    LOG_INFO(Debug, "BBSC chalice: native guest dungeon transition deferred to scoped follow");
+    BBSC_TIMELINE("CHALICE", "native dungeon transition deferred; keeping current world until scoped follow");
+}
 
 bool BbscProtectChaliceAltar(u32 flag, u32 width = 1) {
     if (!Chalice::TouchesAltar(flag, width)) return false;
@@ -5098,7 +5144,10 @@ Chalice::Key ReadBbscChaliceKey() {
 // has not committed channel/layout/parts/type/feature into its runtime loader yet.
 // Both copied instructions are whole, non-RIP-relative stores (11 checked bytes).
 void PS4_SYSV_ABI BbscChaliceContextHook(u64, const GuestRegisterSnapshot* registers) {
-    if (!registers || !Chalice::IsMap(static_cast<u32>(registers->r13))) {
+    if (!registers) return;
+    const s32 state = GetSessionState();
+    const u32 initial_map = (state == 4 || state == 6) ? BbscChaliceInitialJoinMap() : 0;
+    if (!Chalice::IsMap(initial_map) && !Chalice::IsMap(static_cast<u32>(registers->r13))) {
         // A guest without a ritual gets native r13=-1 before our override. The requested
         // descriptor at driver+48 still identifies the forced m29 destination.
         if (!registers || !ReadablePointer(registers->rbx, 0x4C) ||
@@ -5106,7 +5155,6 @@ void PS4_SYSV_ABI BbscChaliceContextHook(u64, const GuestRegisterSnapshot* regis
     }
     const u64 frame = registers->rbp;
     if (frame < 0x78 || !HasMemoryAccess(frame - 0x78, 72, MemoryProt::CpuWrite)) return;
-    const s32 state = GetSessionState();
     if (state != 4 && state != 6) {
         Chalice::Mount native{};
         native.key.channel = registers->rcx;
@@ -5119,6 +5167,12 @@ void PS4_SYSV_ABI BbscChaliceContextHook(u64, const GuestRegisterSnapshot* regis
         std::scoped_lock lock{bbsc_chalice_mutex};
         native.revision = ++bbsc_chalice_native_revision;
         bbsc_chalice_native = native;
+        return;
+    }
+    // Primary summon does not call RequestBbscSessionWarp. Bind its trusted fresh claim here,
+    // after relay discovery, before the native initializer commits any dungeon loader fields.
+    if (Chalice::IsMap(initial_map) && !PrepareBbscChaliceLoad(initial_map)) {
+        LOG_WARNING(Debug, "BBSC chalice: initial native loader is waiting for scoped host context");
         return;
     }
     Chalice::Mount borrowed{};
@@ -5165,8 +5219,13 @@ void InstallBbscChaliceHooks() {
     bbsc_chalice_value_hook_ready = InstallGuestCodeHook(
         reinterpret_cast<void*>(image_base + 0x013D0060), Value, 0, BbscChaliceValueHook,
         &bbsc_chalice_value_skip);
-    LOG_INFO(Debug, "BBSC chalice: native loader hook {}, altar value guard {}",
-             bbsc_chalice_context_hook_ready, bbsc_chalice_value_hook_ready);
+    static constexpr std::array<u8, 6> Transition{0x55,0x48,0x89,0xE5,0x41,0x57};
+    bbsc_chalice_transition_hook_ready = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + StageTransitionOffset), Transition, 0,
+        BbscChaliceTransitionHook, &bbsc_chalice_transition_skip);
+    LOG_INFO(Debug, "BBSC chalice: native loader hook {}, altar value guard {}, transition guard {}",
+             bbsc_chalice_context_hook_ready, bbsc_chalice_value_hook_ready,
+             bbsc_chalice_transition_hook_ready);
 }
 
 bool BbscLatestChaliceMount(u32 map, Chalice::Mount& out) {
@@ -5235,6 +5294,19 @@ bool BbscChaliceArrivalReady(u32 map) {
            (loan.mounted.map == map ||
             (current_part && remote.revision == loan.mounted.revision &&
              remote.key == loan.mounted.key));
+}
+
+bool BbscChaliceJoinNeedsFollow() {
+    u32 target = BbscChaliceInitialJoinMap();
+    if (!Chalice::IsMap(target)) {
+        std::scoped_lock lock{bbsc_follow_mutex};
+        const auto& follow = bbsc_follow_latest;
+        if (SteadyNowMs() - follow.received_ms >= 0 &&
+            SteadyNowMs() - follow.received_ms < 6000) target = follow.packed_map;
+    }
+    return Chalice::IsMap(target) &&
+           (GetCurrentPackedMap() != target || !BbscChaliceArrivalReady(target) ||
+            BbscChaliceNeedsLoad(target));
 }
 
 void TickBbscChaliceBorrow() {
@@ -5535,7 +5607,8 @@ void TickBbscFollowHost() {
     // went somewhere. If only the guest walked off, the host's map is still this one.
     static u32 shared_host_map = 0;
     const bool chalice_load = BbscChaliceNeedsLoad(host.packed_map);
-    if (!IsUsablePackedMap(here) || (here == host.packed_map && !chalice_load)) {
+    if ((!IsUsablePackedMap(here) && !chalice_load) ||
+        (here == host.packed_map && !chalice_load)) {
         if (here == host.packed_map) shared_arrival_ms = host.arrival_ms;
         mismatch_since_ms = 0;
         shared_host_map = host.packed_map;
@@ -22309,6 +22382,8 @@ void InstallReverseEngineeringTrace() {
     size_t selected_count = 0;
     for (size_t index = 0; index < Sites.size(); ++index) {
         const auto& site = Sites[index];
+        // Chalice transition guard owns this entry, including with diagnostic traces enabled.
+        if (site.offset == StageTransitionOffset && BbscWarpTogetherEnabled()) continue;
         if (!BbscResearchEnabled() && !BbscFunctionalTraceSite(site) &&
             !BbscEssentialDiagnosticSite(site)) {
             continue;

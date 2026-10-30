@@ -42,6 +42,7 @@ using namespace Core::Bloodborne;
 #undef PS4_SYSV_ABI
 #define PS4_SYSV_ABI
 #define LOG_INFO(...)
+#define LOG_WARNING(...)
 #define LOG_ERROR(...)
 #define BBSC_TIMELINE(...)
 using Packet=Libraries::Np::NpSignaling::SignalingBbscWorldFlags;
@@ -66,8 +67,17 @@ s32 session=3;
 s32 GetSessionState() { return session; }
 u64 GetGlobalState() { return 0x90000; }
 struct GuestRegisterSnapshot {
-    u64 r13{},rcx{},rdx{},r8{},r15{},rbp{},rbx{},rsi{};
+    u64 r13{},rcx{},rdx{},r8{},r15{},rbp{},rbx{},rsi{},rax{};
 };
+struct SummonPlacementDescriptor { u32 packed_region; };
+std::optional<SummonPlacementDescriptor> initial_claim;
+std::optional<SummonPlacementDescriptor> BbscConnectFirstHost() { return initial_claim; }
+bool bbsc_join_teleport_done=false, bbsc_chalice_transition_owned=false;
+constexpr u64 StageTransitionOffset=0x013cde30;
+s32 player_type=1, hp=594;
+s32 GetLocalPlayerType() { return player_type; }
+u64 GetLocalPlayerCharacter() { return 0x80000; }
+s32 GetCharacterHp(u64) { return hp; }
 template<class... Args> bool InstallGuestCodeHook(Args&&...) { return true; }
 bool ReadablePointer(u64 p,size_t) { return p >= 0x10000; }
 bool BbscEventFlag(u32 f) { return f>=9020 && f<=9026 && selected[f-9020]; }
@@ -154,6 +164,43 @@ int main() {
     assert(!BbscChaliceLoadReady(current));
     OnBbscWorldFlagsPacket(sent[0].data(),sent[0].size());
     assert(BbscChaliceLoadReady(current));
+
+    // Direct summon to a host already in a dungeon: native entry has no BBSC warp prepare.
+    // Even all three native map candidates can still be the guest's old/invalid map.
+    session=6; current=0x18010000; selected.fill(false);
+    initial_claim=SummonPlacementDescriptor{mount.map};
+    assert(BbscChaliceJoinNeedsFollow()); // do not teleport dungeon coords into Yharnam
+    GuestRegisterSnapshot first_load{};
+    first_load.r13=0xffffffff; first_load.rbx=0xe0000; first_load.rbp=0xf0000;
+    memory[first_load.rbx+0x48]=0;
+    BbscChaliceContextHook(0,&first_load);
+    assert(first_load.r13==mount.stage_map && first_load.rcx==mount.key.channel);
+    assert(bbsc_chalice_borrowed.pending && bbsc_chalice_borrowed.applied_revision==mount.revision);
+    current=mount.map; CompleteBbscChaliceLoad(current);
+    assert(!BbscChaliceJoinNeedsFollow());
+    initial_claim.reset(); bbsc_chalice_borrowed={};
+
+    // An already joined living guest suppresses the unprepared native m29 transition.
+    // No teardown/global writes; host, initial summon, death, home, invader and BBSC follow pass.
+    GuestRegisterSnapshot transition{};
+    memory[0x9000c]=mount.map; memory[0x91592]=0; memory[0x90008]=0;
+    bbsc_join_teleport_done=true;
+    const auto guard_memory=memory;
+    BbscChaliceTransitionHook(0,&transition);
+    assert(bbsc_chalice_transition_skip==1 && transition.rax==1 && memory==guard_memory);
+    auto passes=[&] {
+        bbsc_chalice_transition_skip=0; transition.rax=99;
+        BbscChaliceTransitionHook(0,&transition);
+        assert(bbsc_chalice_transition_skip==0 && transition.rax==99);
+    };
+    bbsc_chalice_transition_owned=true; passes(); bbsc_chalice_transition_owned=false;
+    hp=0; passes(); hp=594;
+    player_type=2; passes(); player_type=1;
+    memory[0x91592]=1; passes(); memory[0x91592]=0;
+    memory[0x90008]=1; passes(); memory[0x90008]=0;
+    memory[0x9000c]=0x15000000; passes(); memory[0x9000c]=mount.map;
+    session=3; passes(); session=6;
+    bbsc_join_teleport_done=false; passes();
 
     // Entry from Dream with no own altar: keep the same co-op role throughout.
     session=6; current=0x15000000; selected.fill(false);
@@ -257,7 +304,7 @@ int main() {
     sent.clear(); present=0;
     SendBbscFlagSnapshot(1,0x18000000,3,40,key_of,present);
     assert(sent[0].size()==sizeof(Packet) && sent[0][5]==1);
-    puts("chalice: native capture/injection, seamless Dream entry, altar guards, same-map revisions, load completion, cancellation/cleanup, replay/malformed packets, ordinary maps PASS");
+    puts("chalice: direct native summon, no cross-world teleport, one transition owner, native capture/injection, seamless Dream entry, altar guards, same-map revisions, cancellation/cleanup, replay/malformed packets, ordinary maps PASS");
 }
 '''
 
@@ -265,7 +312,7 @@ start = SOURCE.index("// Borrowed loader input is process-local.")
 end = SOURCE.index("// Host side: say where we are", start)
 bridge = SOURCE[start:end]
 code = prefix + function("Chalice::Key ReadBbscOwnChaliceKey()") + follow
-code += "bool BbscChaliceLoadReady(u32);\n" + bridge + snapshots
+code += "bool BbscChaliceLoadReady(u32);\nbool PrepareBbscChaliceLoad(u32);\n" + bridge + snapshots
 code += function("void OnBbscChaliceMountPacket(const void* data, std::size_t size)")
 code += function("void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z, float heading,\n"
                  "                            std::uint32_t sequence, std::int32_t lamp_point,\n"
