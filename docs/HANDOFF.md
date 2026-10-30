@@ -1,5 +1,11 @@
 # HANDOFF — состояние работы и что дальше
 
+> **Launcher source preference:** use the user's own build (as on laptop), never
+> replace it with upstream unless explicitly requested. Independent fork planned.
+> PC clean reinstall completed 30 Oct 16:50: 5102 laptop-matched runtime files,
+> T17, mods/settings/saves preserved; old folder backed up. See [T17](fixes/T17-event-work.md).
+
+
 > **T17 deployed PC + laptop:** event-driven reward/drop/cutscene/departure
 > notifications, numeric scaling/cache and research-only diagnostic scans (`addfd08`).
 > Build exit=0, zero warnings; 12 deployed-file hash checks PASS; concurrency,

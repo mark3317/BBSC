@@ -141,3 +141,23 @@ same Offline Dream route is appropriate; not performed automatically. No evidenc
 yet distinguishes driver, port resource lifetime/synchronization, other game mods
 or hardware instability. WATCHDOG folder access denied in current process;
 dumps not analyzed. No binary/settings/save changes during this investigation.
+
+## Clean reinstall of the user's own build — 16:50 Moscow
+
+User correction: do not install/update upstream releases; use own build as on
+laptop. Independent launcher fork is future intent. Downloaded upstream v2.3.2
+was not installed. Source: own T16 ZIP, saved SHA256/CRC verified. Compared 5102
+runtime files to laptop: 5098 match; copied exact laptop Bloodborne.exe,
+bin/bb-probe.exe, _internal/base_library.zip and Discord Rich Presence exe for the
+four differences. All runtime hashes checked before directory swap; four copied
+binary hashes checked again after. Current T17 BBSC override preserved.
+
+New install at D:/Games/Bloodborne/bbport-coop. Old folder renamed to
+D:/Games/Bloodborne/bbport-coop.before-clean-20261030-164954. Migrated 16 files
+including game/input/mod/server configs, prompt mods, custom config and BBSC.
+APPDATA settings unchanged; 16 save hashes unchanged in external testHost.
+No game files touched. Old generated out/internal caches not migrated. External
+user_dir (including its caches) unchanged. Games/launchers stopped during swap.
+Manifests/result in D:/Games/Bloodborne/coop-dev/clean-own-T17-20261030/.
+No driver, auto-update settings or source changes. Game not launched.
+Next control: Offline Dream travel, upscaler=off/frame_gen=off.
