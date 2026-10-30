@@ -1,7 +1,7 @@
 """Exercise production dungeon reads, snapshot assembly and scope switches without a game.
 
-The memory fixture verifies the statically recovered layout, not that the selected altar
-is the active guest layout at runtime. That still requires the documented two-PC test.
+The memory fixture verifies recovered native loader input and borrowed-context lifecycle.
+Actual resource loading and session continuity still require the documented two-PC test.
 """
 import os
 from pathlib import Path
@@ -39,13 +39,36 @@ prefix = r'''
 #include "core/bbsc_chalice.h"
 #include "core/libraries/np/np_signaling/np_signaling_bbsc.h"
 using namespace Core::Bloodborne;
+#undef PS4_SYSV_ABI
+#define PS4_SYSV_ABI
 #define LOG_INFO(...)
+#define LOG_ERROR(...)
+#define BBSC_TIMELINE(...)
 using Packet=Libraries::Np::NpSignaling::SignalingBbscWorldFlags;
 u64 image_base=0x100000;
 std::unordered_map<u64,u64> memory;
 std::array<bool,7> selected{};
 std::vector<u8> form(140, 17);
-template<class T> T ReadValue(u64 p,size_t off) { return static_cast<T>(memory[p+off]); }
+std::map<u64,std::array<s32,18>> arrays;
+template<class T> T ReadValue(u64 p,size_t off) {
+    if constexpr (std::is_same_v<T,std::array<s32,18>>) return arrays[p+off];
+    else return static_cast<T>(memory[p+off]);
+}
+template<class T> bool WriteValue(u64 p,size_t off,const T& value) {
+    if constexpr (std::is_same_v<T,std::array<s32,18>>) arrays[p+off]=value;
+    else memory[p+off]=value;
+    return true;
+}
+namespace MemoryProt { constexpr int CpuWrite=1; }
+bool memory_writable=true;
+bool HasMemoryAccess(u64 p,size_t,int) { return memory_writable && p>=0x10000; }
+s32 session=3;
+s32 GetSessionState() { return session; }
+u64 GetGlobalState() { return 0x90000; }
+struct GuestRegisterSnapshot {
+    u64 r13{},rcx{},rdx{},r8{},r15{},rbp{},rbx{},rsi{};
+};
+template<class... Args> bool InstallGuestCodeHook(Args&&...) { return true; }
 bool ReadablePointer(u64 p,size_t) { return p >= 0x10000; }
 bool BbscEventFlag(u32 f) { return f>=9020 && f<=9026 && selected[f-9020]; }
 s64 now=1000;
@@ -92,87 +115,144 @@ void WriteBbscGuestLootFile() { ++flushes; if (!fail_write) bbsc_loot_dirty=fals
 
 main = r'''
 int main() {
-    // Seven slots, different altar numbers must resolve identical dungeon data.
+    // Recover the host's native ritual without depending on the altar number.
     memory[image_base+0x0553e9e8]=0x20000;
     memory[0x20000]=7; memory[0x20008]=0x30000;
     memory[0x30000+2*8]=0x40000; memory[0x40000+0x1d8]=0x50000;
-    memory[0x50010]=42;
-    memory[0x50058]=reinterpret_cast<u64>(form.data()); memory[0x50060]=form.size();
+    memory[0x50010]=42; memory[0x50058]=reinterpret_cast<u64>(form.data()); memory[0x50060]=140;
     selected[2]=true;
-    const auto a=ReadBbscChaliceKey(); assert(Chalice::Valid(a));
-    assert(a.channel==42 && a.form_size==140);
-    OnBbscHostFollowPacket(current,0,0,0,0,1,-1,a);
+    const auto a=ReadBbscOwnChaliceKey(); assert(Chalice::Valid(a));
     selected[2]=false; selected[5]=true; memory[0x30000+5*8]=0x40000;
-    assert(ReadBbscChaliceKey()==a);
-    selected[1]=true; assert(!Chalice::Valid(ReadBbscChaliceKey())); selected[1]=false;
-    memory[0x50060]=2048; assert(!Chalice::Valid(ReadBbscChaliceKey())); memory[0x50060]=140;
-    auto unknown=a; unknown.form_version=1; assert(!Chalice::Valid(unknown));
+    assert(ReadBbscOwnChaliceKey()==a);
+    selected[1]=true; assert(!Chalice::Valid(ReadBbscOwnChaliceKey())); selected[1]=false;
+    memory[0x50060]=0x10000008cULL; assert(!Chalice::Valid(ReadBbscOwnChaliceKey())); memory[0x50060]=140;
     memory[0x50010]=0x8000000000000000ULL;
-    assert(!Chalice::Valid(ReadBbscChaliceKey())); memory[0x50010]=42;
-    form[0]^=1; assert(ReadBbscChaliceKey()!=a); form[0]^=1;
+    assert(!Chalice::Valid(ReadBbscOwnChaliceKey())); memory[0x50010]=42;
+    form[0]^=1; assert(ReadBbscOwnChaliceKey()!=a); form[0]^=1;
+    auto unknown=a; unknown.form_version=1; assert(!Chalice::Valid(unknown));
 
-    // The production relay follow encoder includes the key only for dungeon packets.
-    Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(current,1,2,3,4,9,-1,a);
-    assert(sent.size()==1 && sent[0].size()==58);
-    Chalice::Key wire; std::memcpy(&wire,sent[0].data()+34,sizeof(wire)); assert(wire==a);
-    sent.clear();
-    Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(0x18000000,1,2,3,4,10,-1,{});
-    assert(sent[0].size()==34); sent.clear();
-
-    // Actual sender and actual receiver: no publish until all five scoped chunks arrive.
+    InstallBbscChaliceHooks(); bbsc_chalice_flag_hook_ready=true;
+    // The real hook captures pointer-free host stage-loader input.
+    GuestRegisterSnapshot host{};
+    host.rbp=0xa0000; host.rbx=0xb0000; host.r13=current;
+    host.rcx=42; host.rdx=0x1d050000; host.r8=123; host.r15=3;
+    arrays[host.rbp-0x78].fill(-1); arrays[host.rbp-0x78][0]=9910000;
+    BbscChaliceContextHook(0,&host);
+    const auto mount=BbscHostChaliceMount(); assert(Chalice::ValidMount(mount));
+    assert(mount.revision==1 && mount.layout_map==0x1d050000);
+    SendBbscChaliceMount(); assert(sent.size()==1 && sent[0].size()==Chalice::MountPacketSize);
+    auto descriptor=sent[0]; sent.clear();
+    const auto before=memory;
+    OnBbscChaliceMountPacket(descriptor.data(),descriptor.size());
+    assert(memory==before); // receive callbacks never touch game memory
+    OnBbscHostFollowPacket(current,0,0,0,0,1,-1,a);
     u64 present=0; group[0]=0x80;
     SendBbscFlagSnapshot(1,current,1,40,key_of,present);
-    assert(sent.size()==5 && sent[0].size()==sizeof(Packet)+sizeof(Chalice::Key));
-    assert(sent[0].size()+13+8+40 < 1280); // relay envelope, UDP and IPv6 budget
+    assert(sent.size()==5 && sent[0].size()==sizeof(Packet)+sizeof(Chalice::Key)+8);
+    assert(sent[0][5]==4 && sent[0].size()+13+8+40 < 1280);
     for (int i=4;i>0;--i) OnBbscWorldFlagsPacket(sent[i].data(),sent[i].size());
     assert(!BbscChaliceLoadReady(current));
     OnBbscWorldFlagsPacket(sent[0].data(),sent[0].size());
     assert(BbscChaliceLoadReady(current));
-    BbscWorldSnapshot snap; assert(BbscHostBlockSnapshot(current,snap));
-    assert(snap.dungeon==a && snap.groups[0][0]==0x80);
-    memory[0x50010]=43; assert(!BbscChaliceLoadReady(current)); memory[0x50010]=42;
-    auto switched=a; switched.channel=43;
-    OnBbscHostFollowPacket(current,0,0,0,0,2,-1,switched);
-    assert(!BbscChaliceLoadReady(current)); // matching old snapshot cannot override new host identity
-    OnBbscHostFollowPacket(current,0,0,0,0,3,-1,a);
-    current=0x15000000; assert(!BbscChaliceLoadReady(0x1d000000)); current=0x1d000000;
-    now=7000; assert(!BbscChaliceLoadReady(current)); now=1000;
-    enabled=false; assert(!BbscChaliceLoadReady(current)); enabled=true;
 
-    // Legacy/malformed packets must not publish dungeon state; interleaved identities
-    // must not assemble one snapshot from chunks of two different dungeons.
-    ClearBbscHostWorldSnapshots();
-    auto bad=sent[0]; bad.resize(sizeof(Packet)); bad[5]=1;
-    OnBbscWorldFlagsPacket(bad.data(),bad.size()); assert(bbsc_world_blocks.empty());
-    bad=sent[0]; bad[17]=0;
-    OnBbscWorldFlagsPacket(bad.data(),bad.size()); assert(bbsc_world_blocks.empty());
-    bad=sent[0]; bad.push_back(0);
-    OnBbscWorldFlagsPacket(bad.data(),bad.size()); assert(bbsc_world_blocks.empty());
-    for (int i=0;i<4;++i) OnBbscWorldFlagsPacket(sent[i].data(),sent[i].size());
-    bad=sent[4]; Chalice::Key other=a; other.channel=43;
-    std::memcpy(bad.data()+sizeof(Packet),&other,sizeof(other));
-    OnBbscWorldFlagsPacket(bad.data(),bad.size()); assert(bbsc_world_blocks.empty());
+    // Entry from Dream with no own altar: keep the same co-op role throughout.
+    session=6; current=0x15000000; selected.fill(false);
+    assert(!Chalice::Valid(ReadBbscOwnChaliceKey()));
+    assert(BbscChaliceLoadReady(mount.map));
+    assert(PrepareBbscChaliceLoad(mount.map));
+    assert(ReadBbscChaliceKey()==a && BbscChaliceNeedsLoad(mount.map));
+    assert(BbscProtectChaliceAltar(9020)); assert(BbscProtectChaliceAltar(94000000));
+    assert(BbscProtectChaliceAltar(93999999,2));
+    assert(!BbscProtectChaliceAltar(52900000)); assert(!BbscProtectChaliceAltar(12900000));
+    assert(!BbscProtectChaliceAltar(94700000));
+    GuestRegisterSnapshot write{}; write.rsi=94000000; write.rdx=32;
+    BbscChaliceValueHook(0,&write); assert(bbsc_chalice_value_skip==1);
+    CompleteBbscChaliceLoad(mount.map); assert(!BbscChaliceArrivalReady(mount.map));
+    GuestRegisterSnapshot guest{};
+    guest.rbp=0xc0000; guest.rbx=0xd0000; guest.r13=0xffffffff;
+    memory[guest.rbx+0x48]=mount.map; arrays[guest.rbp-0x78].fill(-1);
+    memory_writable=false; BbscChaliceContextHook(0,&guest);
+    assert(guest.r13==0xffffffff && bbsc_chalice_borrowed.applied_revision==0);
+    memory_writable=true; BbscChaliceContextHook(0,&guest);
+    assert(session==6 && guest.r13==mount.stage_map && guest.rcx==42);
+    assert(guest.rdx==mount.layout_map && guest.r8==123 && guest.r15==3);
+    assert(arrays[guest.rbp-0x78]==mount.parts && memory[0x9000c]==mount.stage_map);
+    assert(!BbscChaliceArrivalReady(mount.map));
+    current=mount.map; CompleteBbscChaliceLoad(current);
+    assert(BbscChaliceArrivalReady(current) && !BbscChaliceNeedsLoad(current));
+    assert(!selected[5] && memory[0x50010]==42); // own altar fields not changed
+    BbscWorldSnapshot stale;
+    assert(BbscHostBlockSnapshot(current,stale) && BbscChaliceSnapshotMatches(stale));
+
+    // A new load with the same virtual map/key requires the matching new flag generation.
+    auto newer=mount; newer.revision=2; newer.parts[0]=9920000;
+    std::memcpy(descriptor.data()+8,&newer,sizeof(newer));
+    OnBbscChaliceMountPacket(descriptor.data(),descriptor.size());
+    assert(!BbscChaliceLoadReady(current)); assert(BbscChaliceNeedsLoad(current));
+    sent.clear(); bbsc_chalice_native=newer;
+    selected[5]=true; session=3;
+    SendBbscFlagSnapshot(1,current,2,40,key_of,present);
+    session=6; selected.fill(false);
     for (const auto& packet:sent) OnBbscWorldFlagsPacket(packet.data(),packet.size());
     assert(BbscChaliceLoadReady(current));
+    assert(!BbscChaliceSnapshotMatches(stale)); // readiness of a newer cache cannot validate an old copy
+    assert(PrepareBbscChaliceLoad(current));
+    CancelBbscChaliceLoad(); assert(bbsc_chalice_borrowed.armed.revision==1);
+    assert(PrepareBbscChaliceLoad(current));
+    BbscChaliceContextHook(0,&guest); CompleteBbscChaliceLoad(current);
+    assert(!BbscChaliceNeedsLoad(current));
+    // Ordinary walking to another resident part does not start another load.
+    newer.map=0x1d010000;
+    std::memcpy(descriptor.data()+8,&newer,sizeof(newer));
+    OnBbscChaliceMountPacket(descriptor.data(),descriptor.size());
+    OnBbscHostFollowPacket(newer.map,0,0,0,0,2,-1,a);
+    assert(!BbscChaliceNeedsLoad(newer.map));
+    assert(BbscChaliceArrivalReady(newer.map)); // resident walking keeps loot capture enabled
+    // A delayed descriptor cannot roll the loader back to an older revision.
+    std::memcpy(descriptor.data()+8,&mount,sizeof(mount));
+    OnBbscChaliceMountPacket(descriptor.data(),descriptor.size());
+    assert(bbsc_chalice_remote.revision==2);
+    auto bad=newer; bad.feature=4;
+    std::memcpy(descriptor.data()+8,&bad,sizeof(bad));
+    OnBbscChaliceMountPacket(descriptor.data(),descriptor.size());
+    assert(bbsc_chalice_remote.feature==3);
+    bad=newer; bad.parts[0]=-2; assert(!Chalice::ValidMount(bad));
+    bad=newer; bad.reserved=1; assert(!Chalice::ValidMount(bad));
+    now=7000; assert(!BbscLatestChaliceMount(newer.map,bad)); now=1000;
+    bbsc_chalice_value_hook_ready=false; assert(!BbscLatestChaliceMount(newer.map,bad));
+    bbsc_chalice_value_hook_ready=true;
 
-    // Scope switch flushes first; failed persistence retains the old namespace.
-    assert(SelectBbscLootScope(current)); const auto first=bbsc_loot_dungeon;
-    assert(first.find("-chalice-")==0);
-    bbsc_loot_dirty=true; bbsc_loot_groups[52900]=1;
-    fail_write=true; assert(!SelectBbscLootScope(0x18000000));
-    assert(bbsc_loot_dungeon==first && bbsc_loot_groups.size()==1);
-    fail_write=false; assert(SelectBbscLootScope(0x18000000));
-    assert(bbsc_loot_dungeon.empty() && bbsc_loot_groups.empty());
-    assert(Chalice::IsLootGroup(52900) && !Chalice::IsLootGroup(52400));
-    assert(!Chalice::IsLootGroup(12900));
+    // Return to Dream/own world discards the loan, without changing a ritual.
+    current=0x15000000; now=1500; TickBbscChaliceBorrow();
+    assert(!Chalice::ValidMount(bbsc_chalice_borrowed.armed));
+    assert(!BbscProtectChaliceAltar(94000000));
+    session=0; memory[0x90008]=0; memory[0x91592]=1;
+    now=2000; TickBbscChaliceBorrow(); assert(session==0);
+
+    // Strict framing rejects unscoped/malformed chunks and never mixes native revisions.
+    ClearBbscHostWorldSnapshots();
+    auto packet=sent[0]; packet.resize(sizeof(Packet)); packet[5]=1;
+    OnBbscWorldFlagsPacket(packet.data(),packet.size()); assert(bbsc_world_blocks.empty());
+    packet=sent[0]; packet[17]=0;
+    OnBbscWorldFlagsPacket(packet.data(),packet.size()); assert(bbsc_world_blocks.empty());
+    for (int i=0;i<4;++i) OnBbscWorldFlagsPacket(sent[i].data(),sent[i].size());
+    packet=sent[4]; u64 rev=3; std::memcpy(packet.data()+sizeof(Packet)+sizeof(a),&rev,8);
+    OnBbscWorldFlagsPacket(packet.data(),packet.size()); assert(bbsc_world_blocks.empty());
+    for (const auto& chunk:sent) OnBbscWorldFlagsPacket(chunk.data(),chunk.size());
+    assert(bbsc_world_blocks.size()==1);
     sent.clear(); present=0;
-    SendBbscFlagSnapshot(1,0x18000000,2,40,key_of,present);
+    SendBbscFlagSnapshot(1,0x18000000,3,40,key_of,present);
     assert(sent[0].size()==sizeof(Packet) && sent[0][5]==1);
-    puts("chalice: native layout, identity mismatch, bounded protocol, chunk isolation, freshness, mounted-entry guard, loot scope/failed persistence PASS");
+    puts("chalice: native capture/injection, seamless Dream entry, altar guards, same-map revisions, load completion, cancellation/cleanup, replay/malformed packets, ordinary maps PASS");
 }
 '''
 
-code = prefix + function("Chalice::Key ReadBbscChaliceKey()") + follow + snapshots
+start = SOURCE.index("// Borrowed loader input is process-local.")
+end = SOURCE.index("// Host side: say where we are", start)
+bridge = SOURCE[start:end]
+code = prefix + function("Chalice::Key ReadBbscOwnChaliceKey()") + follow
+code += "bool BbscChaliceLoadReady(u32);\n" + bridge + snapshots
+code += function("void OnBbscChaliceMountPacket(const void* data, std::size_t size)")
 code += function("void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z, float heading,\n"
                  "                            std::uint32_t sequence, std::int32_t lamp_point,\n"
                  "                            const Chalice::Key& dungeon)")
@@ -180,6 +260,7 @@ for signature in (
     "u32 SendBbscFlagSnapshot(u8 version, u32 map, u32 snapshot, size_t count,\n"
     "                         u32 (*key_of)(u32 map, size_t index), u64& present)",
     "bool BbscHostBlockSnapshot(u32 packed_map, BbscWorldSnapshot& out)",
+    "bool BbscChaliceSnapshotMatches(const BbscWorldSnapshot& host)",
     "bool BbscChaliceLoadReady(u32 map)",
     "void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size)",
 ):

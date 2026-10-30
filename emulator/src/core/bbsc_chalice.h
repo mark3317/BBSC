@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -31,5 +32,37 @@ inline std::uint64_t HashForm(std::span<const std::uint8_t> bytes) {
 // Expired, unscoped and another dungeon's state must never unblock a dungeon load.
 constexpr bool CanUse(const Key& local, const Key& host, std::int64_t age_ms) {
     return Valid(local) && Valid(host) && local == host && age_ms >= 0 && age_ms < 6000;
+}
+// Decoded, pointer-free stage-loader input. It is borrowed by guests, never installed
+// into their altar flags or cached ritual objects. Revision changes on each native load.
+struct Mount {
+    Key key{};
+    std::uint64_t revision = 0;
+    std::uint32_t map = 0;
+    std::uint32_t layout_map = 0;
+    std::array<std::int32_t, 18> parts{};
+    std::int32_t dungeon_type = -1;
+    std::uint32_t feature = 0;
+    std::uint32_t stage_map = 0; // native virtual root; map may identify a resident part
+    std::uint32_t reserved = 0;
+    bool operator==(const Mount&) const = default;
+};
+static_assert(sizeof(Mount) == 128);
+inline constexpr std::uint8_t MountPacketType = 0x2B;
+inline constexpr std::size_t MountPacketSize = 8 + sizeof(Mount);
+inline bool ValidMount(const Mount& mount) {
+    if (!Valid(mount.key) || mount.revision == 0 || !IsMap(mount.map) ||
+        !IsMap(mount.layout_map) || !IsMap(mount.stage_map) || mount.reserved != 0 || mount.feature > 3 || mount.dungeon_type < -1) return false;
+    bool any = false;
+    for (auto part : mount.parts) {
+        if (part < -1) return false;
+        any |= part != -1;
+    }
+    return any;
+}
+constexpr bool TouchesAltar(std::uint32_t first, std::uint32_t width = 1) {
+    if (width == 0) return false;
+    const std::uint64_t end = std::uint64_t{first} + width;
+    return (first < 9027 && end > 9020) || (first < 94'700'000 && end > 94'000'000);
 }
 } // namespace Core::Bloodborne::Chalice

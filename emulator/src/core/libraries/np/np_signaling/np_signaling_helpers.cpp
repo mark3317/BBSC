@@ -399,8 +399,14 @@ static void ReceiveThreadMain() {
                                                      follow.lamp_point, dungeon);
             continue;
         }
+        if (type == Core::Bloodborne::Chalice::MountPacketType &&
+            nbytes == Core::Bloodborne::Chalice::MountPacketSize) {
+            Core::Bloodborne::OnBbscChaliceMountPacket(buf, nbytes);
+            continue;
+        }
         if ((nbytes == sizeof(SignalingBbscWorldFlags) ||
-             nbytes == sizeof(SignalingBbscWorldFlags) + sizeof(Core::Bloodborne::Chalice::Key)) &&
+             nbytes == sizeof(SignalingBbscWorldFlags) + sizeof(Core::Bloodborne::Chalice::Key) ||
+             nbytes == sizeof(SignalingBbscWorldFlags) + sizeof(Core::Bloodborne::Chalice::Key) + 8) &&
             type == static_cast<u8>(SignalingPacketType::BbscWorldFlags)) {
             Core::Bbsc::NoteSignalingBbscPacket();
             Core::Bloodborne::OnBbscWorldFlagsPacket(buf, static_cast<u32>(nbytes));

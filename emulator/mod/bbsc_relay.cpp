@@ -365,6 +365,8 @@ void Dispatch(const std::vector<u8>& wrapped, bool from_server = false) {
             BbscMod::OnAimedHostPlacement(std::atoll(text.substr(0, bar).c_str()),
                                           text.substr(bar + 1), sender);
         }
+    } else if (frame[4] == Core::Bloodborne::Chalice::MountPacketType) {
+        if (from_our_host()) Core::Bloodborne::OnBbscChaliceMountPacket(frame.data(), frame.size());
     } else if (frame[4] == Libraries::Np::NpSignaling::kSignalingBbscWorldFlagsType) {
         if (from_our_host()) {
             Core::Bloodborne::OnBbscWorldFlagsPacket(frame.data(), static_cast<u32>(frame.size()));

@@ -33,6 +33,8 @@ void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z,
 // BBSC world state: one chunk of the host's event flags for its map block arrived (a whole
 // SignalingBbscWorldFlags packet). Signaling receive thread; only stores it.
 void OnBbscWorldFlagsPacket(const void* packet, std::uint32_t size);
+// Pointer-free native dungeon loader input; receive thread only stores it.
+void OnBbscChaliceMountPacket(const void* packet, std::size_t size);
 // BBSC life state: another player says whether it is dead (spectating) or alive. Relay receive
 // thread; only stores it.
 void OnBbscLifePacket(std::uint32_t player, std::uint8_t dead, std::uint32_t sequence, bool host = false);

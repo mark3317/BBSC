@@ -4745,17 +4745,22 @@ bool BbscWarpJoinEnabled() {
 // and without them the reload used the map's default spawn - the guest appeared in Iosefka's
 // Clinic for a moment before the join teleport moved her (Eryk, 2026-09-23, build 732ABF1E).
 bool BbscChaliceLoadReady(u32 map);
+bool PrepareBbscChaliceLoad(u32 map);
+void CancelBbscChaliceLoad();
 
 bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std::string_view why) {
-    if (Chalice::IsMap(to.packed_region) && !BbscChaliceLoadReady(to.packed_region)) {
+    if (Chalice::IsMap(to.packed_region) && !PrepareBbscChaliceLoad(to.packed_region)) {
         LOG_WARNING(Debug, "BBSC chalice ({}): dungeon identity/host flags not ready; load deferred", why);
+        if (Chalice::IsMap(to.packed_region)) CancelBbscChaliceLoad();
         return false;
     }
     if (!ReadablePointer(global, 0x1598) || !IsUsablePackedMap(to.packed_region)) {
+        if (Chalice::IsMap(to.packed_region)) CancelBbscChaliceLoad();
         return false;
     }
     if (!WriteTransportedSummonPlacement(global, to)) {
         LOG_WARNING(Debug, "BBSC {} warp: summoned placement block not writable", why);
+        if (Chalice::IsMap(to.packed_region)) CancelBbscChaliceLoad();
         return false;
     }
     using PlacementSetter = void PS4_SYSV_ABI (*)(const void* value);
@@ -4775,6 +4780,7 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
     if (!selected || selected_map != to.packed_region) {
         LOG_WARNING(Debug, "BBSC {} warp: selector picked {:#x}, wanted {:#x}; not loading", why,
                     selected_map, to.packed_region);
+        if (Chalice::IsMap(to.packed_region)) CancelBbscChaliceLoad();
         return false;
     }
     const u64 rules = ReadValue<u64>(image_base + SummonSessionRulesPointerOffset, 0);
@@ -5021,7 +5027,7 @@ bool BbscOwnOpeningDone() {
 // The JSON parser 01E89F64..71 accepts FormDataVersion 0 only; cached item has no
 // version field. Do not confuse it with the transient JSON entry (different layout).
 // Game thread only. Unknown layout/version or ambiguous selection is not guessed.
-Chalice::Key ReadBbscChaliceKey() {
+Chalice::Key ReadBbscOwnChaliceKey() {
     Chalice::Key key{};
     if (image_base == 0) return key;
     int selected = -1;
@@ -5051,6 +5057,219 @@ Chalice::Key ReadBbscChaliceKey() {
     if (!ReadablePointer(form, key.form_size)) return {};
     key.form_hash = Chalice::HashForm({reinterpret_cast<const u8*>(form), key.form_size});
     return Chalice::Valid(key) ? key : Chalice::Key{};
+}
+
+// Borrowed loader input is process-local. No guest altar, cached ritual or save pointer is replaced.
+std::mutex bbsc_chalice_mutex;
+Chalice::Mount bbsc_chalice_native{};
+Chalice::Mount bbsc_chalice_remote{};
+s64 bbsc_chalice_remote_ms = 0;
+u64 bbsc_chalice_native_revision = 0;
+struct BbscBorrowedChalice {
+    Chalice::Mount armed{};
+    Chalice::Mount mounted{};
+    u64 applied_revision = 0;
+    bool pending = false;
+};
+BbscBorrowedChalice bbsc_chalice_borrowed;
+bool bbsc_chalice_context_hook_ready = false;
+bool bbsc_chalice_value_hook_ready = false;
+bool bbsc_chalice_flag_hook_ready = false;
+u8 bbsc_chalice_value_skip = 0;
+
+bool BbscProtectChaliceAltar(u32 flag, u32 width = 1) {
+    if (!Chalice::TouchesAltar(flag, width)) return false;
+    const s32 state = GetSessionState();
+    if (state != 4 && state != 6) return false;
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    return Chalice::ValidMount(bbsc_chalice_borrowed.armed);
+}
+
+Chalice::Key ReadBbscChaliceKey() {
+    const s32 state = GetSessionState();
+    if (state == 4 || state == 6) {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        if (Chalice::ValidMount(bbsc_chalice_borrowed.armed)) return bbsc_chalice_borrowed.armed.key;
+    }
+    return ReadBbscOwnChaliceKey();
+}
+
+// Hook at 01928987: the native stage initializer has decoded the selected ritual, but
+// has not committed channel/layout/parts/type/feature into its runtime loader yet.
+// Both copied instructions are whole, non-RIP-relative stores (11 checked bytes).
+void PS4_SYSV_ABI BbscChaliceContextHook(u64, const GuestRegisterSnapshot* registers) {
+    if (!registers || !Chalice::IsMap(static_cast<u32>(registers->r13))) {
+        // A guest without a ritual gets native r13=-1 before our override. The requested
+        // descriptor at driver+48 still identifies the forced m29 destination.
+        if (!registers || !ReadablePointer(registers->rbx, 0x4C) ||
+            !Chalice::IsMap(ReadValue<u32>(registers->rbx, 0x48))) return;
+    }
+    const u64 frame = registers->rbp;
+    if (frame < 0x78 || !HasMemoryAccess(frame - 0x78, 72, MemoryProt::CpuWrite)) return;
+    const s32 state = GetSessionState();
+    if (state != 4 && state != 6) {
+        Chalice::Mount native{};
+        native.key.channel = registers->rcx;
+        native.map = static_cast<u32>(registers->r13);
+        native.stage_map = native.map;
+        native.layout_map = static_cast<u32>(registers->rdx);
+        native.dungeon_type = static_cast<s32>(registers->r8);
+        native.feature = static_cast<u32>(registers->r15);
+        native.parts = ReadValue<std::array<s32, 18>>(frame - 0x78, 0);
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        native.revision = ++bbsc_chalice_native_revision;
+        bbsc_chalice_native = native;
+        return;
+    }
+    Chalice::Mount borrowed{};
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        borrowed = bbsc_chalice_borrowed.armed;
+    }
+    if (!Chalice::ValidMount(borrowed)) return;
+    const u64 global = GetGlobalState();
+    if (!HasMemoryAccess(global + 0x0C, 4, MemoryProt::CpuWrite) ||
+        !WriteValue(frame - 0x78, 0, borrowed.parts)) return;
+    // The native code at 01928983 has just stored its own selected map. Correct that
+    // runtime selection too; persistent altar flags and its object are never touched.
+    WriteValue<u32>(global, 0x0C, borrowed.stage_map);
+    auto* changed = const_cast<GuestRegisterSnapshot*>(registers);
+    changed->r13 = borrowed.stage_map;
+    changed->rcx = borrowed.key.channel;
+    changed->rdx = borrowed.layout_map;
+    changed->r8 = static_cast<u32>(borrowed.dungeon_type);
+    changed->r15 = borrowed.feature;
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        if (bbsc_chalice_borrowed.armed == borrowed)
+            bbsc_chalice_borrowed.applied_revision = borrowed.revision;
+    }
+    LOG_INFO(Debug, "BBSC chalice: borrowed native loader injected, channel {}, revision {}, layout {:#x}",
+             borrowed.key.channel, borrowed.revision, borrowed.layout_map);
+    BBSC_TIMELINE("CHALICE", "borrowed loader injected: channel {} revision {} layout {:#x}",
+                  borrowed.key.channel, borrowed.revision, borrowed.layout_map);
+}
+
+void PS4_SYSV_ABI BbscChaliceValueHook(u64, const GuestRegisterSnapshot* registers) {
+    if (registers && BbscProtectChaliceAltar(static_cast<u32>(registers->rsi),
+                                           static_cast<u32>(registers->rdx)))
+        bbsc_chalice_value_skip = 1;
+}
+
+void InstallBbscChaliceHooks() {
+    if (image_base == 0 || !BbscWarpTogetherEnabled()) return;
+    static constexpr std::array<u8, 11> Context{0x44,0x89,0x6B,0x48,0x48,0x89,0x8B,0xE0,0,0,0};
+    static constexpr std::array<u8, 6> Value{0x55,0x41,0x57,0x41,0x56,0x53};
+    bbsc_chalice_context_hook_ready = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + 0x01928987), Context, 0, BbscChaliceContextHook);
+    bbsc_chalice_value_hook_ready = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + 0x013D0060), Value, 0, BbscChaliceValueHook,
+        &bbsc_chalice_value_skip);
+    LOG_INFO(Debug, "BBSC chalice: native loader hook {}, altar value guard {}",
+             bbsc_chalice_context_hook_ready, bbsc_chalice_value_hook_ready);
+}
+
+bool BbscLatestChaliceMount(u32 map, Chalice::Mount& out) {
+    if (!bbsc_chalice_context_hook_ready || !bbsc_chalice_value_hook_ready ||
+        !bbsc_chalice_flag_hook_ready) return false;
+    BbscFollowMessage follow;
+    {
+        std::scoped_lock lock{bbsc_follow_mutex};
+        follow = bbsc_follow_latest;
+    }
+    const s64 now = SteadyNowMs();
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    if (!Chalice::ValidMount(bbsc_chalice_remote) || bbsc_chalice_remote.map != map ||
+        now - bbsc_chalice_remote_ms < 0 || now - bbsc_chalice_remote_ms >= 6000 ||
+        follow.packed_map != map || !Chalice::CanUse(follow.dungeon, bbsc_chalice_remote.key,
+                                                   now - follow.received_ms)) return false;
+    out = bbsc_chalice_remote;
+    return true;
+}
+
+bool BbscChaliceNeedsLoad(u32 map) {
+    if (!Chalice::IsMap(map)) return false;
+    Chalice::Mount remote;
+    if (!BbscLatestChaliceMount(map, remote)) return false;
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    return bbsc_chalice_borrowed.mounted.revision != remote.revision ||
+           bbsc_chalice_borrowed.mounted.key != remote.key;
+}
+
+bool PrepareBbscChaliceLoad(u32 map) {
+    if (!Chalice::IsMap(map)) return true;
+    Chalice::Mount remote;
+    if (!BbscLatestChaliceMount(map, remote) || !BbscChaliceLoadReady(map)) return false;
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    if (!bbsc_chalice_borrowed.pending || bbsc_chalice_borrowed.armed != remote) {
+        bbsc_chalice_borrowed.armed = remote;
+        bbsc_chalice_borrowed.applied_revision = 0;
+        bbsc_chalice_borrowed.pending = true;
+    }
+    return true;
+}
+
+void CancelBbscChaliceLoad() {
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    bbsc_chalice_borrowed.armed = bbsc_chalice_borrowed.mounted;
+    bbsc_chalice_borrowed.pending = false;
+}
+
+void CompleteBbscChaliceLoad(u32 map) {
+    if (!Chalice::IsMap(map)) return;
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    auto& loan = bbsc_chalice_borrowed;
+    if (loan.pending && loan.armed.map == map && loan.applied_revision == loan.armed.revision) {
+        loan.mounted = loan.armed;
+        loan.pending = false;
+    }
+}
+
+bool BbscChaliceArrivalReady(u32 map) {
+    if (!Chalice::IsMap(map)) return true;
+    Chalice::Mount remote;
+    const bool current_part = BbscLatestChaliceMount(map, remote);
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    const auto& loan = bbsc_chalice_borrowed;
+    return !loan.pending && Chalice::ValidMount(loan.mounted) &&
+           (loan.mounted.map == map ||
+            (current_part && remote.revision == loan.mounted.revision &&
+             remote.key == loan.mounted.key));
+}
+
+void TickBbscChaliceBorrow() {
+    static s64 last_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 250) return;
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    if (!ReadablePointer(global, 0x1593) || ReadValue<u8>(global, 0x08) != 0) return;
+    const s32 state = GetSessionState();
+    const bool home = (state == 0 || state == 3) && ReadValue<u8>(global, 0x1592) != 0;
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    if (home || (!Chalice::IsMap(GetCurrentPackedMap()) &&
+                 !bbsc_chalice_borrowed.pending)) bbsc_chalice_borrowed = {};
+}
+
+Chalice::Mount BbscHostChaliceMount() {
+    auto key = ReadBbscOwnChaliceKey();
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    auto native = bbsc_chalice_native;
+    if (native.key.channel != key.channel) return {};
+    native.key = key;
+    native.map = GetCurrentPackedMap();
+    return Chalice::ValidMount(native) ? native : Chalice::Mount{};
+}
+
+void SendBbscChaliceMount() {
+    const auto native = BbscHostChaliceMount();
+    if (!Chalice::ValidMount(native)) return;
+    std::array<u8, Chalice::MountPacketSize> packet{};
+    std::memcpy(packet.data(), "SHAD", 4);
+    packet[4] = Chalice::MountPacketType;
+    packet[5] = 1;
+    std::memcpy(packet.data() + 8, &native, sizeof(native));
+    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(), packet.size());
 }
 
 // Host side: say where we are, so a guest that is somewhere else can come to us.
@@ -5085,6 +5304,7 @@ void TickBbscFollowBroadcast() {
         return;
     }
     ++sequence;
+    if (Chalice::IsMap(map)) SendBbscChaliceMount();
     // The host's last lamp goes along, so a dead guest respawns where the host would.
     const s32 lamp_point = ReadablePointer(global, 0x1530) ? ReadValue<s32>(global, 0x1528) : -1;
     const u32 peers = Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(
@@ -5193,6 +5413,7 @@ void TickBbscFollowHost() {
     static s64 warp_requested_ms = 0;
     static u32 target_map = 0;
     static u32 attempts_map = 0;
+    static u64 attempts_chalice_revision = 0;
     static int attempts = 0;
     static s64 shared_arrival_ms = 0; // host load already reached by this guest
     if (!BbscWarpTogetherEnabled() || image_base == 0) {
@@ -5233,7 +5454,7 @@ void TickBbscFollowHost() {
     }
 
     if (warping) {
-        if (GetCurrentPackedMap() != target_map) {
+        if (GetCurrentPackedMap() != target_map || !BbscChaliceArrivalReady(target_map)) {
             if (now - warp_requested_ms > BbscFollowArriveTimeoutMs) {
                 // Never waiting forever again (code review A3): the load went somewhere else.
                 warping = false;
@@ -5261,7 +5482,8 @@ void TickBbscFollowHost() {
             EndBbscLoadCover("arrived, not placed");
             return;
         }
-        if (host.packed_map != target_map) {
+        if (host.packed_map != target_map ||
+            (Chalice::IsMap(target_map) && BbscChaliceNeedsLoad(target_map))) {
             // 2026-10-12 (Weronika, guest, 21:16:42): the host loaded again (into the next block,
             // 0x18010000) while our load into 0x18000000 ran; its position, in the other block's
             // coordinates, put us under the ground and we fell through the map. Positions are per
@@ -5312,7 +5534,8 @@ void TickBbscFollowHost() {
     // The host's map when both were last in the same one: a different map later means the HOST
     // went somewhere. If only the guest walked off, the host's map is still this one.
     static u32 shared_host_map = 0;
-    if (!IsUsablePackedMap(here) || here == host.packed_map) {
+    const bool chalice_load = BbscChaliceNeedsLoad(host.packed_map);
+    if (!IsUsablePackedMap(here) || (here == host.packed_map && !chalice_load)) {
         if (here == host.packed_map) shared_arrival_ms = host.arrival_ms;
         mismatch_since_ms = 0;
         shared_host_map = host.packed_map;
@@ -5333,7 +5556,7 @@ void TickBbscFollowHost() {
     // host who changed map since they last shared one.
     const bool host_moved = shared_host_map != 0 && host.packed_map != shared_host_map;
     const bool same_area = (here >> 24) == (host.packed_map >> 24);
-    if (!host_loaded_there && (same_area || !host_moved)) {
+    if (!chalice_load && !host_loaded_there && (same_area || !host_moved)) {
         static u32 apart_logged = 0;
         if (apart_logged != (here ^ host.packed_map)) {
             apart_logged = here ^ host.packed_map;
@@ -5345,7 +5568,7 @@ void TickBbscFollowHost() {
         mismatch_since_ms = 0;
         return;
     }
-    if (!host_loaded_there && BbscMapResident(host.packed_map)) {
+    if (!chalice_load && !host_loaded_there && BbscMapResident(host.packed_map)) {
         static u32 walk_logged = 0;
         if (walk_logged != host.packed_map) {
             walk_logged = host.packed_map;
@@ -5368,8 +5591,12 @@ void TickBbscFollowHost() {
     if (!settled || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
         return; // just out of a load, or dead: the follow waits (the wipe/respawn logic owns this)
     }
-    if (attempts_map != host.packed_map) {
+    Chalice::Mount target_dungeon;
+    const u64 dungeon_revision = Chalice::IsMap(host.packed_map) &&
+        BbscLatestChaliceMount(host.packed_map, target_dungeon) ? target_dungeon.revision : 0;
+    if (attempts_map != host.packed_map || attempts_chalice_revision != dungeon_revision) {
         attempts_map = host.packed_map;
+        attempts_chalice_revision = dungeon_revision;
         attempts = 0;
     }
     if (attempts >= BbscFollowMaxAttempts) {
@@ -5416,6 +5643,8 @@ void TickBbscFollowHost() {
     } else {
         ApplyBbscHostWorldFlags(host.packed_map, "before the follow load");
     }
+    if (Chalice::IsMap(host.packed_map) && !PrepareBbscChaliceLoad(host.packed_map)) return;
+    if (Chalice::IsMap(host.packed_map)) ApplyBbscHostWorldFlags(host.packed_map, "prepared borrowed dungeon");
     ApplyBbscHostTime("before the follow load");
     ApplyBbscGuestLootView(host.packed_map, "before the follow load");
     if (host.packed_map == BbscDreamStateMap) {
@@ -5896,7 +6125,8 @@ struct BbscWorldSnapshot {
     u32 chunks = 0;  // bit per received chunk
     std::array<std::array<u8, BbscWorldGroupBytes>, BbscSnapshotMaxGroups> groups{};
     s64 complete_ms = 0; // 0 while chunks are missing
-    Chalice::Key dungeon{}; // v3 only; empty for ordinary maps/Dream
+    Chalice::Key dungeon{}; // v3/v4 only; empty for ordinary maps/Dream
+    u64 dungeon_revision = 0; // v4: native loader generation
 };
 
 std::mutex bbsc_world_mutex;
@@ -5913,6 +6143,11 @@ BbscWorldSnapshot bbsc_dream_assembling; // guest: the host's Dream state being 
 BbscWorldSnapshot bbsc_dream_ready;      // guest: the newest complete one
 
 void ClearBbscHostWorldSnapshots() {
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        bbsc_chalice_remote = {};
+        bbsc_chalice_remote_ms = 0;
+    }
     std::scoped_lock lock{bbsc_world_mutex};
     bbsc_world_assembling = {};
     bbsc_world_ready = {};
@@ -5925,6 +6160,8 @@ void ClearBbscHostWorldSnapshots() {
 // peers reached; `present` gets a bit per group that exists here.
 u32 SendBbscFlagSnapshot(u8 version, u32 map, u32 snapshot, size_t count,
                          u32 (*key_of)(u32 map, size_t index), u64& present) {
+    const auto mount = Chalice::IsMap(map) ? BbscHostChaliceMount() : Chalice::Mount{};
+    if (Chalice::IsMap(map) && (!Chalice::ValidMount(mount) || mount.map != map)) return 0;
     const size_t chunks = (count + BbscWorldChunkGroups - 1) / BbscWorldChunkGroups;
     u32 sent = 0;
     for (size_t chunk = 0; chunk < chunks; ++chunk) {
@@ -5948,12 +6185,11 @@ u32 SendBbscFlagSnapshot(u8 version, u32 map, u32 snapshot, size_t count,
             present |= u64{1} << (first + i);
         }
         if (Chalice::IsMap(map)) {
-            const auto key = ReadBbscChaliceKey();
-            if (!Chalice::Valid(key)) return 0;
-            packet.version = 3;
-            std::array<u8, sizeof(packet) + sizeof(key)> scoped{};
+            packet.version = 4;
+            std::array<u8, sizeof(packet) + sizeof(mount.key) + sizeof(mount.revision)> scoped{};
             std::memcpy(scoped.data(), &packet, sizeof(packet));
-            std::memcpy(scoped.data() + sizeof(packet), &key, sizeof(key));
+            std::memcpy(scoped.data() + sizeof(packet), &mount.key, sizeof(mount.key));
+            std::memcpy(scoped.data() + sizeof(packet) + sizeof(mount.key), &mount.revision, sizeof(mount.revision));
             sent = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(scoped.data(), scoped.size());
         } else {
             sent = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet, sizeof(packet));
@@ -6106,21 +6342,19 @@ bool BbscHostBlockSnapshot(u32 packed_map, BbscWorldSnapshot& out) {
     return true;
 }
 
+bool BbscChaliceSnapshotMatches(const BbscWorldSnapshot& host) {
+    if (!Chalice::IsMap(host.map)) return true;
+    if (!BbscWorldSyncEnabled()) return false;
+    Chalice::Mount remote;
+    return BbscLatestChaliceMount(host.map, remote) &&
+           host.dungeon_revision == remote.revision &&
+           Chalice::CanUse(remote.key, host.dungeon, SteadyNowMs() - host.complete_ms);
+}
+
 bool BbscChaliceLoadReady(u32 map) {
     if (!Chalice::IsMap(map)) return true;
-    if (!BbscWorldSyncEnabled() || !Chalice::IsMap(GetCurrentPackedMap())) return false;
-    // Matching altar data alone does not prove its layout is mounted. Native entry comes first.
-    BbscFollowMessage follow;
-    {
-        std::scoped_lock lock{bbsc_follow_mutex};
-        follow = bbsc_follow_latest;
-    }
-    const auto local = ReadBbscChaliceKey();
-    if (follow.packed_map != map ||
-        !Chalice::CanUse(local, follow.dungeon, SteadyNowMs() - follow.received_ms)) return false;
     BbscWorldSnapshot host;
-    return BbscHostBlockSnapshot(map, host) && host.dungeon == follow.dungeon &&
-           Chalice::CanUse(local, host.dungeon, SteadyNowMs() - host.complete_ms);
+    return BbscHostBlockSnapshot(map, host) && BbscChaliceSnapshotMatches(host);
 }
 
 // Guest side: puts the host's flags for that map into our live table. Game thread.
@@ -6134,7 +6368,7 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
         BBSC_TIMELINE("WORLD", "world state ({}): no host flags for map {:#x}", why, packed_map);
         return false;
     }
-    if (Chalice::IsMap(packed_map) && !BbscChaliceLoadReady(packed_map)) {
+    if (!BbscChaliceSnapshotMatches(host)) {
         return false;
     }
     // The Dream's messengers (2026-10-08, 3-player test in kalee's Dream: "the guest cannot take
@@ -6161,8 +6395,7 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
     const auto write_block = [&](const BbscWorldSnapshot& snap, size_t& changed, size_t& missing) {
         size_t written = 0;
         if (Chalice::IsMap(snap.map) &&
-            (snap.map != packed_map || !Chalice::CanUse(ReadBbscChaliceKey(), snap.dungeon,
-                                                       SteadyNowMs() - snap.complete_ms))) return written;
+            (snap.map != packed_map || !BbscChaliceSnapshotMatches(snap))) return written;
         if (snap.map == BbscDreamStateMap && BbscDreamOwnEnabled()) {
             return written; // our own Hunter's Dream: its map flags stay ours
         }
@@ -6511,6 +6744,7 @@ void ApplyBbscHostWorldFlagsAtLoad() {
     if (!IsUsablePackedMap(map)) {
         return;
     }
+    CompleteBbscChaliceLoad(map);
     LogBbscHostWorldFlagsDiff(map, "load created the character, before writing");
     ApplyBbscHostWorldFlags(map, "load created the character");
     ApplyBbscHostTime("load created the character");
@@ -7356,6 +7590,7 @@ void CaptureBbscGuestLoot() {
     }
     // Native loads can change the selected dungeon before the next view callback.
     if (Chalice::IsMap(GetCurrentPackedMap())) {
+        if (!BbscChaliceArrivalReady(GetCurrentPackedMap())) return;
         const auto identity = ReadBbscChaliceKey();
         if (!Chalice::Valid(identity) || bbsc_loot_dungeon !=
             fmt::format("-chalice-{:016x}-{:016x}-{}-{}-{:08x}", identity.channel, identity.form_hash,
@@ -15457,6 +15692,10 @@ void PS4_SYSV_ABI BbscResearchSetFlagHook(u64 /*tag*/, const GuestRegisterSnapsh
     if (registers == nullptr) {
         return;
     }
+    if (BbscProtectChaliceAltar(static_cast<u32>(registers->rsi))) {
+        bbsc_setflag_skip = 1;
+        return;
+    }
     const u64 caller = ReadablePointer(registers->rsp, 8) ? ReadValue<u64>(registers->rsp, 0) : 0;
     const u64 caller_offset = caller >= image_base ? caller - image_base : caller;
     if (BbscEventActionNotOurs(caller_offset)) { // every flag of a talk-driven event not ours
@@ -15512,6 +15751,8 @@ void InstallBbscResearchHooks() {
                               std::span<const u8>{Prologue}, 0, BbscResearchSetFlagHook,
                               &bbsc_setflag_skip)) {
         LOG_ERROR(Debug, "BBSC research: SetEventFlag hook failed");
+    } else {
+        bbsc_chalice_flag_hook_ready = true;
     }
     static constexpr std::array<u8, 7> StepBegin{0x48, 0x8B, 0xB5, 0x20, 0xFF, 0xFF, 0xFF};
     static constexpr std::array<u8, 7> StepEnd{0x44, 0x3B, 0xA5, 0x44, 0xFF, 0xFF, 0xFF};
@@ -19886,6 +20127,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         { BBSC_PERF_NESTED("tick TickBbscSpectate"); TickBbscSpectate(); }
         { BBSC_PERF_NESTED("tick TickBbscFollowBroadcast"); TickBbscFollowBroadcast(); }
         { BBSC_PERF_NESTED("tick TickBbscWorldFlagsBroadcast"); TickBbscWorldFlagsBroadcast(); }
+        { BBSC_PERF_NESTED("tick TickBbscChaliceBorrow"); TickBbscChaliceBorrow(); }
         { BBSC_PERF_NESTED("tick TickBbscFollowHost"); TickBbscFollowHost(); }
         { BBSC_PERF_NESTED("tick TickBbscLoadCover"); TickBbscLoadCover(); }
         { BBSC_PERF_NESTED("tick TickBbscHpPenalty"); TickBbscHpPenalty(); }
@@ -21073,10 +21315,16 @@ void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
     SignalingBbscWorldFlags packet;
     std::memcpy(&packet, data, sizeof(packet));
     Chalice::Key dungeon{};
-    const bool chalice = packet.version == 3;
+    const bool chalice = packet.version == 3 || packet.version == 4;
+    u64 dungeon_revision = 0;
     if (chalice) {
-        if (size != sizeof(packet) + sizeof(dungeon) || !Chalice::IsMap(packet.packed_map)) return;
+        const size_t tail = sizeof(dungeon) + (packet.version == 4 ? sizeof(dungeon_revision) : 0);
+        if (size != sizeof(packet) + tail || !Chalice::IsMap(packet.packed_map)) return;
         std::memcpy(&dungeon, static_cast<const u8*>(data) + sizeof(packet), sizeof(dungeon));
+        if (packet.version == 4) {
+            std::memcpy(&dungeon_revision, static_cast<const u8*>(data) + sizeof(packet) + sizeof(dungeon), sizeof(dungeon_revision));
+            if (dungeon_revision == 0) return;
+        }
         if (!Chalice::Valid(dungeon)) return;
     } else if (size != sizeof(packet) || Chalice::IsMap(packet.packed_map)) {
         return; // legacy dungeon flags have no identity
@@ -21100,11 +21348,13 @@ void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
         std::scoped_lock lock{bbsc_world_mutex};
         BbscWorldSnapshot& snap = dream ? bbsc_dream_assembling : bbsc_world_assembling;
         BbscWorldSnapshot& ready = dream ? bbsc_dream_ready : bbsc_world_ready;
-        if (snap.map != packet.packed_map || snap.snapshot != packet.snapshot || snap.dungeon != dungeon) {
+        if (snap.map != packet.packed_map || snap.snapshot != packet.snapshot || snap.dungeon != dungeon ||
+            snap.dungeon_revision != dungeon_revision) {
             snap = BbscWorldSnapshot{};
             snap.map = packet.packed_map;
             snap.snapshot = packet.snapshot;
             snap.dungeon = dungeon;
+            snap.dungeon_revision = dungeon_revision;
         }
         for (size_t i = 0; i < count; ++i) {
             if ((packet.present & (1u << i)) != 0) {
@@ -21129,6 +21379,22 @@ void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
         LOG_INFO(Debug, "BBSC world state: host's {} for map {:#x} received",
                  dream ? "Hunter's Dream state" : "flags", map);
     }
+}
+
+void OnBbscChaliceMountPacket(const void* data, std::size_t size) {
+    if (!data || size != Chalice::MountPacketSize) return;
+    const auto* bytes = static_cast<const u8*>(data);
+    if (std::memcmp(bytes, "SHAD", 4) != 0 || bytes[4] != Chalice::MountPacketType ||
+        bytes[5] != 1 || bytes[6] != 0 || bytes[7] != 0) return;
+    Chalice::Mount mount;
+    std::memcpy(&mount, bytes + 8, sizeof(mount));
+    if (!Chalice::ValidMount(mount)) return;
+    const s64 now = SteadyNowMs();
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    if (bbsc_chalice_remote_ms != 0 && now - bbsc_chalice_remote_ms < 15'000 &&
+        mount.revision < bbsc_chalice_remote.revision) return;
+    bbsc_chalice_remote = mount;
+    bbsc_chalice_remote_ms = now;
 }
 
 void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z, float heading,
@@ -22030,6 +22296,7 @@ void InstallReverseEngineeringTrace() {
     InstallBbscWallHooks();
     InstallBbscEchoPathHooks();
     InstallBbscDreamHooks();
+    InstallBbscChaliceHooks();
     InstallBbscFloorGuardAndPickupTrace();
     InstallBbscItemResearchHooks();
     InstallBbscCinematicHook();

@@ -315,6 +315,8 @@ void Dispatch(const std::vector<std::uint8_t>& wrapped) {
         }
     } else if (type == HostBossType && frame.size() >= 9) {
         // Accept and ignore the legacy boss-name banner packet.
+    } else if (type == Core::Bloodborne::Chalice::MountPacketType) {
+        Core::Bloodborne::OnBbscChaliceMountPacket(frame.data(), frame.size());
     } else if (type == Libraries::Np::NpSignaling::kSignalingBbscWorldFlagsType) {
         Core::Bloodborne::OnBbscWorldFlagsPacket(frame.data(),
                                                  static_cast<std::uint32_t>(frame.size()));
