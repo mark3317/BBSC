@@ -20341,12 +20341,14 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             site.name.substr(10), static_cast<s32>(registers->rsi), registers->rdx, registers->rcx,
             behind(registers->rcx), registers->r8, behind(registers->r8), registers->r9, stack(8),
             stack(16), registers->rdi, caller_offset, GetSessionState(), GetCurrentPackedMap());
-        LOG_INFO(Debug, "BBSC {}", line);
+        if (capture_file) {
+            LOG_INFO(Debug, "BBSC {}", line);
+        }
         BBSC_TIMELINE("CUTSCENE", "{}", line);
         OnBbscCutsceneRequestHook(site.offset, *registers);
     }
-    if (!BbscResearchEnabled() && !BbscEssentialDiagnosticSite(site)) {
-        return; // functional work above is complete; no routine memory dumps or file I/O
+    if (!BbscResearchEnabled() && (!capture_file || !BbscEssentialDiagnosticSite(site))) {
+        return; // functional work above is complete; no routine diagnostic work or file I/O
     }
     if (site.kind == TraceKind::LuaSessionEvent) {
         // Only session-relevant Lua events; the dispatcher also runs gameplay events.
@@ -22353,29 +22355,30 @@ void InstallReverseEngineeringTrace() {
         return;
     }
 
-    const auto capture_dir =
-        Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "bloodborne-re";
-    std::error_code error;
-    std::filesystem::create_directories(capture_dir, error);
-    if (error) {
-        LOG_ERROR(Debug, "Could not create Bloodborne RE capture directory {}: {}",
-                  Common::FS::PathToUTF8String(capture_dir), error.message());
-        return;
-    }
+    if (EnvFlagEnabled("SHADPS4_CAPTURE_BLOODBORNE_SUMMON")) {
+        const auto capture_dir =
+            Common::FS::GetUserPath(Common::FS::PathType::CapturesDir) / "bloodborne-re";
+        std::error_code error;
+        std::filesystem::create_directories(capture_dir, error);
+        if (error) {
+            LOG_ERROR(Debug, "Could not create Bloodborne RE capture directory {}: {}",
+                      Common::FS::PathToUTF8String(capture_dir), error.message());
+            return;
+        }
 
-    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-    const int process_id = Debugger::GetCurrentPid();
-    capture_path = capture_dir / ("cusa03173-109-p" + std::to_string(process_id) + '-' +
-                                  std::to_string(timestamp) + ".jsonl");
-    capture_file.open(capture_path, std::ios::out | std::ios::trunc);
-    if (!capture_file) {
-        LOG_ERROR(Debug, "Could not open Bloodborne RE capture {}",
-                  Common::FS::PathToUTF8String(capture_path));
-        return;
-    }
-    capture_file << "{\"type\":\"header\",\"title\":\"CUSA03173\","
+        const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+        const int process_id = Debugger::GetCurrentPid();
+        capture_path = capture_dir / ("cusa03173-109-p" + std::to_string(process_id) + '-' +
+                                      std::to_string(timestamp) + ".jsonl");
+        capture_file.open(capture_path, std::ios::out | std::ios::trunc);
+        if (!capture_file) {
+            LOG_ERROR(Debug, "Could not open Bloodborne RE capture {}",
+                      Common::FS::PathToUTF8String(capture_path));
+            return;
+        }
+        capture_file << "{\"type\":\"header\",\"title\":\"CUSA03173\","
                     "\"app_version\":\"01.09\",\"image_base\":\"0x"
                  << std::hex << image_base << std::dec << "\",\"process_id\":" << process_id
                  << ",\"site_count\":" << Sites.size() << ",\"negative_area_patch\":"
@@ -22413,7 +22416,8 @@ void InstallReverseEngineeringTrace() {
                  << (deferred_summon_reload_hook_installed ? "true" : "false")
                  << ",\"healing_fountain_host_availability_hook\":"
                  << (healing_fountain_host_availability_hook_installed ? "true" : "false") << "}\n";
-    capture_file.flush();
+        capture_file.flush();
+    }
 
     size_t hook_count = 0;
     size_t selected_count = 0;
@@ -22450,9 +22454,8 @@ void InstallReverseEngineeringTrace() {
     }
 
     installed = hook_count == selected_count;
-    LOG_INFO(Debug, "Bloodborne RE trace installed {}/{} selected hooks ({} diagnostic sites omitted); capture={}",
-             hook_count, selected_count, Sites.size() - selected_count,
-             Common::FS::PathToUTF8String(capture_path));
+    LOG_INFO(Debug, "Bloodborne RE hooks installed {}/{} selected sites ({} diagnostic sites omitted)",
+             hook_count, selected_count, Sites.size() - selected_count);
     BBSC_TIMELINE("START", "BBSC hooks installed: {} of {} selected", hook_count, selected_count);
     InstallBbscSpectateHooks();
     InstallBbscWallHooks();
