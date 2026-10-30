@@ -310,9 +310,7 @@ void Dispatch(const std::vector<std::uint8_t>& wrapped) {
             Core::Bloodborne::OnBbscProgressPacket(flags.data(), flags.size());
         }
     } else if (type == HostBossType && frame.size() >= 9) {
-        std::int32_t boss = -1;
-        std::memcpy(&boss, frame.data() + 5, 4);
-        Core::Bloodborne::OnBbscHostBossPacket(boss);
+        // Accept and ignore the legacy boss-name banner packet.
     } else if (type == Libraries::Np::NpSignaling::kSignalingBbscWorldFlagsType) {
         Core::Bloodborne::OnBbscWorldFlagsPacket(frame.data(),
                                                  static_cast<std::uint32_t>(frame.size()));

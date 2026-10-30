@@ -412,9 +412,7 @@ static void ReceiveThreadMain() {
             continue;
         }
         if (type == 0x27 && nbytes == 9) {
-            s32 boss = -1;
-            std::memcpy(&boss, buf + 5, 4);
-            Core::Bloodborne::OnBbscHostBossPacket(boss);
+            // Legacy boss-name banner packet; no longer used by the UI.
             continue;
         }
         if (nbytes == sizeof(SignalingEchoPong) &&

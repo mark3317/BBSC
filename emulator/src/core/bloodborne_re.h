@@ -46,8 +46,6 @@ void OnBbscPvpPacket(std::uint8_t kind, std::uint8_t on);
 // a guest takes packets from (0 = none known yet), and the session state as of the last game tick.
 // BBSC shared progress: the host's boss-defeat flags that are on (relay "SHAD" 0x26). Relay thread.
 void OnBbscProgressPacket(const std::uint32_t* flags, std::size_t count);
-// BBSC boss line: the boss on the host's boss bar (name id, -1 none; relay "SHAD" 0x27).
-void OnBbscHostBossPacket(std::int32_t boss);
 // BBSC cutscenes: the host's cutscene request ("SHAD" 0x28, a whole packet). Relay thread; queued.
 void OnBbscCutscenePacket(const void* data, std::size_t size);
 // BBSC shared keys and badges: the host's owned ones ("SHAD" 0x29). Relay thread; only stored.

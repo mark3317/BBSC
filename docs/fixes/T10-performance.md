@@ -17,10 +17,15 @@ These are previous-run observations, NOT a benchmark of this build.
   leave-decision diagnostics stay. Research mode restores the full trace set.
   Functional sites finish before ordinary capture serialization, locking and disk I/O.
   This removes whole register-save trampolines, not merely their log messages.
-* Boss state broadcast no longer depends on `SHADPS4_BBSC_MESSAGES`; it is sent once
-  a second without building/localizing/replacing a boss banner. Death/wipe logic
-  still receives host boss state. The old coupling could disable gameplay data
-  when UI messages were disabled.
+* Removed the boss-name banner, its lookup and its once-per-second 0x27 packet.
+  A complete reference audit found that this packet was UI-only, despite the first
+  draft conservatively retaining it. Death/wipe detection uses the local boss bar,
+  its death-time latch and life packets, not the banner packet. Receivers accept
+  and ignore legacy 0x27 packets; mixed older clients simply lose the named banner.
+* Removed the unused 20-second talk-gift rejection heuristic and its 50-entry table.
+  SetFlag no longer locks/updates a timestamp map that nobody reads. Actual local
+  talk ownership still updates bbsc_action_owner under its existing mutex.
+  Removed unused timeout/item constants reported by the compiler.
 * Param lookup caches the repository SLOT per type and thread, not a raw table.
   Every hit checks loaded state, follows current holder/resource pointers and
   validates the type name. Changed/unloaded/reused tables fall back to lookup.

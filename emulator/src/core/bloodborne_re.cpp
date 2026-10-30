@@ -4188,8 +4188,7 @@ constexpr s64 BbscLifeFreshMs = 3'000;
 // while it loads (no session state), so 3 s later its "dead" report was stale; the guest died in
 // that window, fell back to the host's copy in its own world - which TickBbscRemoteRevive had just
 // stood up - saw a living partner and spectated, waiting for a boss kill. A "dead" report now holds
-// until the same player says "alive" (or for this long without a word: a dead player who left).
-constexpr s64 BbscLifeDeadHoldMs = 60'000;
+// until the same player says "alive" or confirmed departure removes its life record.
 struct BbscPeerLife {
     u8 dead = 0;
     u32 sequence = 0;
@@ -4210,11 +4209,9 @@ std::atomic<u32> bbsc_revivals_at_own_death{0};
 // {fresh reports, of which dead}
 std::pair<u32, u32> BbscPeerLifeCounts() {
     std::scoped_lock lock{bbsc_life_mutex};
-    const s64 now = SteadyNowMs();
     u32 fresh = 0;
     u32 dead = 0;
     for (const auto& [player, life] : bbsc_peer_life) {
-        const s64 age = now - life.received_ms;
         if (life.received_ms != 0) { // life changes only on an explicit report, never on a timeout
             ++fresh;
             dead += life.dead != 0 ? 1 : 0;
@@ -5022,7 +5019,6 @@ void TickBbscFollowBroadcast() {
 constexpr s64 BbscFollowArriveTimeoutMs = 90'000;
 constexpr int BbscFollowMaxAttempts = 3;
 // No follow load while the host is this close in the same area (shared coordinates, see below).
-constexpr float BbscFollowNearMetres = 120.0f;
 // ... and only once the host's map has differed from ours this long.
 constexpr s64 BbscFollowMismatchMs = 2'500;
 
@@ -11673,80 +11669,12 @@ constexpr u64 BbscItemManPointer = 0x0553D6E0;
 constexpr u64 BbscAwardItemLot = 0x017DDC50;
 constexpr u64 BbscItemPopupQueue = 0x016D8850;
 
-// ---- Talk gifts are each player's own (2026-10-27) ---------------------------------------------
-// Test at Iosefka's door: whoever talked, both players got the vial - a talk's flags reach the
-// other player's table too (not through SetFlag 0x013CFCC0: the research hook never saw it there;
-// the game's own talk sync), and each player's copy of the gift event then gives its player the
-// gift. The user: a quest that follows a talk is each player's own, so its gifts are too. A gift
-// lot below comes from an event that waits on a flag the talk scripts set (all talk scripts' c1_11
-// / talk-group arguments x the inits of the gift events, tools: esd + emevd scan); in a session it
-// is given only to the player whose own talk set one of its flags in the last 20 s, else the award
-// is skipped and those flags are put back off (so our own talk can still give it).
-struct BbscTalkGift {
-    s32 lot;
-    u32 flag;
-};
-constexpr std::array<BbscTalkGift, 50> BbscTalkGifts{{
-    {17000, 9042},    {22000, 9045},    {24000, 9047},    {24010, 9048},    {24020, 9049},
-    {24030, 9050},    {24040, 9051},    {24050, 9052},    {26000, 9054},    {26010, 9055},
-    {26020, 9056},    {26030, 9057},    {27000, 9058},    {27010, 9059},    {27020, 9060},
-    {27030, 9061},    {27040, 9062},    {27050, 9063},    {27060, 9064},    {29000, 9066},
-    {30000, 9067},    {32000, 9069},    {33000, 9071},    {34000, 9072},    {34010, 9073},
-    {35000, 9074},    {35010, 9075},    {39010, 9077},    {24060, 72410359}, {23000, 72410310},
-    {32020, 72400398}, {28000, 72400489}, {37000, 72400441}, {43120, 72700321}, {43130, 72700322},
-    {43110, 72700330}, {43200, 73400430}, {43200, 73500630}, {43210, 73400431}, {43211, 73400424},
-    {43010, 73500321}, {43020, 73500322}, {43000, 73500320}, {43600, 73600300}, {43220, 73600530},
-    {23000, 9046},    {39000, 9076},    {17010, 9043},    {43200, 1710},    {43220, 1713},
-}};
-std::mutex bbsc_local_talk_mutex;
-std::unordered_map<u32, s64> bbsc_local_talk_ms; // flag -> when our own talk set it on
-
+// Local talks establish ownership directly. The obsolete 20-second gift heuristic
+// had no callers; do not maintain its duplicate timestamp map in the SetFlag hook.
 void NoteBbscLocalTalkFlag(u32 flag, u8 value) {
-    if (value == 0) {
-        return;
-    }
-    std::scoped_lock lock{bbsc_local_talk_mutex};
-    if (bbsc_local_talk_ms.size() > 4096) {
-        bbsc_local_talk_ms.clear();
-    }
-    bbsc_local_talk_ms[flag] = SteadyNowMs();
-    { std::scoped_lock owner_lock{bbsc_npc_own_mutex}; bbsc_action_owner[flag] = true; }
-}
-
-// True when the award of `lot` is another player's talk gift (and was skipped).
-bool SkipBbscOthersTalkGift(s32 lot) {
-    const s32 state = GetSessionState();
-    if (state != 3 && state != 6) {
-        return false; // alone: the game's own way
-    }
-    bool listed = false;
-    bool ours = false;
-    {
-        std::scoped_lock lock{bbsc_local_talk_mutex};
-        for (const auto& gift : BbscTalkGifts) {
-            if (gift.lot != lot) {
-                continue;
-            }
-            listed = true;
-            const auto it = bbsc_local_talk_ms.find(gift.flag);
-            ours = ours || (it != bbsc_local_talk_ms.end() && SteadyNowMs() - it->second < 20'000);
-        }
-    }
-    if (!listed || ours) {
-        return false;
-    }
-    using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
-    const auto set = reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0);
-    for (const auto& gift : BbscTalkGifts) {
-        if (gift.lot == lot && gift.flag >= 9000 && gift.flag < 10000) {
-            set(0, gift.flag, 0); // a story gift flag: off again, for our own talk later
-        }
-    }
-    LOG_INFO(Debug, "BBSC talk gifts: item lot {} follows the other player's talk - not ours "
-                    "(session state {})",
-             lot, state);
-    BBSC_TIMELINE("ITEMS", "talk gift lot {} skipped: the other player's talk", lot);
-    return true;
+    if (value == 0) return;
+    std::scoped_lock owner_lock{bbsc_npc_own_mutex};
+    bbsc_action_owner[flag] = true;
 }
 
 bool BbscEventActionNotOurs(u64 caller_offset); // see "Talk-driven events are each player's own"
@@ -16398,19 +16326,7 @@ void TickBbscMessages() {
     }
 }
 
-// ---- Boss battle line with the boss's name (2026-10-07) -----------------------------------------
-// The user: "the host started the final battle" should say which boss. The game's line for that
-// (30/105199, and 105299) is one fixed text with no boss tag. BBSC points it at its own text with the
-// boss's name in it: the host sends the boss on its boss bar (relay "SHAD" 0x27, s32 the gauge's
-// name id, once a second while hosting), and a guest also uses its own boss bar. The name comes from
-// BbscBossNames (the Discord status table); unknown boss = "The host started a boss battle."
-// The text is looked up when the banner is drawn, so it has to be in place by then: a host packet
-// arrives within ~1 s of the bar coming up. HYPOTHESIS until a guest screenshot shows the name.
-constexpr s64 BbscHostBossFreshMs = 10'000;
-std::atomic<s32> bbsc_host_boss_id{-1};
-std::atomic<s64> bbsc_host_boss_ms{0};
-const char* BbscBossNameById(s32 id); // see "Discord status"
-
+// ---- Boss HUD cleanup after a reload or session departure -------------------------------------
 void ClearBbscBossContext(std::string_view why) {
     const bool had_bar = BossFightActive();
     const u64 gauge = ReadValue<u64>(image_base + BossGaugePointerOffset, 0);
@@ -16423,37 +16339,7 @@ void ClearBbscBossContext(std::string_view why) {
     bbsc_boss_at_own_death = false;
     bbsc_boss_bar_seen_ms = 0;
     bbsc_boss_killed_ms = 0;
-    bbsc_host_boss_id = -1;
-    bbsc_host_boss_ms = 0;
     LOG_INFO(Debug, "BBSC boss context: cleared ({}, had bar {})", why, had_bar);
-}
-
-// The name id on our own boss bar, or -1.
-s32 BbscGaugeBossId() {
-    const u64 gauge = ReadValue<u64>(image_base + BossGaugePointerOffset, 0);
-    if (!ReadablePointer(gauge, 0x1690)) {
-        return -1;
-    }
-    for (int slot = 0; slot < 3; ++slot) {
-        const size_t at = static_cast<size_t>(slot) * 0x14;
-        if (ReadValue<s32>(gauge, 0x165C + at) != -1) {
-            return ReadValue<s32>(gauge, 0x1658 + at);
-        }
-    }
-    return -1;
-}
-
-// Boss state is gameplay data (death/wipe detection), independent of banner settings.
-void TickBbscBossBroadcast() {
-    static s64 last_send_ms = 0;
-    const s64 now = SteadyNowMs();
-    if (image_base == 0 || now - last_send_ms < 1'000) return;
-    last_send_ms = now;
-    if (GetSessionState() != 3) return;
-    const s32 own = BbscGaugeBossId();
-    std::array<u8, 9> packet{'S', 'H', 'A', 'D', 0x27};
-    std::memcpy(packet.data() + 5, &own, 4);
-    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(), packet.size());
 }
 
 // ---- Co-op banner lines (2026-09-25) ------------------------------------------------------------
@@ -17545,7 +17431,6 @@ void StartBbscScaling() {
 constexpr u32 BbscDuelBellGoodsId = 4313;
 constexpr u32 BbscDuelBellEffectId = 7511;
 constexpr u32 BbscDuelBellSourceEffectId = 9000; // Beckoning Bell
-constexpr u32 BbscDuelBellItemCode = 0x40000000u | BbscDuelBellGoodsId;
 constexpr u64 InventoryFitsOffset = 0x014D9A80;
 constexpr u64 InventoryAddOffset = 0x014DA0A0;
 constexpr u32 BbscPvpTeam = 21;
@@ -19082,9 +18967,7 @@ const char* FindBbscName(std::span<const std::pair<s32, const char*>> names, s32
     return nullptr;
 }
 
-const char* BbscBossNameById(s32 id) {
-    return FindBbscName(BbscBossNames, id);
-}
+
 
 std::string BbscAreaName(u32 packed_map) {
     const s32 area = static_cast<s32>((packed_map >> 24) & 0xFF);
@@ -19655,7 +19538,6 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         { BBSC_PERF_NESTED("tick TickBbscStuckLeaveLocks"); TickBbscStuckLeaveLocks(); }
         { BBSC_PERF_NESTED("tick TickBbscStrandedGuest"); TickBbscStrandedGuest(); }
         { BBSC_PERF_NESTED("tick TickBbscKeptHome"); TickBbscKeptHome(); }
-        { BBSC_PERF_NESTED("tick TickBbscBossBroadcast"); TickBbscBossBroadcast(); }
         { BBSC_PERF_NESTED("tick TickBbscCutsceneReplay"); TickBbscCutsceneReplay(); }
         { BBSC_PERF_NESTED("tick TickBbscSharedKeyItems"); TickBbscSharedKeyItems(); }
         { BBSC_PERF_NESTED("tick TickBbscNpcOwnQuests"); TickBbscNpcOwnQuests(); }
@@ -20721,10 +20603,7 @@ void TickBbscCutsceneReplay() {
 }
 } // namespace
 
-void OnBbscHostBossPacket(std::int32_t boss) {
-    bbsc_host_boss_id = boss;
-    bbsc_host_boss_ms = SteadyNowMs();
-}
+
 
 void OnBbscProgressPacket(const std::uint32_t* flags, std::size_t count) {
     if (flags == nullptr || bbsc_relay_session_state.load() != 6) {

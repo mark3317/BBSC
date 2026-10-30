@@ -1,7 +1,7 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
 > **T10, 30 October: performance/notification audit, build only (NO DEPLOY).**
-> Diagnostic-only hot hooks are opt-in; boss state transport separated from UI;
+> Diagnostic-only hot hooks are opt-in; obsolete boss-banner transport removed;
 > reload-safe param slot cache, dead shop guard removed, personal-event policy
 > unified. Keep connection/departure and PvP notices. See
 > [T10-performance](fixes/T10-performance.md). Gameplay/FPS verification pending.

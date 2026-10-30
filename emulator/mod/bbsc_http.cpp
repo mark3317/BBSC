@@ -116,7 +116,6 @@ std::atomic<s64> placement_received_ms{0};
 // waiting guest follows one host until that host goes quiet.
 std::atomic<s64> own_sign_created_ms{0};
 std::atomic<s64> own_sign_deleted_ms{0};
-constexpr s64 OwnSignMs = 60'000; // the game posts its sign again about every 30 s
 std::atomic<u32> placement_sender{0};
 std::atomic<s64> claim_delivered_ms{0}; // our sign's reply carried a host's claim (0 = none open)
 std::atomic<bool> was_in_session{false};

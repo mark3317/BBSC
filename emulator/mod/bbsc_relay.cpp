@@ -342,11 +342,7 @@ void Dispatch(const std::vector<u8>& wrapped, bool from_server = false) {
             Core::Bloodborne::OnBbscProgressPacket(flags.data(), flags.size());
         }
     } else if (frame[4] == HostBossType && frame.size() >= 9) {
-        if (from_our_host()) {
-            std::int32_t boss = -1;
-            std::memcpy(&boss, frame.data() + 5, 4);
-            Core::Bloodborne::OnBbscHostBossPacket(boss);
-        }
+        // Legacy boss-name banner packet. No gameplay state depends on it.
     } else if (frame[4] == KeyItemsType) {
         if (from_our_host()) {
             Core::Bloodborne::OnBbscKeyItemsPacket(frame.data(), frame.size());
