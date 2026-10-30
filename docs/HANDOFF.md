@@ -1,9 +1,10 @@
 # HANDOFF — состояние работы и что дальше
 
-> **T17 implementation ready for build:** first event-driven reward/drop/cutscene/departure
-> notifications, numeric scaling/cache and research-only diagnostic scans. Automated
-> concurrency, scaling and existing recovery/follow checks PASS. User authorized
-> build/deployment to PC + laptop. See [T17](fixes/T17-event-work.md).
+> **T17 deployed PC + laptop:** event-driven reward/drop/cutscene/departure
+> notifications, numeric scaling/cache and research-only diagnostic scans (`addfd08`).
+> Build exit=0, zero warnings; 12 deployed-file hash checks PASS; concurrency,
+> scaling and existing recovery/follow checks PASS. Research OFF, saves unchanged.
+> Gameplay/FPS confirmation pending. See [T17](fixes/T17-event-work.md).
 
 
 > **T16 deployed PC + laptop**: consume host arrival after sharing map, preventing repeated

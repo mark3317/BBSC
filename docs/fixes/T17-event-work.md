@@ -33,7 +33,15 @@ heartbeats, exact expiry, new settings, guest counts and solo/rejoin transitions
 Existing `test_perf_policy.py`, `test_post_load_recovery.py` (15 scenarios) and
 `test_follow_arrival.py`: PASS. `git diff --check`: PASS.
 
-Build/deployment outcome and artifact hash will be recorded after completion.
+Code commit: `addfd08`. Standalone mod build: `exit=0`, zero warnings.
+Deployed to PC and laptop with games/launchers stopped. All three files (DLL,
+launcher, mod.json) verified by SHA256 in both override and active package on each
+machine (12 checks). DLL SHA256:
+`A539FE8AC535F3B0BA8547644B8545ACEE32AC4E6C42A6E415CF701952D1BF11`.
+Previous binaries backed up beside the installed files by deploy-mod.
+Research user environment is 0 on both devices; PC extra_env explicitly has
+RESEARCH=0, neither extra_env/user environment disables the default BBSC profiler.
+Saves, graphics settings, port and server unchanged.
 No gameplay/FPS result yet. This is phase one, not a replacement of all polling.
 
 ## Gameplay test
@@ -45,3 +53,5 @@ enemy/boss health bars, death/spectator/wipe recovery, map-border follow and cle
 host exit/guest return home, then reconnect and swap roles if practical. A normal
 boss cutscene/reward is desirable when available, without forcing save rollback.
 Collect both machines' perf/timeline logs after the user finishes.
+
+Test run: `20261030-161747` (run.txt/current-run recorded, VPS log byte offset captured).
