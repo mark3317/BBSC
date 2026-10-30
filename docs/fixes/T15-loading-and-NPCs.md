@@ -12,4 +12,6 @@ has not been established. Existing creation patch remains enabled.
 
 Code d13754c. Existing perf/policy and all 15 post-load fixtures pass. These do not test visual
 rendering. In-game confirmation required for same-map/cross-map joins and NPCs across reloads.
-No deployment or save modifications in this turn.
+Deployed by user request to PC and laptop, both stopped. Override and active-package DLL/launcher
+hashes verified against build. DLL SHA256: 23E3765DB27FDD28BFF416544FD008CC26C2B3380EE4C7E73F96B061FC2632A2.
+Previous files backed up by coopdev. No save/settings modifications. Build exit=0.

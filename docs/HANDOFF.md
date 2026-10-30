@@ -1,5 +1,12 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T15 deployed to PC + laptop**, override and active-package hashes verified.
+> See [T15](fixes/T15-loading-and-NPCs.md). Gameplay confirmation pending.
+> **User preference:** after future fixes and successful builds, deploy immediately to
+> PC/laptop where the game and launcher are stopped. Do not terminate running games;
+> report devices skipped. Save rollback still requires a separate request.
+
+
 > **T14, 30 October: post-load/session recovery deployed to PC + laptop by user request.**
 > Latest laptop log confirms dead guest after wipe load, then home state=0/own_world=1
 > with phantom type=1 (bell rejected player type). Cancel kept-death override before
