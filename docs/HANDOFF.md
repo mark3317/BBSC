@@ -1,11 +1,12 @@
 # HANDOFF — состояние работы и что дальше
 
-> **T14, 30 October: post-load/session recovery implemented, not deployed.**
+> **T14, 30 October: post-load/session recovery deployed to PC + laptop by user request.**
 > Latest laptop log confirms dead guest after wipe load, then home state=0/own_world=1
 > with phantom type=1 (bell rejected player type). Cancel kept-death override before
 > teardown; reconcile local character/camera after completed loads independently of
 > remote creation; normalize phantom at home; dead/missing guests can return home.
-> No save changes. All 15 fixture scenarios pass; final mod build exit=0, no warnings.
+> Override and active-package hashes verified on both machines. No save/settings changes.
+> All 15 fixture scenarios pass; final mod build exit=0, no warnings.
 > Code `8ff3435` + `7ed971b`. Details/hash in
 > [T14-post-load-recovery](fixes/T14-post-load-recovery.md); gameplay confirmation pending.
 
