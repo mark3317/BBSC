@@ -48,3 +48,10 @@ Test as PC host / laptop client, current test saves (no automatic rollback):
 Separate audit lead: Shared Progress OR-merges kind-1 flags, which may retain transient
 encounter flags such as 12704800/12704801. This is not proven as the cause in this run;
 no broad event-flag changes are bundled with this confirmed death-state fix.
+
+
+Build/deploy: code commit `12984a9`, build log `exit=0`, 8 existing unused-symbol warnings.
+PC and laptop override + active-package DLL hashes verified:
+`68943CD98A535BCEB9771F5B5DB9FCFC3DD696EDA50747D5ABECD1DE23F514AF`.
+Native ClearBossGauge disassembled at 0x01336D00: only resets HUD slots, no calls/flags.
+Current testHost/test saves kept. No save rollback, no server changes.

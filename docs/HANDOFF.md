@@ -4,7 +4,9 @@
 > in place at 01:07:12, before PartyGhostDeath_2 at 01:07:13; no full client reload.
 > Unified watchdog/native death state, latched boss-at-death, actual load-generation
 > check, HUD cleanup after reload/return home. See `docs/fixes/T9-boss-wipe.md`.
-> Build/deployment pending. Current saves and `forest-host` remain untouched.
+> Code `12984a9`: build exit=0; deployed/verified on PC and laptop. SHA256
+> `68943CD98A535BCEB9771F5B5DB9FCFC3DD696EDA50747D5ABECD1DE23F514AF`.
+> Gameplay confirmation pending. Current saves and `forest-host` remain untouched.
 
 > **Запомненный сейв «в лесу» (30.10):** снимок **`forest-host`** на ПК,
 > `D:\Games\Bloodborne\coop-dev\saves\forest-host`.

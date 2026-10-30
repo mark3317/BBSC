@@ -1,7 +1,7 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
 T9 (30 October): confirmed host-first/client-last boss wipe bypass through the 15s
-watchdog. Fix in progress; gameplay confirmation pending. See [T9](fixes/T9-boss-wipe.md).
+watchdog. Fix `12984a9` built and deployed to both machines; gameplay confirmation pending. See [T9](fixes/T9-boss-wipe.md).
 
 Приоритеты: **P0** — софтлок / вылет / потеря прогресса, **P1** — ломает механику или квест, **P2** — заметно, но обходится,
 **P3** — косметика. Ссылки на находки изучения — `docs/study/FINDINGS.md`.
