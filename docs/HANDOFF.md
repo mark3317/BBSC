@@ -1,7 +1,7 @@
 # HANDOFF — состояние работы и что дальше
 
 > **T11, 30 October: build 8373921 deployed/verified on PC + laptop; Research logs OFF.**
-> PC restored forest-host (testHost, slot 1); laptop save unchanged.
+> PC restored forest-host (testHost, slot 1); current PC save subsequently copied to laptop test by user request (19 files verified, including journals).
 > Host-first wipe spectator cleanup, resolved banner draw filter, native chest
 > availability and immediate native summon loading screen. See
 > [T11-test-regressions](fixes/T11-test-regressions.md). T10 test had Research logs
@@ -157,3 +157,14 @@
 2. Вайп на Чудовище-клирике: гость умирает первым (камера: мышь, I/J/K/L, стик), потом хост. Ждём `CHECK FAIL DEATH-dream-respawn` у хоста и пробуждение у лампы Центрального Ярнама, не в Сне.
 3. Повторная загрузка Запретного леса хостом с вступлением в Лигу — руна «Нечистота» не множится (если дойти).
 Логи: `grep -h "BBSC CHECK\|BBSC ledger\|BBSC items\|respawn point" bbsc-mod-*.log`.
+
+### T11 follow-up: copy PC forest save to laptop
+User requested the current PC save on the laptop. Source snapshot
+`pc-forest-transfer-20261030-111920` created from PC testHost; restored to
+`C:/Games/Bloodborne/test/savedata/1/CUSA00207/SPRJ0005`.
+Save/system metadata and current own-world, bell-pending, item-ledger, guest-items,
+shared-progress, kit-repaired directories synchronized; missing source journals
+become empty on target to prevent old guest recovery from overwriting imported state.
+19 files verified by SHA256. Laptop's old save and all journals backed up in
+`C:/Games/Bloodborne/coop-dev/saves/before-pc-forest-20261030-111954`.
+Both games were closed. Mod and Research settings unchanged.
