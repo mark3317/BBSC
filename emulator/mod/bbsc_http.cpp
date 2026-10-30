@@ -499,6 +499,12 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
         return original_send(request, data, size); // (review 2026-10-08) the slots never filled
     }
     original_add_header(request, "X-ShadPS4-Bloodborne-Seamless", "1", 0);
+    // New ports return create replies immediately; the native scheduler now retries
+    // every 2 seconds. Old ports ignore this header and keep their legacy fast sign.
+    if (Core::Bloodborne::ConfigureBbscSummonPolling()) {
+        original_add_header(request, "X-BBSC-Native-Summon-Polling", "1", 0);
+    }
+
     if (IsSummonDelete(url)) {
         own_sign_deleted_ms = NowMs();
     }

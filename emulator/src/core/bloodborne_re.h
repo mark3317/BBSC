@@ -13,6 +13,7 @@
 namespace Core::Bloodborne {
 
 std::optional<std::string> GetSeamlessHostPlacementHeader();
+bool ConfigureBbscSummonPolling();
 bool SetSeamlessHostPlacementHeader(std::string_view value);
 void ClearSeamlessHostPlacementHeader();
 // BBSC timeline: one line in this run's bbsc-timeline-*.txt ("kind" like NET, RELAY, JOIN). Any

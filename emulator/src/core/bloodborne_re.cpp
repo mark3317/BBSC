@@ -17055,7 +17055,7 @@ void TickBbscNoticeRestore() {
 
 // BBSC's own notices, for moments the game has no line for (respawning, the host falling).
 void BbscAnnounce(const char16_t* text, std::string_view what) {
-    if (what != "pvp on" && what != "pvp off" && what != "pvp alone" && what != "kept home") {
+    if (what != "pvp on" && what != "pvp off" && what != "pvp alone" && what != "kept home" && what != "host search ended") {
         LOG_INFO(Debug, "BBSC notice (log only): {}", what);
         return;
     }
@@ -18835,6 +18835,26 @@ void TickBbscInvadable() {
     }
 }
 
+// Erasing the Beckoning effect silences matchmaking through the native bell path;
+// unlike Silencing Blank it does not dismiss hunters already in the host's room.
+void TickBbscHostSearchLimit() {
+    static s64 started_ms = 0;
+    const s32 state = GetSessionState();
+    const bool active = (state == 0 || state == 3) && !BbscInAnotherWorld() &&
+                        BbscLocalEffectNode(9000) != 0;
+    if (!active) { started_ms = 0; return; }
+    const s64 now = SteadyNowMs();
+    if (started_ms == 0) {
+        started_ms = now;
+        BBSC_TIMELINE("JOIN", "host bell: search started (maximum 300 seconds)");
+    }
+    if (now - started_ms < 300'000) return;
+    if (!BbscEraseLocalEffect(9000)) return; // retry until the native erase succeeds
+    started_ms = 0;
+    BBSC_TIMELINE("JOIN", "host bell: search ended after 300 seconds");
+    BbscAnnounce(u"Поиск окончен.\nЧтобы продолжить поиск, позвоните в колокол снова.", "host search ended");
+}
+
 void TickBbscHostBlank() {
     static bool was = false;
     const bool now = bbsc_duel_bell_ready && !bbsc_blank_effect_rows.empty() && GetSessionState() == 3 &&
@@ -19037,6 +19057,7 @@ void TickBbscPvp() {
     }
     StartBbscDuelBell();
     TickBbscDuelBellGive();
+    TickBbscHostSearchLimit();
     TickBbscHostBlank();
     TickBbscInvadable();
     const s32 state = GetSessionState();
@@ -21535,6 +21556,33 @@ std::string CapBbscAreaListRequest(std::string_view path, std::string& body) {
                     asked);
     BbscTimeline("NET", std::string_view(summary).substr(5));
     return summary;
+}
+
+// CUSA03173 1.09: ServerInfo manager [05540288]+18. Native create completion
+// 01E89A57 reads +89C; search completion 01E9597C / 01E97AF6 reads +8A0.
+// Change the actual consumed settings, rather than ss.info's versioned XML only.
+// Only called by the DLL's private-server HTTP route, before dispatching a summon.
+bool ConfigureBbscSummonPolling() {
+    if (image_base == 0) return false;
+    const u64 manager = ReadValue<u64>(image_base + 0x05540288, 0);
+    if (!ReadablePointer(manager, 0x20)) return false;
+    const u64 info = ReadValue<u64>(manager, 0x18);
+    if (!ReadablePointer(info, 0x8A4) ||
+        !HasMemoryAccess(info + 0x89C, 8, MemoryProt::CpuWrite)) return false;
+    const u32 create = ReadValue<u32>(info, 0x89C);
+    const u32 search = ReadValue<u32>(info, 0x8A0);
+    if (create > 9999 || search > 9999) return false;
+    const u64 network = ReadValue<u64>(image_base + SummonManagerRootPointerOffset, 0);
+    const u64 broker = ReadablePointer(network, 0xC58) ? ReadValue<u64>(network, 0xC50) : 0;
+    if (!ReadablePointer(broker, 0x194)) return false;
+    // ss.info completion also caches the create interval here (01E89AAD).
+    const bool ok = WriteValue<u32>(info, 0x89C, 2) && WriteValue<u32>(info, 0x8A0, 2) &&
+                    WriteValue<float>(broker, 0x190, 2.0f);
+    if (ok && (create != 2 || search != 2)) {
+        LOG_INFO(Debug, "BBSC matchmaking: native sign/search intervals {} / {} -> 2 seconds", create, search);
+        BBSC_TIMELINE("JOIN", "matchmaking: native sign/search intervals {} / {} -> 2 seconds", create, search);
+    }
+    return ok;
 }
 
 std::optional<std::string> GetSeamlessHostPlacementHeader() {
