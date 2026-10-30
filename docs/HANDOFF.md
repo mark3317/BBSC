@@ -4,7 +4,8 @@
 > Diagnostic-only hot hooks are opt-in; obsolete boss-banner transport removed;
 > reload-safe param slot cache, dead shop guard removed, personal-event policy
 > unified. Keep connection/departure and PvP notices. See
-> [T10-performance](fixes/T10-performance.md). Gameplay/FPS verification pending.
+> [T10-performance](fixes/T10-performance.md). `d101121`: mod build exit=0, zero warnings;
+> regression checks passed. Gameplay/FPS verification pending; NOT deployed.
 
 > **T9, 30 October: boss wipe regression confirmed in logs.** Client watchdog revived
 > in place at 01:07:12, before PartyGhostDeath_2 at 01:07:13; no full client reload.

@@ -4,7 +4,8 @@
 > Diagnostic-only hot hooks are opt-in; obsolete boss-banner transport removed;
 > reload-safe param slot cache, dead shop guard removed, personal-event policy
 > unified. Keep connection/departure and PvP notices. See
-> [T10-performance](fixes/T10-performance.md). Gameplay/FPS verification pending.
+> [T10-performance](fixes/T10-performance.md). `d101121`: mod build exit=0, zero warnings;
+> regression checks passed. Gameplay/FPS verification pending; NOT deployed.
 
 T9 (30 October): confirmed host-first/client-last boss wipe bypass through the 15s
 watchdog. Fix `12984a9` built and deployed to both machines; gameplay confirmation pending. See [T9](fixes/T9-boss-wipe.md).

@@ -12,7 +12,7 @@ Existing laptop profiles in `bloodborne_pc/out/coop-dev/runs/20261030-003555`:
 (`IsValidSos.Update`), and 404.6 in `TickBbscBossLine` (nested, not additive).
 These are previous-run observations, NOT a benchmark of this build.
 
-* Production no longer installs diagnostic-only TraceEntry hooks (action flags,
+* Production selects 31 of 168 trace sites, omitting 137 diagnostic-only TraceEntry hooks (action flags,
   goods lookups, bell probes, etc.). Functional dispatch, panic, Lua session and
   leave-decision diagnostics stay. Research mode restores the full trace set.
   Functional sites finish before ordinary capture serialization, locking and disk I/O.
@@ -57,7 +57,11 @@ memory: warm-cache cost, unloaded params, changed table, changed repository/slot
 wrong type and invalid pointer; checks notification policy and coverage of every
 functional dispatch offset by the production hook selector.
 `git diff --check`: PASS.
-Build result will be recorded after compilation.
+Final mod build from `d101121` (includes `454745c`, `7b91d31`): `exit=0`, zero warnings.
+Artifacts: `build/mod/bbsc.dll`, `bbsc-launch.exe`, `mod.json`.
+DLL SHA256: `F6CD7AC6ED0053884A07D948F4B303DF2252CB63F5AB34FC4DCC926D79ECB2AF`.
+The standalone mod was built; the separate full emulator target was not built.
+Its two packet consumers were updated to ignore the removed UI-only packet too.
 
 No game launch, deployment, save changes, server changes or push authorized/performed.
 A later same-scene host/guest profile is needed to measure actual FPS improvement.
