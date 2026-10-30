@@ -4129,7 +4129,6 @@ s64 bbsc_spectate_since_ms = 0;
 // host after its own death) and every boss is back to full health, so nobody is going to kill the
 // boss this death was waiting for. Test 2026-10-01: the guest stayed dead after the host's reload
 // until the host died again.
-u64 bbsc_spectate_chr = 0;
 s64 bbsc_spectate_alone_since_ms = 0;
 // Test 2026-10-04 (mod 11, boss fight): the guest died first and spectated; when the host died the
 // guest saw nobody alive and reloaded on its own - into its OWN respawn point (the Hunter's Dream),
@@ -4376,6 +4375,12 @@ bool BossFightActive() {
 constexpr s64 BbscBossBarMemoryMs = 10'000;
 s64 bbsc_boss_bar_seen_ms = 0;
 s64 bbsc_boss_killed_ms = 0;
+// Latched at HP zero, before Failed_BossAreaMission removes the gauge. The native final
+// death step can arrive more than 15 seconds later; a time-limited bar cache is insufficient.
+bool bbsc_boss_at_own_death = false;
+std::atomic<u32> bbsc_load_generation{0}; // incremented after an actual load completes
+u32 bbsc_spectate_load_generation = 0;
+void ClearBbscBossContext(std::string_view why);
 
 void NoteBbscBossBar() {
     if (BossFightActive()) {
@@ -4386,7 +4391,7 @@ void NoteBbscBossBar() {
 // A boss fight was on when the player died: a bar is up now, or was up moments ago and no boss
 // has been killed since.
 bool BbscBossFightAtDeath() {
-    if (BossFightActive()) {
+    if (bbsc_boss_at_own_death || BossFightActive()) {
         return true;
     }
     return bbsc_boss_bar_seen_ms != 0 && bbsc_boss_killed_ms < bbsc_boss_bar_seen_ms &&
@@ -4402,6 +4407,7 @@ void PS4_SYSV_ABI BbscFailedBossAreaHook(u64 tag, const GuestRegisterSnapshot* r
         return;
     }
     const bool bar = BossFightActive();
+    bbsc_boss_at_own_death |= bar;
     NoteBbscBossBar();
     LOG_INFO(Debug, "BBSC boss fight: Failed_BossAreaMission (died in the boss area), boss bar {}",
              bar ? "up - remembered for the death step" : "not up");
@@ -8970,17 +8976,9 @@ bool BbscLateDeathStep(std::string_view name) {
 // Runs just before the death step's body. The body itself is harmless now that its reload call is
 // a no-op, so nothing is skipped here: this only records that the local player died so the tick
 // below can revive them (or wait out a boss fight first).
-void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* registers) {
-    BBSC_PERF_SCOPE("hook BbscSpectateDeathHook");
-    if (registers == nullptr || bbsc_spectate_releasing || !BbscSpectateEnabled()) {
-        return; // releasing: the reload the step asked for is being requested for real
-    }
-    const std::string_view name = tag == 0 ? "SoloPlayDeath_2" : "PartyGhostDeath_2";
-    if (tag < 2 && BbscLateDeathStep(name)) {
-        bbsc_late_final_skip[tag] = 1;
-        return;
-    }
-    const s32 session_state = GetSessionState();
+// Both the native final death step and the watchdog enter the same state machine.
+// The watchdog must never revive a boss death directly, even if the native step is delayed.
+void BeginBbscCoopDeath(std::string_view name, s32 session_state) {
     if (session_state != 3 && session_state != 6) {
         // Solo play. The step's reload call is retargeted to a no-op whether or not a session
         // exists, so without asking for it here the player would stay dead with camera control
@@ -9012,12 +9010,11 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
         bbsc_request_death_reload = true;
         return;
     }
-    bbsc_echoes_at_death = GetBloodEchoes();
     bbsc_kept_death_this_load = true;
     StashBbscOwnWorldSnapshot();
     bbsc_spectate_name = name;
     bbsc_spectate_since_ms = SteadyNowMs();
-    bbsc_spectate_chr = GetLocalPlayerCharacter();
+    bbsc_spectate_load_generation = bbsc_load_generation.load();
     bbsc_spectate_alone_since_ms = 0;
     bbsc_spectate_logged_wait = false;
     bbsc_spectate_saw_wipe = guest_waits_for_host;
@@ -9054,6 +9051,22 @@ void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* re
                  : "no boss fight: respawn at the last lamp without a reload");
 }
 
+void PS4_SYSV_ABI BbscSpectateDeathHook(u64 tag, const GuestRegisterSnapshot* registers) {
+    BBSC_PERF_SCOPE("hook BbscSpectateDeathHook");
+    if (registers == nullptr || bbsc_spectate_releasing || !BbscSpectateEnabled()) {
+        return; // releasing: the reload the step asked for is being requested for real
+    }
+    const std::string_view name = tag == 0 ? "SoloPlayDeath_2" : "PartyGhostDeath_2";
+    if (tag < 2 && BbscLateDeathStep(name)) {
+        bbsc_late_final_skip[tag] = 1;
+        return;
+    }
+    if (bbsc_spectate_active) return; // watchdog already owns this death, including a pending wipe load
+    bbsc_echoes_at_death = GetBloodEchoes();
+    const s32 session_state = GetSessionState();
+    BeginBbscCoopDeath(name, session_state);
+}
+
 void ReleaseBbscGuestRespawnPoint(std::string_view why); // see TickBbscRespawnPointWatch
 
 // Game-thread tick: release the held death once nobody is left alive, the session is over, or the
@@ -9082,10 +9095,13 @@ void TickBbscSpectate() {
     }
     if (session_alive && LivingPartnerExists()) {
         std::string_view respawn_why;
-        const u64 chr = GetLocalPlayerCharacter();
+        const u64 global = GetGlobalState();
+        const bool loaded = bbsc_load_generation.load() != bbsc_spectate_load_generation &&
+                            ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) == 0;
         if (bbsc_death_mode == BbscDeathMode::RespawnNow) {
             respawn_why = "no boss fight";
-        } else if (chr != 0 && bbsc_spectate_chr != 0 && chr != bbsc_spectate_chr) {
+        } else if (loaded) {
+            ClearBbscBossContext("death load completed");
             respawn_why = "a load ended the boss fight";
         } else if (session_state == 6 && bbsc_spectate_saw_wipe && !bbsc_spectate_wipe_warped) {
             if (bbsc_spectate_host_back_ms == 0) {
@@ -9113,6 +9129,7 @@ void TickBbscSpectate() {
             to.y = target.y;
             to.z = target.z;
             to.heading = target.heading;
+            bbsc_spectate_load_generation = bbsc_load_generation.load();
             if (RequestBbscSessionWarp(GetGlobalState(), to, "wipe")) return;
             bbsc_spectate_wipe_warped = false;
             return; // retry; never fall back into a different map
@@ -10496,6 +10513,7 @@ void TickBbscSessionExit() {
             using Cleanup = void PS4_SYSV_ABI (*)(u64);
             reinterpret_cast<Cleanup>(image_base + WorldChrManRemoteCleanupOffset)(remote);
         }
+        ClearBbscBossContext("session ended at home");
         ReleaseBbscLeaveLocks("session ended at home");
         ReleaseBbscDeathLocks("session ended at home");
         bbsc_recover_session_cleanup = false;
@@ -15596,6 +15614,7 @@ void TickBbscLifeBroadcast() {
     if (dead != last_dead) {
         last_dead = dead;
         if (dead) {
+            bbsc_boss_at_own_death = BbscBossFightAtDeath();
             bbsc_revivals_at_own_death = bbsc_peer_revivals.load();
         }
         bbsc_own_dead = dead;
@@ -16455,6 +16474,23 @@ std::atomic<s32> bbsc_host_boss_id{-1};
 std::atomic<s64> bbsc_host_boss_ms{0};
 const char* BbscBossNameById(s32 id); // see "Discord status"
 
+void ClearBbscBossContext(std::string_view why) {
+    const bool had_bar = BossFightActive();
+    const u64 gauge = ReadValue<u64>(image_base + BossGaugePointerOffset, 0);
+    if (ReadablePointer(gauge, 0x1690)) {
+        // Native ClearBossGauge, the same HUD-only reset used by Failed_BossAreaMission.
+        // Never marks a boss defeated and never grants rewards.
+        using Clear = void PS4_SYSV_ABI (*)();
+        reinterpret_cast<Clear>(image_base + 0x01336D00)();
+    }
+    bbsc_boss_at_own_death = false;
+    bbsc_boss_bar_seen_ms = 0;
+    bbsc_boss_killed_ms = 0;
+    bbsc_host_boss_id = -1;
+    bbsc_host_boss_ms = 0;
+    LOG_INFO(Debug, "BBSC boss context: cleared ({}, had bar {})", why, had_bar);
+}
+
 // The name id on our own boss bar, or -1.
 s32 BbscGaugeBossId() {
     const u64 gauge = ReadValue<u64>(image_base + BossGaugePointerOffset, 0);
@@ -17067,12 +17103,17 @@ void TickBbscDeadWatchdog() {
     const s32 hp = ReadablePointer(player, 0x3B8) ? GetCharacterHp(player) : -1;
     // A held death during a boss fight is meant to stay dead until the boss is over.
     const bool spectating = bbsc_spectate_active && bbsc_death_mode == BbscDeathMode::Spectate;
-    if (!session_alive || hp > 0 || hp < 0 || spectating || BbscCurtainActive()) {
+    if (hp > 0 && !bbsc_spectate_active && !BbscCurtainActive()) {
+        bbsc_boss_at_own_death = false;
+    }
+    const bool loading = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
+    if (!session_alive || loading || hp > 0 || hp < 0 || spectating || BbscCurtainActive()) {
         bbsc_dead_since_ms = 0;
         return;
     }
     if (bbsc_dead_since_ms == 0) {
         bbsc_dead_since_ms = now;
+        bbsc_boss_at_own_death = BbscBossFightAtDeath();
         bbsc_death_text_raised = false;
         // Record the echoes now: a repeat death gets no death step to do it, and without a
         // snapshot the penalty below drops nothing.
@@ -17096,63 +17137,10 @@ void TickBbscDeadWatchdog() {
         return;
     }
     bbsc_dead_since_ms = 0;
-    if (repeat && BbscBossFightAtDeath() && LivingPartnerExists()) {
-        // Same rule as the death step: in a boss fight the dead player waits for the boss kill or
-        // for nobody to be left alive (TickBbscSpectate).
-        bbsc_spectate_name = "repeat death";
-        bbsc_spectate_since_ms = now;
-        bbsc_spectate_alone_since_ms = 0;
-        bbsc_boss_cleared_since_ms = 0;
-        bbsc_death_mode = BbscDeathMode::Spectate;
-        bbsc_spectate_active = true;
-        LOG_INFO(Debug, "BBSC death: repeat death in a boss fight (session state {}) -> spectate "
-                        "until the boss dies or nobody is alive",
-                 session_state);
-        BBSC_TIMELINE("DEATH", "death: repeat death in a boss fight (session state {}) -> spectate "
-                        "until the boss dies or nobody is alive",
-                 session_state);
-        return;
-    }
-    if (repeat) {
-        LOG_INFO(Debug,
-                 "BBSC death: repeat death in the same load (the game's death script only runs "
-                 "once per load), handled by BBSC after {} ms (session state {}, echoes {})",
-                 limit, session_state, bbsc_echoes_at_death);
-        BBSC_TIMELINE("DEATH", "death: repeat death in the same load (the game's death script only runs "
-                 "once per load), handled by BBSC after {} ms (session state {}, echoes {})",
-                 limit, session_state, bbsc_echoes_at_death);
-    } else {
-        LOG_WARNING(Debug,
-                    "BBSC death watchdog: dead for {} ms with no respawn (session state {}, "
-                    "spectate {}), reviving",
-                    limit, session_state, bbsc_spectate_active);
-    }
-    bbsc_spectate_active = false;
-    if (BbscDiedRightAfterRespawn("watchdog")) {
-        if (session_state == 6 && LivingPartnerExists()) {
-            // Guest: hand over to TickBbscSpectate's wipe path (full reload beside the host).
-            bbsc_spectate_name = "repeat death";
-            bbsc_spectate_since_ms = now;
-            bbsc_spectate_chr = GetLocalPlayerCharacter();
-            bbsc_spectate_alone_since_ms = 0;
-            bbsc_boss_cleared_since_ms = 0;
-            bbsc_spectate_saw_wipe = true;
-            bbsc_spectate_wipe_warped = false;
-            bbsc_spectate_host_back_ms = now - BbscWipeHostSettleMs;
-            bbsc_spectate_revivals_at_death = bbsc_peer_revivals.load();
-            bbsc_death_mode = BbscDeathMode::Spectate;
-            bbsc_spectate_active = true;
-            LOG_INFO(Debug, "BBSC death: guest reloads beside the host instead");
-            return;
-        }
-        BbscApplyDeathPenalty("watchdog");
-        RequestBbscDeathReload("watchdog: repeat death right after a respawn in place");
-        return;
-    }
-    BbscApplyDeathPenalty("watchdog");
-    if (!StartBbscDeathCurtain("watchdog") && !BbscRespawnInPlace("watchdog")) {
-        RequestBbscDeathReload("watchdog: respawn in place failed");
-    }
+    LOG_WARNING(Debug, "BBSC death watchdog: handing {} death to normal co-op rules after {} ms "
+                       "(state {}, boss at death {})",
+                repeat ? "repeat" : "delayed", limit, session_state, bbsc_boss_at_own_death);
+    BeginBbscCoopDeath(repeat ? "repeat death" : "watchdog", session_state);
 }
 
 // ---- Enemy scaling (like Elden Ring Seamless Co-op) ----------------------------------------------
@@ -20544,7 +20532,6 @@ std::deque<BbscCutscenePacket> bbsc_cutscene_queue;          // from the host, f
 // host's is not replayed when our own game played it. Safe for the fog events: 2002[03] does not
 // hold the event (12411802: the boss is enabled right after it, read with tools/gamedata/emevd.py).
 std::unordered_map<s32, u32> bbsc_cutscene_seen; // cutscene id -> load generation it played in
-std::atomic<u32> bbsc_load_generation{0};          // +1 at the end of every load (game tick)
 u8 bbsc_cutscene_skip = 0;
 
 bool BbscCutscenesEnabled() {

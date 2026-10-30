@@ -1,5 +1,11 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T9, 30 October: boss wipe regression confirmed in logs.** Client watchdog revived
+> in place at 01:07:12, before PartyGhostDeath_2 at 01:07:13; no full client reload.
+> Unified watchdog/native death state, latched boss-at-death, actual load-generation
+> check, HUD cleanup after reload/return home. See `docs/fixes/T9-boss-wipe.md`.
+> Build/deployment pending. Current saves and `forest-host` remain untouched.
+
 > **Запомненный сейв «в лесу» (30.10):** снимок **`forest-host`** на ПК,
 > `D:\Games\Bloodborne\coop-dev\saves\forest-host`.
 > Источник — `testHost`, активный слот **1 по BBSC**; хост в **Запретном лесу**,
