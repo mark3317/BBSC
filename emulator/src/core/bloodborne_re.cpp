@@ -4418,6 +4418,7 @@ s64 bbsc_boss_killed_ms = 0;
 // death step can arrive more than 15 seconds later; a time-limited bar cache is insufficient.
 bool bbsc_boss_at_own_death = false;
 std::atomic<u32> bbsc_load_generation{0}; // incremented after an actual load completes
+std::atomic<bool> bbsc_reload_finish_pending{false}; // native load callback; ticks may pause in loads
 u32 bbsc_spectate_load_generation = 0;
 void ClearBbscBossContext(std::string_view why);
 
@@ -10961,7 +10962,16 @@ void TickBbscLoadState() {
     const u64 global = GetGlobalState();
     if (!ReadablePointer(global, 0x10)) return;
     const bool loading = ReadValue<u8>(global, 0x08) != 0;
-    if (was_loading && !loading) ++bbsc_load_generation;
+    // The game tick can be suspended for the entire loading screen. ReloadFinish runs
+    // during character construction even then; consume it only once loading has ended.
+    if (!loading) {
+        const bool native_finish = bbsc_reload_finish_pending.exchange(false);
+        if (was_loading || native_finish) {
+            ++bbsc_load_generation;
+            LOG_INFO(Debug, "BBSC load: completed generation {} (native finish {})",
+                     bbsc_load_generation.load(), native_finish);
+        }
+    }
     was_loading = loading;
 }
 
@@ -20170,6 +20180,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         ApplySummonReloadStateAtDescriptor(*registers);
     }
     if (site.offset == 0x0178D9C0) {
+        bbsc_reload_finish_pending.store(true);
         bbsc_dream_type_conditions.fill(0);
         bbsc_dream_type_next = 0;
         bbsc_dream_type_logged.clear();

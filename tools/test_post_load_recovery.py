@@ -56,6 +56,7 @@ u8 bbsc_v8_saved_sign_extra=0;
 s64 bbsc_v8_death_ms=0, bbsc_v8_ready_since_ms=0;
 bool bbsc_v8_pending=false, bbsc_v8_original_swapped=false;
 std::atomic<u32> bbsc_load_generation{0};
+std::atomic<bool> bbsc_reload_finish_pending{false};
 bool bbsc_spectate_active=false, bbsc_spectate_releasing=false;
 std::atomic<bool> bbsc_recover_session_cleanup{false};
 void LogBbscSessionShape(std::string_view) {}
@@ -94,6 +95,26 @@ int main(int argc,char**argv) {
         global=0x200000; memory[global+8]=0; TickBbscLoadState();
         assert(bbsc_load_generation==1); TickBbscLoadState();
         assert(bbsc_load_generation==1); return 0;
+    }
+    if(test=="native_load_observer") {
+        // No game ticks during the load: the native callback is the only evidence.
+        bbsc_reload_finish_pending=true;
+        memory[global+8]=1; TickBbscLoadState(); assert(bbsc_load_generation==0);
+        memory[global+8]=0; TickBbscLoadState(); assert(bbsc_load_generation==1);
+        TickBbscLoadState(); assert(bbsc_load_generation==1);
+        bbsc_reload_finish_pending=true; TickBbscLoadState();
+        assert(bbsc_load_generation==2); TickBbscLoadState();
+        assert(bbsc_load_generation==2); return 0;
+    }
+    if(test=="native_wipe_alive" || test=="native_wipe_dead") {
+        bbsc_spectate_active=true;
+        hp=test=="native_wipe_alive" ? 100 : 0;
+        bbsc_reload_finish_pending=true; TickBbscLoadState();
+        assert(bbsc_load_generation==1);
+        tick(20);
+        assert(!bbsc_spectate_active && camera_off==1 && hp>0 && stopped==0);
+        assert(revived==(test=="native_wipe_dead" ? 1 : 0));
+        return 0;
     }
     if(test=="override") {
         ArmBbscReinsertV8(); assert(bbsc_v8_original_type==0);
@@ -143,7 +164,7 @@ with tempfile.TemporaryDirectory(prefix='bbsc-recovery-') as tmp:
     cpp=Path(tmp)/'fixture.cpp'; exe=Path(tmp)/'fixture.exe'
     cpp.write_text(prefix+functions+fixture,encoding='utf-8')
     subprocess.run([os.environ.get('CXX','g++'),'-std=c++20','-O0',str(cpp),'-o',str(exe)],check=True)
-    for scenario in ('load_observer','override','boss_without_load','home','home_pending','dead','healthy',
+    for scenario in ('load_observer','native_load_observer','native_wipe_alive','native_wipe_dead','override','boss_without_load','home','home_pending','dead','healthy',
                      'missing','failed_revive','host_missing','loading','joining','invader','title','lua_unavailable'):
         subprocess.run([str(exe),scenario],check=True,timeout=5)
         print(scenario+': PASS')
@@ -158,3 +179,6 @@ spectate=function('void TickBbscSpectate()')
 assert spectate.index('bbsc_load_generation.load() != bbsc_spectate_load_generation') < spectate.index('LivingPartnerExists()')
 assert 'else if (loaded)' not in spectate
 print('completed load has one recovery owner: PASS')
+
+assert 'bbsc_reload_finish_pending.store(true);' in SOURCE[SOURCE.index('if (site.offset == 0x0178D9C0) {'):][:250]
+print('native reload callback integration: PASS')

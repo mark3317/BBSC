@@ -25,7 +25,7 @@ def function(signature):
 
 # Every offset used by functional dispatch must be selected, regardless of research setting.
 dispatch = SOURCE.split("const auto& site = Sites[tag];", 1)[1].split(
-    "if (!BbscResearchEnabled() && !BbscEssentialDiagnosticSite", 1)[0]
+    "if (!BbscResearchEnabled() && (!capture_file || !BbscEssentialDiagnosticSite", 1)[0]
 policy = function("bool BbscFunctionalTraceSite(const TraceSite& site)")
 required = set(re.findall(r"site.offset == ([A-Za-z0-9_]+)", dispatch))
 selected = set(re.findall(r"site.offset == ([A-Za-z0-9_]+)", policy))
@@ -114,7 +114,7 @@ int main() {
     assert(BbscHideBanner(u"[BBSC:silent]"));
     assert(BbscHideBanner(u"?ActionEventInfo?"));
     assert(!BbscHideBanner(u"Player joined your game."));
-    assert(!BbscHideBanner(u"PvP включено."));
+    assert(!BbscHideBanner(u"PvP РІРєР»СЋС‡РµРЅРѕ."));
     assert(!BbscQuietMessage(200, 302000)); // item/menu name
     std::cout << "param reload/cache and notification policy: PASS\n";
 }
