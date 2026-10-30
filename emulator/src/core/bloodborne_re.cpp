@@ -19461,6 +19461,12 @@ bool BbscFunctionalTraceSite(const TraceSite& site) {
            site.offset == HealingFountainAvailabilityOffset || site.name.starts_with("BBSC.Remo.");
 }
 
+bool BbscEssentialDiagnosticSite(const TraceSite& site) {
+    // MatchingLeaveDecision was also reused for high-frequency item research probes.
+    return site.kind == TraceKind::EnginePanic || site.kind == TraceKind::LuaSessionEvent ||
+           (site.kind == TraceKind::MatchingLeaveDecision && !site.name.starts_with("BBSC.Items."));
+}
+
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
@@ -19656,8 +19662,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         BBSC_TIMELINE("CUTSCENE", "{}", line);
         OnBbscCutsceneRequestHook(site.offset, *registers);
     }
-    if (!BbscResearchEnabled() && site.kind != TraceKind::EnginePanic &&
-        site.kind != TraceKind::LuaSessionEvent && site.kind != TraceKind::MatchingLeaveDecision) {
+    if (!BbscResearchEnabled() && !BbscEssentialDiagnosticSite(site)) {
         return; // functional work above is complete; no routine memory dumps or file I/O
     }
     if (site.kind == TraceKind::LuaSessionEvent) {
@@ -21645,8 +21650,7 @@ void InstallReverseEngineeringTrace() {
     for (size_t index = 0; index < Sites.size(); ++index) {
         const auto& site = Sites[index];
         if (!BbscResearchEnabled() && !BbscFunctionalTraceSite(site) &&
-            site.kind != TraceKind::EnginePanic && site.kind != TraceKind::LuaSessionEvent &&
-            site.kind != TraceKind::MatchingLeaveDecision) {
+            !BbscEssentialDiagnosticSite(site)) {
             continue;
         }
         ++selected_count;

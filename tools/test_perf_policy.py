@@ -25,13 +25,27 @@ def function(signature):
 
 # Every offset used by functional dispatch must be selected, regardless of research setting.
 dispatch = SOURCE.split("const auto& site = Sites[tag];", 1)[1].split(
-    "if (!BbscResearchEnabled() && site.kind", 1)[0]
+    "if (!BbscResearchEnabled() && !BbscEssentialDiagnosticSite", 1)[0]
 policy = function("bool BbscFunctionalTraceSite(const TraceSite& site)")
 required = set(re.findall(r"site.offset == ([A-Za-z0-9_]+)", dispatch))
 selected = set(re.findall(r"site.offset == ([A-Za-z0-9_]+)", policy))
 assert required <= selected, required - selected
 assert 'site.name.starts_with("BBSC.Remo.")' in policy
 assert "TraceKind::ActionFlags" not in policy
+# Inventory probes reused the leave-decision enum; they must not survive the production filter.
+diagnostics = function("bool BbscEssentialDiagnosticSite(const TraceSite& site)")
+constants = dict(re.findall(r"constexpr u64 (\w+) = (0x[0-9A-Fa-f]+);", SOURCE))
+offsets = {int(constants.get(value, value), 16) for value in selected}
+sites = re.findall(r'\{"([^"]+)",\s*(\w+),\s*TraceKind::(\w+)',
+                   SOURCE.split("constexpr auto Sites =", 1)[1].split("});", 1)[0])
+assert '!site.name.starts_with("BBSC.Items.")' in diagnostics
+production = [(name, value, kind) for name, value, kind in sites
+              if int(constants.get(value, value), 16) in offsets or name.startswith("BBSC.Remo.")
+              or kind in ("EnginePanic", "LuaSessionEvent")
+              or (kind == "MatchingLeaveDecision" and not name.startswith("BBSC.Items."))]
+assert not any(name.startswith("BBSC.Items.") for name, _, _ in production)
+print(f"trace selection: {len(production)}/{len(sites)} ({len(sites)-len(production)} diagnostic hooks omitted)")
+
 
 prefix = r"""
 #include <algorithm>
