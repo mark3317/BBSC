@@ -1,6 +1,7 @@
 # HANDOFF — состояние работы и что дальше
 
-> **T11, 30 October: test regressions fixed in build 8373921, not deployed.**
+> **T11, 30 October: build 8373921 deployed/verified on PC + laptop; Research logs OFF.**
+> PC restored forest-host (testHost, slot 1); laptop save unchanged.
 > Host-first wipe spectator cleanup, resolved banner draw filter, native chest
 > availability and immediate native summon loading screen. See
 > [T11-test-regressions](fixes/T11-test-regressions.md). T10 test had Research logs

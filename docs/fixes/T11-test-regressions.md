@@ -52,3 +52,15 @@ DLL SHA256: 2497F38DEFC8C321552181343ACC5D0D29057BB58A0963558CEB20070A3964F6.
 No deployment or save modifications in this fix session. Gameplay confirmation
 pending: both wipe orders, closed/open chest and ordinary ground loot, Dream-to-
 field summon/cancellation, and connection/PvP banners without placeholders.
+
+## Deployment and forest restore (2026-10-30)
+
+User authorized deployment and forest restore. Build `8373921` installed on PC
+and laptop; SHA256 verified in override and active package on each. Research
+logging explicitly disabled with SHADPS4_BBSC_RESEARCH=0 in launcher extra_env
+and user environment on both machines (settings backed up before editing).
+PC testHost restored from forest-host (slot 1, Forbidden Woods, lamp 2702950):
+14 save files and bell-pending/item-ledger checked against snapshot.
+Pre-restore backup: D:/Games/Bloodborne/coop-dev/saves/before-t11-forest-20261030-111715
+plus native _auto-20261030-111715. Laptop save unchanged: no forest snapshot
+exists for the guest. Gameplay validation pending.
