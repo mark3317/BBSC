@@ -1,5 +1,14 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T14, 30 October: post-load/session recovery implemented, not deployed.**
+> Latest laptop log confirms dead guest after wipe load, then home state=0/own_world=1
+> with phantom type=1 (bell rejected player type). Cancel kept-death override before
+> teardown; reconcile local character/camera after completed loads independently of
+> remote creation; normalize phantom at home; dead/missing guests can return home.
+> No save changes. Regression fixtures pass. Build status below in
+> [T14-post-load-recovery](fixes/T14-post-load-recovery.md); gameplay confirmation pending.
+
+
 > **T13, 30 October: join failed because MSI Center exhausted PC UDP ports.**
 > User-authorized MSI Center restart freed 16,308 sockets; game STUN now reaches
 > VPS as twin:3658. Retest join. Laptop crash separately confirmed nvlddmkm TDR/

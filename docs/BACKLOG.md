@@ -1,5 +1,11 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
+> **30.10, T14:** повторный софтлок после одновременной смерти вне босса подтверждён:
+> клиент мёртв после load; после выхода домой остаётся phantom type=1.
+> Общая post-load recovery + отмена временного типа до выхода реализованы, автоматические
+> проверки проходят; игровой тест ещё нужен. См. [T14](fixes/T14-post-load-recovery.md).
+
+
 > **T11, 30 October: test regressions under repair, not deployed.**
 > Host-first wipe spectator cleanup, resolved banner draw filter, native chest
 > availability and immediate native summon loading screen. See

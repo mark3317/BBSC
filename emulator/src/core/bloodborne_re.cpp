@@ -3678,6 +3678,7 @@ u8 bbsc_v8_saved_sign_extra = 0;    // global+0x16F4
 s64 bbsc_v8_death_ms = 0;
 s64 bbsc_v8_ready_since_ms = 0;
 bool bbsc_v8_pending = false;
+s32 bbsc_v8_session_state = -1;
 
 bool ReadablePointer(u64 pointer, size_t size) {
     return pointer >= 0x10000 && HasMemoryAccess(pointer, size, MemoryProt::CpuRead);
@@ -3715,6 +3716,26 @@ bool SetOwnWorldRestoreType(s32 type, s32* previous) {
     return true;
 }
 
+// A kept-death override belongs to its session, never to the trip home. Cancel before
+// StageFlow creates the home character, including when the guest is still dead/missing.
+void CancelBbscReinsert(std::string_view why) {
+    if (!bbsc_v8_pending && !bbsc_v8_original_swapped) return;
+    if (bbsc_v8_original_swapped) {
+        SetOwnWorldRestoreType(bbsc_v8_original_type, nullptr);
+        bbsc_v8_original_swapped = false;
+    }
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    if (ReadablePointer(slots, 0x90) && ReadValue<s32>(slots, 0x8C) == bbsc_v8_saved_type &&
+        HasMemoryAccess(slots + 0x8C, 4, MemoryProt::CpuWrite)) {
+        WriteValue<s32>(slots, 0x8C, -1);
+    }
+    bbsc_v8_pending = false;
+    bbsc_v8_saved_type = -1;
+    bbsc_v8_saved_sign_type = 0;
+    bbsc_v8_saved_sign_extra = 0;
+    LOG_INFO(Debug, "BBSC reinsert: cancelled kept-death override ({})", why);
+}
+
 // Remembers the summon sign code while it is set (join), for the respawn after a kept death.
 void TrackBbscSignType() {
     const u64 global = GetGlobalState();
@@ -3745,7 +3766,7 @@ void ApplyPhantomCharacterFlags(u64 player) {
 // Called from the BBSC.Type.ReloadFinish hook (0x0178D9C0 entry, before ApplySummonType runs):
 // put back the summon sign type the death handlers cleared, so the respawn gets the phantom type.
 void RestoreBbscSignTypeBeforeReloadFinish() {
-    if (!bbsc_v8_pending || bbsc_v8_saved_type <= 0) {
+    if (!bbsc_v8_pending || bbsc_v8_saved_type <= 0 || GetSessionState() != 6) {
         return;
     }
     const u64 global = GetGlobalState();
@@ -3896,6 +3917,7 @@ void LogBbscSessionShape(std::string_view reason, bool check_characters = false)
 
 // At the kept death (guest, state 6): queue the current player type as the respawn override.
 void ArmBbscReinsertV8() {
+    if (bbsc_v8_pending) return; // never replace the saved home type with our temporary phantom type
     const s32 type = GetLocalPlayerType();
     const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
     bbsc_v8_saved_type = type;
@@ -3909,6 +3931,7 @@ void ArmBbscReinsertV8() {
     bbsc_v8_death_ms = SteadyNowMs();
     bbsc_v8_ready_since_ms = 0;
     bbsc_v8_pending = true;
+    bbsc_v8_session_state = GetSessionState();
     if (type > 0 && ReadablePointer(slots, 0x90) &&
         HasMemoryAccess(slots + 0x8C, 4, MemoryProt::CpuWrite)) {
         WriteValue<s32>(slots, 0x8C, type);
@@ -3932,13 +3955,13 @@ void TickBbscReinsertV8() {
     if (!bbsc_v8_pending) {
         return;
     }
+    if (GetSessionState() != bbsc_v8_session_state) {
+        CancelBbscReinsert("session changed before respawn");
+        return;
+    }
     const s64 now = SteadyNowMs();
     if (now - bbsc_v8_death_ms > BbscReinsertTimeoutMs) {
-        bbsc_v8_pending = false;
-        if (bbsc_v8_original_swapped) {
-            SetOwnWorldRestoreType(bbsc_v8_original_type, nullptr);
-            bbsc_v8_original_swapped = false;
-        }
+        CancelBbscReinsert("respawn timeout");
         LOG_WARNING(Debug, "BBSC reinsert v8: timed out waiting for the respawned player");
         LogBbscSessionShape("v8 timeout");
         return;
@@ -4377,8 +4400,6 @@ s64 bbsc_boss_killed_ms = 0;
 bool bbsc_boss_at_own_death = false;
 std::atomic<u32> bbsc_load_generation{0}; // incremented after an actual load completes
 u32 bbsc_spectate_load_generation = 0;
-u64 bbsc_spectate_character = 0;
-bool bbsc_spectate_saw_loading = false;
 void ClearBbscBossContext(std::string_view why);
 
 void NoteBbscBossBar() {
@@ -9021,8 +9042,6 @@ void BeginBbscCoopDeath(std::string_view name, s32 session_state) {
     bbsc_spectate_name = name;
     bbsc_spectate_since_ms = SteadyNowMs();
     bbsc_spectate_load_generation = bbsc_load_generation.load();
-    bbsc_spectate_character = GetLocalPlayerCharacter();
-    bbsc_spectate_saw_loading = false;
     bbsc_spectate_alone_since_ms = 0;
     bbsc_spectate_logged_wait = false;
     bbsc_spectate_saw_wipe = guest_waits_for_host;
@@ -9095,25 +9114,6 @@ void TickBbscSpectate() {
     const s64 now = SteadyNowMs();
     const s32 session_state = GetSessionState();
     const bool session_alive = session_state == 3 || session_state == 6;
-    const u64 current_global = GetGlobalState();
-    const bool global_ready = ReadablePointer(current_global, 0x1598);
-    const bool loading_now = global_ready && ReadValue<u8>(current_global, 0x08) != 0;
-    bbsc_spectate_saw_loading |= loading_now;
-    const u64 current_character = GetLocalPlayerCharacter();
-    const bool load_completed = bbsc_load_generation.load() != bbsc_spectate_load_generation ||
-                                bbsc_spectate_saw_loading ||
-                                (bbsc_spectate_character != 0 && current_character != bbsc_spectate_character);
-    if (global_ready && !loading_now && load_completed &&
-        ReadablePointer(current_character, 0x3B8) && GetCharacterHp(current_character) > 0) {
-        bbsc_spectate_active = false;
-        bbsc_spectate_releasing = false;
-        bbsc_spectate_saw_loading = false;
-        Bbsc::CinematicForceOff();
-        ClearBbscBossContext("living character after death load");
-        ReleaseBbscDeathLocks("living character after death load");
-        LOG_INFO(Debug, "BBSC spectate: completed death load, living local character - camera released");
-        return;
-    }
     std::string_view reason;
     if (session_state == 6 && !bbsc_spectate_saw_wipe &&
         bbsc_boss_killed_ms < bbsc_spectate_since_ms &&
@@ -9498,6 +9498,7 @@ void SendBbscSessionLeave() {
 }
 
 void SuspendBbscPersistence(std::string_view why) {
+    CancelBbscReinsert(why);
     bbsc_persistence_restore_at_ms = SteadyNowMs() + BbscQuitTeardownMs;
     Core::Bbsc::SetPersistentSessionPatches(false);
     LOG_INFO(Debug, "BBSC persistence suspended for {} ms ({})", BbscQuitTeardownMs, why);
@@ -10145,7 +10146,7 @@ void TickBbscKeptHome() {
     const s32 state = GetSessionState();
     const u64 global = GetGlobalState();
     if (state != 6 || image_base == 0 || !ReadablePointer(global, 0x1598)) {
-        was_in_host_world = false;
+        if (state == 0 || state == 3 || state == 4) was_in_host_world = false;
         home_since_ms = 0;
         return;
     }
@@ -10155,9 +10156,8 @@ void TickBbscKeptHome() {
         home_since_ms = 0;
         return;
     }
-    const u64 me = GetLocalPlayerCharacter();
-    if (!was_in_host_world || ReadValue<u8>(global, 0x08) != 0 || me == 0 ||
-        GetCharacterHp(me) <= 0 || IsInvaderType(GetLocalCharacterType())) {
+    if (!was_in_host_world || ReadValue<u8>(global, 0x08) != 0 ||
+        IsInvaderType(GetLocalCharacterType())) {
         home_since_ms = 0;
         return;
     }
@@ -10206,10 +10206,8 @@ void TickBbscStrandedGuest() {
     }
     last_ms = now;
     const u64 global = GetGlobalState();
-    const u64 me = GetLocalPlayerCharacter();
     const bool stranded = GetSessionState() == 0 && ReadablePointer(global, 0x1598) &&
-                          ReadValue<u8>(global, 0x1592) == 0 && ReadValue<u8>(global, 0x08) == 0 &&
-                          me != 0 && GetCharacterHp(me) > 0;
+                          ReadValue<u8>(global, 0x1592) == 0 && ReadValue<u8>(global, 0x08) == 0;
     if (!stranded) {
         since_ms = 0;
         return;
@@ -10485,6 +10483,134 @@ void InstallBbscQuitHook() {
     }
     LOG_INFO(Debug, "BBSC quit to title ends the session for both players (RegistReturnTitle {:#x})",
              RegistReturnTitleOffset);
+}
+
+// Shared load observation for death recovery and cutscene replay. An unavailable global
+// during teardown is not proof of completion; only the native loading flag returning to 0 is.
+void TickBbscLoadState() {
+    static bool was_loading = false;
+    const u64 global = GetGlobalState();
+    if (!ReadablePointer(global, 0x10)) return;
+    const bool loading = ReadValue<u8>(global, 0x08) != 0;
+    if (was_loading && !loading) ++bbsc_load_generation;
+    was_loading = loading;
+}
+
+bool BbscPhantomType(s32 type) {
+    return type == 1 || type == 2 || type == 12 || type == 13;
+}
+
+// Reconcile completed loads independently of remote-player creation/life packets. In particular,
+// a dead guest cannot wait for a living remote character: that character's insert can itself be
+// waiting for the local revive. Sample on the game thread, with no waits or network operations.
+void TickBbscPostLoadRecovery() {
+    static s64 last_ms = 0;
+    static s64 stable_ms = 0;
+    static u32 generation = 0;
+    static s32 previous_state = -1;
+    static bool previous_home = false;
+    static bool recover_death_load = false;
+    static int revive_attempts = 0;
+    static s64 last_revive_ms = 0;
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 250) return;
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    const u32 loaded = bbsc_load_generation.load();
+    if (loaded != generation) {
+        generation = loaded;
+        recover_death_load = bbsc_spectate_active || bbsc_v8_pending;
+        revive_attempts = 0;
+        last_revive_ms = 0;
+        stable_ms = 0;
+    }
+    if (!ReadablePointer(global, 0x1700) || ReadValue<u8>(global, 0x08) != 0 ||
+        !IsSprjLuaEventManReady()) {
+        stable_ms = 0;
+        return;
+    }
+    const u64 title_man = ReadValue<u64>(image_base + 0x0553B108, 0);
+    const u64 title_request = ReadablePointer(title_man, 0x18) ? ReadValue<u64>(title_man, 0x10) : 0;
+    if (ReadablePointer(title_request, 0x0C) && ReadValue<s32>(title_request, 8) == 2) {
+        recover_death_load = false;
+        stable_ms = 0;
+        return;
+    }
+    const s32 state = GetSessionState();
+    const bool home = ReadValue<u8>(global, 0x1592) != 0;
+    if (state != previous_state || home != previous_home) {
+        previous_state = state;
+        previous_home = home;
+        stable_ms = 0;
+    }
+    if (stable_ms == 0) stable_ms = now;
+    if (now - stable_ms < BbscReinsertSettleMs) return;
+
+    if (state == 0 && home) {
+        CancelBbscReinsert("post-load own world");
+        // Fallback for loads already built with the temporary type (including an older mod's
+        // save). These are the same two authorities written by the kept-death reinsert above.
+        const s32 slot_type = GetLocalPlayerType();
+        const s32 chr_type = GetLocalCharacterType();
+        if (BbscPhantomType(slot_type) || BbscPhantomType(chr_type)) {
+            const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+            const u64 local = ReadablePointer(slots, 0x90) ? ReadValue<u64>(slots, 8) : 0;
+            const u64 player = GetLocalPlayerCharacter();
+            if (!ReadablePointer(local, 0xA8) || !ReadablePointer(player, 0x80) ||
+                !HasMemoryAccess(local + 0xA4, 4, MemoryProt::CpuWrite) ||
+                !HasMemoryAccess(player + 0x78, 4, MemoryProt::CpuWrite) ||
+                !HasMemoryAccess(slots + 0x8C, 4, MemoryProt::CpuWrite)) return;
+            WriteValue<s32>(local, 0xA4, 0);
+            WriteValue<s32>(player, 0x78, 0);
+            WriteValue<s32>(slots, 0x8C, -1);
+            SetOwnWorldRestoreType(0, nullptr);
+            bbsc_recover_session_cleanup = true;
+            LOG_WARNING(Debug, "BBSC post-load: own world without session, phantom types {}/{} -> 0",
+                        slot_type, chr_type);
+        }
+        if (GetBbscLocalPlayerHp() > 0 &&
+            (bbsc_spectate_active || bbsc_spectate_releasing || recover_death_load)) {
+            bbsc_spectate_active = false;
+            bbsc_spectate_releasing = false;
+            Bbsc::CinematicForceOff();
+            bbsc_recover_session_cleanup = true;
+        }
+    }
+    if (!recover_death_load) return;
+    if (state != 3 && state != 6) {
+        recover_death_load = false; // normal home/solo death belongs to the native scripts
+        return;
+    }
+    if (state == 6 && (home || IsInvaderType(GetLocalCharacterType()))) return;
+    bool alive = GetBbscLocalPlayerHp() > 0;
+    if (!alive && revive_attempts < 2 && ReadablePointer(GetLocalPlayerCharacter(), 0x410) &&
+        (last_revive_ms == 0 || now - last_revive_ms >= 1'000)) {
+        last_revive_ms = now;
+        ++revive_attempts;
+        alive = BbscRespawnInPlace("completed co-op death load");
+    }
+    if (alive) {
+        recover_death_load = false;
+        bbsc_spectate_active = false;
+        bbsc_spectate_releasing = false;
+        Bbsc::CinematicForceOff();
+        ClearBbscBossContext("completed co-op death load");
+        ReleaseBbscDeathLocks("completed co-op death load");
+        EndBbscLoadCover("completed co-op death load");
+        LOG_INFO(Debug, "BBSC post-load: living local character, death camera and locks released");
+    } else if (state == 6 && now - stable_ms >= 15'000) {
+        // No usable local character: never leave a camera-only client in a kept session.
+        // Native leave followed by TickBbscStrandedGuest sends it home even with no character.
+        recover_death_load = false;
+        SuspendBbscPersistenceOnce("no usable guest character after completed death load");
+        const u64 manager = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
+        if (ReadablePointer(manager, 0x128)) {
+            using Stop = u8 PS4_SYSV_ABI (*)(u64);
+            reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(manager);
+        }
+        bbsc_recover_session_cleanup = true;
+        LOG_WARNING(Debug, "BBSC post-load: guest character recovery failed, returning home");
+    }
 }
 
 // Run engine cleanup only on the game thread, after confirmed departure / return home.
@@ -19534,6 +19660,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscPerfReport();
         bbsc_tick_map.store(GetCurrentPackedMap(), std::memory_order_release);
         { BBSC_PERF_NESTED("tick TickBbscTimelineContext"); TickBbscTimelineContext(); }
+        { BBSC_PERF_NESTED("tick TickBbscLoadState"); TickBbscLoadState(); }
         { BBSC_PERF_NESTED("tick TickBbscSessionExit"); TickBbscSessionExit(); }
         { BBSC_PERF_NESTED("tick TickBbscFrameRate"); TickBbscFrameRate(); }
         { BBSC_PERF_NESTED("tick TickBbscGateWatch"); TickBbscGateWatch(); }
@@ -19601,6 +19728,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             { BBSC_PERF_NESTED("tick TickBbscJoinTeleport"); TickBbscJoinTeleport(); }
         }
         { BBSC_PERF_NESTED("tick TickBbscGuestRejoin"); TickBbscGuestRejoin(); }
+        { BBSC_PERF_NESTED("tick TickBbscPostLoadRecovery"); TickBbscPostLoadRecovery(); }
         if (BbscRejoinEnabled()) {
             { BBSC_PERF_NESTED("tick TrackBbscSignType"); TrackBbscSignType(); }
             { BBSC_PERF_NESTED("tick TickBbscReinsertV8"); TickBbscReinsertV8(); }
@@ -20558,15 +20686,6 @@ void OnBbscKeyItemsPacket(const void* data, std::size_t size) {
 
 namespace {
 void TickBbscCutsceneReplay() {
-    {
-        static bool was_loading = false;
-        const u64 global = GetGlobalState();
-        const bool loading = ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) != 0;
-        if (was_loading && !loading) {
-            ++bbsc_load_generation; // a new load: its cutscenes may play again
-        }
-        was_loading = loading;
-    }
     BbscCutscenePacket packet{};
     {
         std::scoped_lock lock{bbsc_cutscene_mutex};
