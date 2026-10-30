@@ -1,11 +1,11 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
-> **T10, 30 October: performance/notification audit, build only (NO DEPLOY).**
+> **T10, 30 October: performance/notification audit, deployed to PC + laptop.**
 > Diagnostic-only hot hooks are opt-in; obsolete boss-banner transport removed;
 > reload-safe param slot cache, dead shop guard removed, personal-event policy
 > unified. Keep connection/departure and PvP notices. See
 > [T10-performance](fixes/T10-performance.md). `d101121`: mod build exit=0, zero warnings;
-> regression checks passed. Gameplay/FPS verification pending; NOT deployed.
+> regression checks passed. Deployed/verified on PC + laptop by user request; gameplay/FPS verification pending.
 
 T9 (30 October): confirmed host-first/client-last boss wipe bypass through the 15s
 watchdog. Fix `12984a9` built and deployed to both machines; gameplay confirmation pending. See [T9](fixes/T9-boss-wipe.md).

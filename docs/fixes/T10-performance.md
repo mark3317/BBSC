@@ -70,3 +70,12 @@ worker would race map loads, event processing, inventory and death transitions.
 Durable journals still flush synchronously at critical transitions; this patch does
 not weaken recovery guarantees to hide disk latency. Legacy optional Dream mode,
 NPC ownership guards and item recovery are not removed without proving redundancy.
+
+## Deployment authorized by user (2026-10-30)
+
+Build `d101121` deployed to PC and laptop with `coopdev.ps1 deploy-mod`.
+Both machines had no running game/launcher. Override and active BBSC package
+verified: DLL, launcher and mod.json match the build on both machines (12 files).
+DLL SHA256 remains F6CD7AC6ED0053884A07D948F4B303DF2252CB63F5AB34FC4DCC926D79ECB2AF.
+Previous binaries backed up as `*.bak-<timestamp>` beside each deployed file.
+Saves and server unchanged; gameplay/FPS verification still pending.
