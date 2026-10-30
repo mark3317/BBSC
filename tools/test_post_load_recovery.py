@@ -40,7 +40,7 @@ constexpr u64 PlayerSlotManagerPointerOffset=0x100, MatchingStatePointerOffset=0
 constexpr s64 BbscReinsertSettleMs=2500;
 u64 image_base=0x100000, global=0x200000, slots=0x300000, local=0x400000, player=0x500000;
 s32 state=6, hp=0; s64 clock_ms=1000;
-bool ready=true, revive_ok=true; int revived=0, stopped=0, suspended=0, camera_off=0;
+bool ready=true, revive_ok=true; int revived=0, stopped=0, suspended=0, camera_off=0, reloaded=0;
 u64 GetGlobalState() { return global; }
 s32 GetSessionState() { return state; }
 s64 SteadyNowMs() { return clock_ms; }
@@ -64,6 +64,7 @@ namespace Bbsc { void CinematicForceOff() { ++camera_off; } }
 void ClearBbscBossContext(std::string_view) {}
 void ReleaseBbscDeathLocks(std::string_view) {}
 void EndBbscLoadCover(std::string_view) {}
+void RequestBbscDeathReload(std::string_view) { ++reloaded; }
 u8 Stop(u64) { ++stopped; state=0; return 1; }
 u64 MultiPlayStopRequestOffset=reinterpret_cast<u64>(&Stop)-image_base;
 '''
@@ -114,12 +115,14 @@ int main(int argc,char**argv) {
     }
     if(test=="missing") { player=0; revive_ok=false; }
     if(test=="failed_revive") revive_ok=false;
+    if(test=="host_missing") { state=3; player=0; revive_ok=false; }
     if(test=="healthy") hp=100;
     tick(72);
     if(test=="loading" || test=="joining" || test=="invader" || test=="title" || test=="lua_unavailable") {
         assert(revived==0 && stopped==0 && camera_off==0);
-    } else if(test=="missing" || test=="failed_revive") {
-        assert(revived==(test=="missing" ? 0 : 2) && stopped==1 && suspended==1);
+    } else if(test=="missing" || test=="failed_revive" || test=="host_missing") {
+        assert(revived==((test=="missing" || test=="host_missing") ? 0 : 2) && stopped==1 && suspended==1);
+        assert(reloaded==(test=="host_missing" ? 1 : 0));
     } else {
         assert(hp>0 && !bbsc_spectate_active && camera_off==1 && stopped==0);
         assert(revived==(test=="healthy" ? 0 : 1));
@@ -133,7 +136,7 @@ with tempfile.TemporaryDirectory(prefix='bbsc-recovery-') as tmp:
     cpp.write_text(prefix+functions+fixture,encoding='utf-8')
     subprocess.run([os.environ.get('CXX','g++'),'-std=c++20','-O0',str(cpp),'-o',str(exe)],check=True)
     for scenario in ('override','boss_without_load','home','home_pending','dead','healthy',
-                     'missing','failed_revive','loading','joining','invader','title','lua_unavailable'):
+                     'missing','failed_revive','host_missing','loading','joining','invader','title','lua_unavailable'):
         subprocess.run([str(exe),scenario],check=True,timeout=5)
         print(scenario+': PASS')
 # Integration: no health veto on sending a stranded client home; cancellation precedes teardown.
@@ -142,3 +145,8 @@ assert 'GetCharacterHp' not in stranded
 suspend=function('void SuspendBbscPersistence(std::string_view why)')
 assert suspend.index('CancelBbscReinsert') < suspend.index('SetPersistentSessionPatches(false)')
 print('home return integration: PASS')
+
+spectate=function('void TickBbscSpectate()')
+assert spectate.index('bbsc_load_generation.load() != bbsc_spectate_load_generation') < spectate.index('LivingPartnerExists()')
+assert 'else if (loaded)' not in spectate
+print('completed load has one recovery owner: PASS')

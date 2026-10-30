@@ -9114,6 +9114,11 @@ void TickBbscSpectate() {
     const s64 now = SteadyNowMs();
     const s32 session_state = GetSessionState();
     const bool session_alive = session_state == 3 || session_state == 6;
+    if (session_alive && bbsc_load_generation.load() != bbsc_spectate_load_generation) {
+        // The completed load belongs to the common reconciler, including dead/missing locals.
+        // Do not race its settle/retry window with another warp or a partner-dependent revive.
+        return;
+    }
     std::string_view reason;
     if (session_state == 6 && !bbsc_spectate_saw_wipe &&
         bbsc_boss_killed_ms < bbsc_spectate_since_ms &&
@@ -9124,14 +9129,8 @@ void TickBbscSpectate() {
     }
     if (session_alive && LivingPartnerExists()) {
         std::string_view respawn_why;
-        const u64 global = GetGlobalState();
-        const bool loaded = bbsc_load_generation.load() != bbsc_spectate_load_generation &&
-                            ReadablePointer(global, 0x10) && ReadValue<u8>(global, 0x08) == 0;
         if (bbsc_death_mode == BbscDeathMode::RespawnNow) {
             respawn_why = "no boss fight";
-        } else if (loaded) {
-            ClearBbscBossContext("death load completed");
-            respawn_why = "a load ended the boss fight";
         } else if (session_state == 6 && bbsc_spectate_saw_wipe && !bbsc_spectate_wipe_warped) {
             if (bbsc_spectate_host_back_ms == 0) {
                 bbsc_spectate_host_back_ms = now;
@@ -10598,18 +10597,22 @@ void TickBbscPostLoadRecovery() {
         ReleaseBbscDeathLocks("completed co-op death load");
         EndBbscLoadCover("completed co-op death load");
         LOG_INFO(Debug, "BBSC post-load: living local character, death camera and locks released");
-    } else if (state == 6 && now - stable_ms >= 15'000) {
+    } else if (now - stable_ms >= 15'000) {
         // No usable local character: never leave a camera-only client in a kept session.
         // Native leave followed by TickBbscStrandedGuest sends it home even with no character.
         recover_death_load = false;
-        SuspendBbscPersistenceOnce("no usable guest character after completed death load");
+        SuspendBbscPersistenceOnce("no usable local character after completed death load");
         const u64 manager = ReadValue<u64>(image_base + MatchingStatePointerOffset, 0);
         if (ReadablePointer(manager, 0x128)) {
             using Stop = u8 PS4_SYSV_ABI (*)(u64);
             reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(manager);
         }
+        bbsc_spectate_active = false;
+        bbsc_spectate_releasing = false;
+        Bbsc::CinematicForceOff();
+        if (state == 3) RequestBbscDeathReload("host character recovery failed after load");
         bbsc_recover_session_cleanup = true;
-        LOG_WARNING(Debug, "BBSC post-load: guest character recovery failed, returning home");
+        LOG_WARNING(Debug, "BBSC post-load: character recovery failed (state {}), ending co-op", state);
     }
 }
 
