@@ -21567,20 +21567,22 @@ bool ConfigureBbscSummonPolling() {
     const u64 manager = ReadValue<u64>(image_base + 0x05540288, 0);
     if (!ReadablePointer(manager, 0x20)) return false;
     const u64 info = ReadValue<u64>(manager, 0x18);
-    if (!ReadablePointer(info, 0x8A4) ||
-        !HasMemoryAccess(info + 0x89C, 8, MemoryProt::CpuWrite)) return false;
+    if (!ReadablePointer(info, 0x8A8) ||
+        !HasMemoryAccess(info + 0x89C, 12, MemoryProt::CpuWrite)) return false;
     const u32 create = ReadValue<u32>(info, 0x89C);
     const u32 search = ReadValue<u32>(info, 0x8A0);
-    if (create > 9999 || search > 9999) return false;
+    const u32 guard = ReadValue<u32>(info, 0x8A4);
+    if (create > 9999 || search > 9999 || guard > 9999) return false;
     const u64 network = ReadValue<u64>(image_base + SummonManagerRootPointerOffset, 0);
     const u64 broker = ReadablePointer(network, 0xC58) ? ReadValue<u64>(network, 0xC50) : 0;
     if (!ReadablePointer(broker, 0x194)) return false;
     // ss.info completion also caches the create interval here (01E89AAD).
     const bool ok = WriteValue<u32>(info, 0x89C, 2) && WriteValue<u32>(info, 0x8A0, 2) &&
+                    WriteValue<u32>(info, 0x8A4, 2) &&
                     WriteValue<float>(broker, 0x190, 2.0f);
-    if (ok && (create != 2 || search != 2)) {
-        LOG_INFO(Debug, "BBSC matchmaking: native sign/search intervals {} / {} -> 2 seconds", create, search);
-        BBSC_TIMELINE("JOIN", "matchmaking: native sign/search intervals {} / {} -> 2 seconds", create, search);
+    if (ok && (create != 2 || search != 2 || guard != 2)) {
+        LOG_INFO(Debug, "BBSC matchmaking: native sign/search/guard intervals {} / {} / {} -> 2 seconds", create, search, guard);
+        BBSC_TIMELINE("JOIN", "matchmaking: native sign/search/guard intervals {} / {} / {} -> 2 seconds", create, search, guard);
     }
     return ok;
 }
