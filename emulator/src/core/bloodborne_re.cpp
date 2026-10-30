@@ -9079,6 +9079,8 @@ void ReleaseBbscGuestRespawnPoint(std::string_view why); // see TickBbscRespawnP
 
 // Game-thread tick: release the held death once nobody is left alive, the session is over, or the
 // safety limit is reached.
+void ReleaseBbscDeathLocks(std::string_view why);
+
 void TickBbscSpectate() {
     NoteBbscBossBar();
     RestoreBbscOwnWorldSnapshot();
@@ -16510,7 +16512,6 @@ void TickBbscRejoinLines() {
 // once made the guest's respawn notice read "?ActionEventInfo?" (screenshots 2026-09-28).
 constexpr s64 BbscNoticeHoldMs = 10'000;
 u64 bbsc_notice_slot = 0;
-bool bbsc_banner_own_pending = false; // a BBSC notice is queued (the join banner filter lets it be)
 u64 bbsc_notice_original = 0;
 s64 bbsc_notice_until_ms = 0;
 
@@ -16560,7 +16561,6 @@ void BbscAnnounce(const char16_t* text, std::string_view what) {
     using SummonedLine = void PS4_SYSV_ABI (*)(u64 unused, u64 unused2, const void* args);
     reinterpret_cast<SummonedLine>(image_base + SummonedLineOffset)(0, 0, args.data());
     WriteBbscRoleColumn(RoleGuestLine, &column, 0);
-    bbsc_banner_own_pending = true; // BBSC's own: never hidden by the join filter
     LOG_INFO(Debug, "BBSC notice shown: {}", what);
 }
 
@@ -16612,7 +16612,6 @@ void PS4_SYSV_ABI BbscBannerMenuHook(u64, const GuestRegisterSnapshot* registers
         WriteValue<float>(registers->r15, 0xB30, 0.0f);
         LOG_INFO(Debug, "BBSC banner: suppressed at resolved text draw ({} UTF-16 units)", text.size());
     }
-    bbsc_banner_own_pending = false;
 }
 
 void InstallBbscBannerHook() {
