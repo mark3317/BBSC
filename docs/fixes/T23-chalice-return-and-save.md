@@ -46,6 +46,7 @@ requested map, loading/own-world/1521/15A3 и состояния task+140/+148.
   из **собственного снимка ноутбука** `chalice-test-20261030` (21:36 МСК).
   Проверены SHA256 всех 14 файлов — PASS. Own-world/bell-pending восстановлены
   из того же снимка; предыдущие live журналы дополнительно сохранены в backup.
+  Также восстановлены `SPRJ0005.sce_sys/icon0.png` и `param.bin`, 2 SHA256 PASS.
 - `restore-result.json` лежит в backup; script `coop-dev/t23-restore-laptop.ps1`
   предварительно проверяет отсутствие игры, равенство текущих файлов backup и
   совпадение набора имён. Удаления save files/слотов не выполнялись.
@@ -60,5 +61,16 @@ PASS: test_native_leave_release (активные/входящие states не �
 4000 вызовов state 7 снимают патчи один раз, повторный выход работает),
 test_chalice_scope, test_post_load_recovery, test_follow_arrival,
 test_perf_policy, test_pending_work, test_matchmaking_native.
-Сборка и установка фиксируются после выполнения. Игровое исправление загрузки
-пока не подтверждено.
+Source `e8994b1`, build-mod-bbport exit=0. Мод установлен на закрытые ПК/ноут
+(override + активный пакет), 12 SHA256 PASS; порт T22 и настройки не заменялись.
+
+| Файл | SHA256 |
+|---|---|
+| bbsc.dll | `2470A8349648BBDCAB83848E043290116C8CABEAC96B11A7ABA0E000795F3178` |
+| bbsc-launch.exe | `1146B56BA77F4E3B2F514F55D3C384C4F6B1693F56E1AD5447B275B40C25D10D` |
+| mod.json | `225AA89F630F694DA3CD7D9041A702A022D3E179A585AA36486A54FD34CD4909` |
+
+Готовая копия в `build/t23-ready/` с manifest и build log. Игровое исправление
+загрузки пока не подтверждено. Следующий контроль: ноут входит в собственный
+восстановленный слот; хост выходит из чаши в Сон сначала один, затем с гостем.
+При повторном зависании оставить процесс для чтения task/barrier состояния.
