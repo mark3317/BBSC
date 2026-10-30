@@ -1,5 +1,11 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T17 implementation ready for build:** first event-driven reward/drop/cutscene/departure
+> notifications, numeric scaling/cache and research-only diagnostic scans. Automated
+> concurrency, scaling and existing recovery/follow checks PASS. User authorized
+> build/deployment to PC + laptop. See [T17](fixes/T17-event-work.md).
+
+
 > **T16 deployed PC + laptop**: consume host arrival after sharing map, preventing repeated
 > follow loads on Cathedral Ward border. Code c75b1d6, tests PASS, build exit=0.
 > Host crash confirmed Windows GPU TDR 141/nvlddmkm Blackwell, not fixed by this patch.

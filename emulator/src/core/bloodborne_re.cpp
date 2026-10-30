@@ -57,6 +57,24 @@
 namespace Core::Bloodborne {
 namespace {
 
+// Producers publish after enqueueing under the queue's mutex. The game thread takes one
+// combined wake mask per frame; a concurrent publication survives for the next frame.
+// This avoids locking empty reward/drop/cutscene/departure queues on every game update.
+enum class BbscWork : u32 { BossReward = 1, GuestDrop = 2, Cutscene = 4, PeerLeft = 8 };
+std::atomic<u32> bbsc_pending_work{0};
+
+void QueueBbscWork(BbscWork work) {
+    bbsc_pending_work.fetch_or(static_cast<u32>(work), std::memory_order_release);
+}
+
+u32 TakeBbscWork() {
+    return bbsc_pending_work.exchange(0, std::memory_order_acq_rel);
+}
+
+bool HasBbscWork(u32 pending, BbscWork work) {
+    return (pending & static_cast<u32>(work)) != 0;
+}
+
 // ---- BBSC perf (2026-10-29, docs/fixes/PERF.md) --------------------------------------------------
 // T4: the guest's frame rate fell to 17 in co-op. A light profiler instead of guesses: every game
 // tick function, every trace site and the hooks on hot game functions add their time here
@@ -8495,6 +8513,7 @@ std::vector<BbscStateRegion> CollectBbscStateRegions() {
 }
 
 void TickBbscStateDiff() {
+    if (!BbscResearchEnabled()) return;
     static s64 last_baseline_ms = 0;
     static std::vector<std::pair<std::string, std::vector<u8>>> baseline;
     const s64 now = SteadyNowMs();
@@ -10613,10 +10632,13 @@ void TickBbscPostLoadRecovery() {
 }
 
 // Run engine cleanup only on the game thread, after confirmed departure / return home.
-void TickBbscSessionExit() {
+void TickBbscSessionExit(bool peer_work) {
     const s32 state = GetSessionState();
     const u64 global = GetGlobalState();
-    if (image_base == 0 || !ReadablePointer(global, 0x1700)) return;
+    if (image_base == 0 || !ReadablePointer(global, 0x1700)) {
+        if (peer_work) QueueBbscWork(BbscWork::PeerLeft); // retry when global state is ready
+        return;
+    }
     const u64 title_man = ReadValue<u64>(image_base + 0x0553B108, 0);
     const u64 title_request = ReadablePointer(title_man, 0x18) ? ReadValue<u64>(title_man, 0x10) : 0;
     const bool returning_title = ReadablePointer(title_request, 0x0C) &&
@@ -10634,7 +10656,7 @@ void TickBbscSessionExit() {
         LOG_INFO(Debug, "BBSC quit: journals flushed, peers notified; stopping before title load");
     }
     std::map<u32, bool> left;
-    {
+    if (peer_work) {
         std::scoped_lock lock{bbsc_peer_left_mutex};
         left.swap(bbsc_peer_left_pending);
     }
@@ -11377,6 +11399,7 @@ void NoteBbscBossRewardEvent(s64 event) {
     if (std::ranges::find(bbsc_boss_reward_given, event) == bbsc_boss_reward_given.end() &&
         std::ranges::find(bbsc_boss_reward_queue, event) == bbsc_boss_reward_queue.end()) {
         bbsc_boss_reward_queue.push_back(event);
+        QueueBbscWork(BbscWork::BossReward);
         LOG_INFO(Debug, "BBSC boss drop: event {} reached its player-type wait on the guest - "
                         "reward queued",
                  event);
@@ -11525,6 +11548,7 @@ void TickBbscBossRewards() {
 // bbsc_patch_tables.h): [SprjSessionManager]+0x188 is a list head, each node +0x10 -> queue, +0x30
 // its packet count; +0x1B0 one more count. Logged while it grows past 100 (at most every 30 s).
 void TickBbscSendBacklog() {
+    if (!BbscResearchEnabled()) return;
     static s64 last_ms = 0;
     static s64 logged_ms = 0;
     static s32 logged_total = 0;
@@ -11601,6 +11625,7 @@ void NoteBbscGuestEnemyDeath(u64 dead) {
         const s32 lot = ReadValue<s32>(row, 0x2C + i * 4);
         if (lot > 0 && bbsc_guest_drop_queue.size() < 64) {
             bbsc_guest_drop_queue.emplace_back(lot, ReadValue<u32>(row, 0x08));
+            QueueBbscWork(BbscWork::GuestDrop);
         }
     }
 }
@@ -15535,6 +15560,7 @@ std::atomic<u64> bbsc_pickup_action_runs{0};
 // the item manager holds, how many are pickable (+0x48 bit 0x40), the nearest one (position
 // +0x30/+0x34/+0x38) and whether the pickup action ran at all.
 void TickBbscItemSurvey() {
+    if (!BbscResearchEnabled()) return;
     static s64 last_ms = 0;
     static std::string last_line;
     const s64 now = SteadyNowMs();
@@ -16158,6 +16184,7 @@ void TickBbscRespawnPointWatch() {
 }
 
 void TickBbscGateWatch() {
+    if (!BbscResearchEnabled()) return;
     static size_t next_point = 0;
     static s64 watched_since_ms = 0;
     static s64 guest_since_ms = 0;
@@ -17076,7 +17103,6 @@ std::atomic<BbscScaleState> bbsc_scale_state{BbscScaleState::Idle};
 std::vector<u64> bbsc_scale_rows_enemy; // SpEffect 7502 rows (every table copy found)
 std::vector<u64> bbsc_scale_rows_boss;  // SpEffect 7503 rows
 std::vector<BbscScaledNpc> bbsc_scaled_npcs;
-std::string bbsc_scale_written;
 
 bool BbscScalingEnabled() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_SCALING");
@@ -17104,6 +17130,31 @@ struct BbscScaleNumbers {
 std::mutex bbsc_scale_host_mutex;
 BbscScaleNumbers bbsc_scale_host;
 s64 bbsc_scale_host_ms = 0;
+std::atomic<u64> bbsc_scale_host_revision{0};
+
+struct BbscAppliedScale {
+    BbscScaleNumbers numbers;
+    int guests;
+    bool operator==(const BbscAppliedScale&) const = default;
+};
+std::optional<BbscAppliedScale> bbsc_scale_written;
+
+// Game-thread cache: network updates publish a revision, so unchanged frames do not
+// lock the host packet mutex. Keep the original 15 s expiry, including heartbeats.
+const BbscScaleNumbers& BbscCachedHostScale(s64& received_ms) {
+    static u64 seen_revision = 0;
+    static BbscScaleNumbers cached;
+    static s64 cached_ms = 0;
+    const u64 revision = bbsc_scale_host_revision.load(std::memory_order_acquire);
+    if (revision != seen_revision) {
+        std::scoped_lock lock{bbsc_scale_host_mutex};
+        cached = bbsc_scale_host;
+        cached_ms = bbsc_scale_host_ms;
+        seen_revision = revision;
+    }
+    received_ms = cached_ms;
+    return cached;
+}
 
 const BbscScaleNumbers& BbscOwnScaleNumbers() {
     static const BbscScaleNumbers own{{BbscScalePercent("BBSC_SCALE_ENEMY_HP", 40),
@@ -17347,9 +17398,10 @@ void TickBbscScaling() {
     BbscScaleNumbers numbers = BbscOwnScaleNumbers();
     bool from_host = false;
     if (GetSessionState() == 6) {
-        std::scoped_lock lock{bbsc_scale_host_mutex};
-        if (bbsc_scale_host_ms != 0 && SteadyNowMs() - bbsc_scale_host_ms < BbscScaleFreshMs) {
-            numbers = bbsc_scale_host;
+        s64 received_ms = 0;
+        const BbscScaleNumbers& host = BbscCachedHostScale(received_ms);
+        if (received_ms != 0 && SteadyNowMs() - received_ms < BbscScaleFreshMs) {
+            numbers = host;
             from_host = true;
         }
     }
@@ -17358,11 +17410,9 @@ void TickBbscScaling() {
     const int damage = numbers.percent[2];
     const int enemy_stagger = numbers.percent[3];
     const int boss_stagger = numbers.percent[4];
-    const s32 guests = GetBbscGuestCount();
     const int extra = GetBbscScalingGuests();
-    const std::string key = fmt::format("{} {} {} {} {} {}", extra, enemy_hp, boss_hp, damage,
-                                        enemy_stagger, boss_stagger);
-    if (key == bbsc_scale_written) {
+    const BbscAppliedScale key{numbers, extra};
+    if (bbsc_scale_written && key == *bbsc_scale_written) {
         return;
     }
     const auto rate = [extra](int percent) {
@@ -17385,6 +17435,7 @@ void TickBbscScaling() {
         WriteValue(npc.row, 280, static_cast<s16>(std::min(armor, 32767.0F)));
     }
     bbsc_scale_written = key;
+    const s32 guests = GetBbscGuestCount(); // only needed for the change log
     LOG_INFO(Debug,
              "BBSC scaling: {} guest(s) (game count {}, members {}) -> enemies HP x{:.2f}, bosses HP "
              "x{:.2f}, damage x{:.2f}, stagger +{}% / +{}% (bosses) - {} settings",
@@ -19659,12 +19710,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     }
     if (site.offset == BbscGameTickOffset) {
         TickBbscPerfReport();
+        const u32 pending_work = TakeBbscWork();
         bbsc_tick_map.store(GetCurrentPackedMap(), std::memory_order_release);
         { BBSC_PERF_NESTED("tick TickBbscTimelineContext"); TickBbscTimelineContext(); }
         { BBSC_PERF_NESTED("tick TickBbscLoadState"); TickBbscLoadState(); }
-        { BBSC_PERF_NESTED("tick TickBbscSessionExit"); TickBbscSessionExit(); }
+        { BBSC_PERF_NESTED("tick TickBbscSessionExit"); TickBbscSessionExit(HasBbscWork(pending_work, BbscWork::PeerLeft)); }
         { BBSC_PERF_NESTED("tick TickBbscFrameRate"); TickBbscFrameRate(); }
-        { BBSC_PERF_NESTED("tick TickBbscGateWatch"); TickBbscGateWatch(); }
+        if (BbscResearchEnabled()) { BBSC_PERF_NESTED("tick TickBbscGateWatch"); TickBbscGateWatch(); }
         { BBSC_PERF_NESTED("tick TickBbscTransitionIdle"); TickBbscTransitionIdle(); }
         { BBSC_PERF_NESTED("tick TickBbscCoopCountFix"); TickBbscCoopCountFix(); }
         { BBSC_PERF_NESTED("tick TickBbscGuestTypeWatch"); TickBbscGuestTypeWatch(); }
@@ -19673,14 +19725,20 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         { BBSC_PERF_NESTED("tick TickBbscHostTime"); TickBbscHostTime(); }
         { BBSC_PERF_NESTED("tick TickBbscHomeSpot"); TickBbscHomeSpot(); }
         { BBSC_PERF_NESTED("tick TickBbscRelayHostLock"); TickBbscRelayHostLock(); }
-        { BBSC_PERF_NESTED("tick TickBbscBossRewards"); TickBbscBossRewards(); }
-        { BBSC_PERF_NESTED("tick TickBbscGuestDrops"); TickBbscGuestDrops(); }
-        { BBSC_PERF_NESTED("tick TickBbscSendBacklog"); TickBbscSendBacklog(); }
+        if (HasBbscWork(pending_work, BbscWork::BossReward)) {
+            { BBSC_PERF_NESTED("tick TickBbscBossRewards"); TickBbscBossRewards(); }
+        }
+        if (HasBbscWork(pending_work, BbscWork::GuestDrop)) {
+            { BBSC_PERF_NESTED("tick TickBbscGuestDrops"); TickBbscGuestDrops(); }
+        }
+        if (BbscResearchEnabled()) { BBSC_PERF_NESTED("tick TickBbscSendBacklog"); TickBbscSendBacklog(); }
         { BBSC_PERF_NESTED("tick TickBbscLeaveLocks"); TickBbscLeaveLocks(); }
         { BBSC_PERF_NESTED("tick TickBbscStuckLeaveLocks"); TickBbscStuckLeaveLocks(); }
         { BBSC_PERF_NESTED("tick TickBbscStrandedGuest"); TickBbscStrandedGuest(); }
         { BBSC_PERF_NESTED("tick TickBbscKeptHome"); TickBbscKeptHome(); }
-        { BBSC_PERF_NESTED("tick TickBbscCutsceneReplay"); TickBbscCutsceneReplay(); }
+        if (HasBbscWork(pending_work, BbscWork::Cutscene)) {
+            { BBSC_PERF_NESTED("tick TickBbscCutsceneReplay"); TickBbscCutsceneReplay(); }
+        }
         { BBSC_PERF_NESTED("tick TickBbscSharedKeyItems"); TickBbscSharedKeyItems(); }
         { BBSC_PERF_NESTED("tick TickBbscNpcOwnQuests"); TickBbscNpcOwnQuests(); }
         { BBSC_PERF_NESTED("tick TickBbscProgressBroadcast"); TickBbscProgressBroadcast(); }
@@ -19697,7 +19755,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         { BBSC_PERF_NESTED("tick TickBbscMessages"); TickBbscMessages(); }
         { BBSC_PERF_NESTED("tick TickBbscRejoinLines"); TickBbscRejoinLines(); }
         { BBSC_PERF_NESTED("tick TickBbscDream"); TickBbscDream(); }
-        { BBSC_PERF_NESTED("tick TickBbscItemSurvey"); TickBbscItemSurvey(); }
+        if (BbscResearchEnabled()) { BBSC_PERF_NESTED("tick TickBbscItemSurvey"); TickBbscItemSurvey(); }
         { BBSC_PERF_NESTED("tick TickBbscGuestItemsPickable"); TickBbscGuestItemsPickable(); }
         { BBSC_PERF_NESTED("tick TickBbscUnstuckKey"); TickBbscUnstuckKey(); }
         { BBSC_PERF_NESTED("tick TickBbscLifeBroadcast"); TickBbscLifeBroadcast(); }
@@ -19725,7 +19783,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         if (BbscSpectateEnabled()) {
             { BBSC_PERF_NESTED("tick TickBbscRemoteRevive"); TickBbscRemoteRevive(); }
             { BBSC_PERF_NESTED("tick TickBbscDeathLockClear"); TickBbscDeathLockClear(); }
-            { BBSC_PERF_NESTED("tick TickBbscStateDiff"); TickBbscStateDiff(); }
+            if (BbscResearchEnabled()) { BBSC_PERF_NESTED("tick TickBbscStateDiff"); TickBbscStateDiff(); }
             { BBSC_PERF_NESTED("tick TickBbscJoinTeleport"); TickBbscJoinTeleport(); }
         }
         { BBSC_PERF_NESTED("tick TickBbscGuestRejoin"); TickBbscGuestRejoin(); }
@@ -19735,7 +19793,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             { BBSC_PERF_NESTED("tick TickBbscReinsertV8"); TickBbscReinsertV8(); }
             { BBSC_PERF_NESTED("tick TickBbscSelfHeal"); TickBbscSelfHeal(); }
             static s64 last_shape_ms = 0;
-            if (const s64 now = SteadyNowMs(); now - last_shape_ms > 1'000) {
+            if (const s64 now = SteadyNowMs(); BbscResearchEnabled() && now - last_shape_ms > 1'000) {
                 last_shape_ms = now;
                 LogBbscSessionShape("tick");
             }
@@ -20547,6 +20605,7 @@ void OnBbscCutscenePacket(const void* data, std::size_t size) {
     last_sequence = packet.sequence;
     if (bbsc_cutscene_queue.size() < 8) {
         bbsc_cutscene_queue.push_back(packet);
+        QueueBbscWork(BbscWork::Cutscene);
     }
 }
 
@@ -20607,7 +20666,7 @@ void TickBbscSharedKeyItems() {
         // triggers in our table, logged on every change, next to the SetFlag research lines.
         static std::array<s8, BbscGuestGiftTriggerFlags.size()> watched{};
         static s64 watched_ms = 0;
-        if (SteadyNowMs() - watched_ms >= 250) {
+        if (BbscResearchEnabled() && SteadyNowMs() - watched_ms >= 250) {
             watched_ms = SteadyNowMs();
             for (size_t i = 0; i < BbscGuestGiftTriggerFlags.size(); ++i) {
                 const s8 on = BbscEventFlag(BbscGuestGiftTriggerFlags[i]) ? 1 : 0;
@@ -20695,6 +20754,9 @@ void TickBbscCutsceneReplay() {
         }
         packet = bbsc_cutscene_queue.front();
         bbsc_cutscene_queue.pop_front();
+        if (!bbsc_cutscene_queue.empty()) {
+            QueueBbscWork(BbscWork::Cutscene); // preserve one replay per game frame
+        }
     }
     const s32 state = GetSessionState();
     const u32 map = GetCurrentPackedMap();
@@ -20824,6 +20886,7 @@ void OnBbscPeerLeft(std::uint32_t player, bool host) {
     }
     std::scoped_lock lock{bbsc_peer_left_mutex};
     bbsc_peer_left_pending[player] = host;
+    QueueBbscWork(BbscWork::PeerLeft);
 }
 
 void OnBbscScalePacket(const std::uint16_t (&percent)[5]) {
@@ -20837,6 +20900,7 @@ void OnBbscScalePacket(const std::uint16_t (&percent)[5]) {
         changed = bbsc_scale_host_ms == 0 || !(bbsc_scale_host == numbers);
         bbsc_scale_host = numbers;
         bbsc_scale_host_ms = SteadyNowMs();
+        bbsc_scale_host_revision.fetch_add(1, std::memory_order_release);
     }
     if (changed) {
         LOG_INFO(Debug,

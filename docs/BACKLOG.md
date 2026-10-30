@@ -1,5 +1,11 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
+> **T17 implementation ready for build:** first event-driven reward/drop/cutscene/departure
+> notifications, numeric scaling/cache and research-only diagnostic scans. Automated
+> concurrency, scaling and existing recovery/follow checks PASS. User authorized
+> build/deployment to PC + laptop. See [T17](fixes/T17-event-work.md).
+
+
 > **30.10, T14:** повторный софтлок после одновременной смерти вне босса подтверждён:
 > клиент мёртв после load; после выхода домой остаётся phantom type=1.
 > Общая post-load recovery + отмена временного типа до выхода реализованы, автоматические
