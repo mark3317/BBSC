@@ -101,3 +101,22 @@ Next optimization candidates from frequent top entries: NpcPass/DreamTypeCheck
 hooks, ScaledMaxHp and game-tick memory access. Nested timings are not additive;
 rare transition spikes are not steady-state cost. No code/build/deploy changes
 were made during this investigation.
+
+## Control with both DLSS features OFF — 16:35–16:36 Moscow
+
+User reports crash on first travel to Hunter's Dream. PC ini mtime 16:35:24,
+process 43796 starts 16:35:36: upscaler=off AND frame_gen=off confirmed and copied.
+The game initially loads Cathedral Ward, session state 0/solo at 16:36:09, then
+OwnWorldStep/SkippedCleanup at 16:36:22.548–.564; no completed Dream arrival is
+logged. Windows again records nvlddmkm 153 at 16:36:22 and 16:36:26, WER
+LiveKernelEvent 141 at 16:36:33, report facbbd68-2f57-4d89-911c-8e325810f370,
+WATCHDOG-20261030-1636.dmp referenced. Captured separately in run
+`20261030-163400-no-dlss` (PC logs and Windows events).
+
+This reproduces the GPU TDR with both DLSS features disabled and no active co-op
+session. Neither feature nor an active peer is a necessary condition. BBSC is
+still injected in this run; solo is not a no-mod control. Next discriminating
+control is the same port/config/character in launcher Offline mode without BBSC,
+then travel to Dream and return/title transitions. Do not attribute the fault to
+GPU hardware, NVIDIA alone or a particular BBSC hook from timing correlation.
+No settings, saves, binaries or driver changed during collection.
