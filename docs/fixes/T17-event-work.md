@@ -161,3 +161,23 @@ user_dir (including its caches) unchanged. Games/launchers stopped during swap.
 Manifests/result in D:/Games/Bloodborne/coop-dev/clean-own-T17-20261030/.
 No driver, auto-update settings or source changes. Game not launched.
 Next control: Offline Dream travel, upscaler=off/frame_gen=off.
+
+## First post-reinstall success and out comparison
+
+User reports Dream loading no longer crashes after reinstall. No driver update.
+Compared old/new out: boot.bin, eboot.elf, boot-libc.bin, boot-linked.bin,
+entry.bin, analysis/link/libc-link JSON and content/profile files are identical.
+All 9907 shader_code data files identical; only stamp.txt timestamps differ
+(9908 total files). All 26 enhancement files match, scripts/_internal/bin match
+apart from two old bb-probe backup files absent in clean install.
+
+patches.bin has 248 old vs 247 new records: sole difference is old offset
+0x1b39030, Skip Online/Offline Choice. This is expected from old Offline vs new
+Coop mode (current setting coop, new BBSC process 2092 at 16:51:55). Not evidence
+of corrupt patch data. GPU cache is under external BB_GPU_USER_DIR=testHost,
+which was preserved; out/shader_code is extracted input, not the driver pipeline
+cache. Cannot claim corrupted shader bytes or a proven fix from this one success.
+Generated state, timing, old transient mod views and stochastic failure remain
+possible. Preserve old installation for controlled comparison; no live cache
+changes while game runs. Recommend repeated same-mode Dream/return transitions
+and Offline comparison before attributing cause to out.
