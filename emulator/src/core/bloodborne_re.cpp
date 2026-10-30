@@ -7704,12 +7704,7 @@ void StartBbscLoadCover(std::string_view why) {
     bbsc_load_cover.active = true;
     bbsc_load_cover.started_ms = SteadyNowMs();
     bbsc_load_cover.why = std::string{why};
-    if (why == "summon" && ReadValue<u64>(image_base + MenuManPointerOffset, 0) != 0) {
-        BbscLoadingScreen(true);
-        bbsc_load_cover.own_screen = true;
-    } else {
-        BbscFadeTo(1.0f, BbscLoadCoverFadeOutS);
-    }
+    BbscFadeTo(1.0f, BbscLoadCoverFadeOutS); // StageFlow owns the actual loading UI.
     LOG_INFO(Debug, "BBSC load cover: started ({}, native screen {})", why, bbsc_load_cover.own_screen);
     BBSC_TIMELINE("LOAD", "load cover: fading out ({})", why);
 }
@@ -7797,9 +7792,6 @@ void TickBbscLoadCover() {
             // Keep the native loading UI across that gap; EndBbscLoadCover owns its close.
             BbscLoadingScreen(true);
             return;
-        }
-        if (!bbsc_load_cover.game_screen_seen) {
-            WriteValue<s32>(menu, 0x808, 2);
         }
         // 2026-10-29 (PT-4): between the loads (and after them, until the guest is placed) the
         // cover no longer opens the game's loading screen itself - the black plate below covers
@@ -17483,8 +17475,11 @@ void StartBbscSolidNpcs() {
         return;
     }
     std::thread{[] {
-        for (int attempt = 0; attempt < 36; ++attempt) {
+        u32 applied_generation = ~u32{0};
+        for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
+            const u32 generation = bbsc_load_generation.load();
+            if (generation == applied_generation) continue;
             const auto tables = FindBbscParamTables("NPC_PARAM_ST");
             size_t rows = 0;
             size_t cleared = 0;
@@ -17512,10 +17507,9 @@ void StartBbscSolidNpcs() {
                          "BBSC solid NPCs: {} NpcParam table(s), {} rows - wander-ghost bit "
                          "cleared on {} (a guest sees the host world's NPCs as they are)",
                          tables.size(), rows, cleared);
-                return;
+                applied_generation = generation;
             }
         }
-        LOG_INFO(Debug, "BBSC solid NPCs: NpcParam table not found after 3 minutes");
     }}.detach();
 }
 
