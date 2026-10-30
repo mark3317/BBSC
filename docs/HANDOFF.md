@@ -1,5 +1,11 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T12, 30 October: PC startup fixed in PORT f4f0028, installed on PC only.**
+> Signaling initialization rollback deadlocked joining a dispatch worker while
+> owning its mutex. Removed unused ioctl socket; release lock before workers.
+> T11 DLL + Research OFF reaches title menu; left running, no world loaded.
+> See [T12-startup-signaling](fixes/T12-startup-signaling.md).
+
 > **T11, 30 October: build 8373921 deployed/verified on PC + laptop; Research logs OFF.**
 > PC restored forest-host (testHost, slot 1); current PC save subsequently copied to laptop test by user request (19 files verified, including journals).
 > Host-first wipe spectator cleanup, resolved banner draw filter, native chest
