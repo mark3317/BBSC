@@ -12,14 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "emulator/src/core/bloodborne_re.cpp").read_text(encoding="utf-8")
 
 
-def function(signature):
-    start = SOURCE.index(signature + " {")
-    opening = SOURCE.index("{", start)
+def function(signature, source=SOURCE):
+    start = source.index(signature + " {")
+    opening = source.index("{", start)
     depth, end = 1, opening + 1
     while depth:
-        depth += (SOURCE[end] == "{") - (SOURCE[end] == "}")
+        depth += (source[end] == "{") - (source[end] == "}")
         end += 1
-    return SOURCE[start:end] + "\n"
+    return source[start:end] + "\n"
 
 
 prefix = r'''
@@ -111,6 +111,14 @@ int main() {
     assert(!Chalice::Valid(ReadBbscChaliceKey())); memory[0x50010]=42;
     form[0]^=1; assert(ReadBbscChaliceKey()!=a); form[0]^=1;
 
+    // The production relay follow encoder includes the key only for dungeon packets.
+    Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(current,1,2,3,4,9,-1,a);
+    assert(sent.size()==1 && sent[0].size()==58);
+    Chalice::Key wire; std::memcpy(&wire,sent[0].data()+34,sizeof(wire)); assert(wire==a);
+    sent.clear();
+    Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(0x18000000,1,2,3,4,10,-1,{});
+    assert(sent[0].size()==34); sent.clear();
+
     // Actual sender and actual receiver: no publish until all five scoped chunks arrive.
     u64 present=0; group[0]=0x80;
     SendBbscFlagSnapshot(1,current,1,40,key_of,present);
@@ -176,6 +184,14 @@ for signature in (
     "void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size)",
 ):
     code += function(signature)
+relay = (ROOT / "emulator/mod/bbsc_relay.cpp").read_text(encoding="utf-8")
+start = relay.index("struct FollowPacket {")
+end = relay.index("\n};", start) + 3
+code += "constexpr u8 FollowType=0x20;\n#pragma pack(push,1)\n" + relay[start:end] + "\n#pragma pack(pop)\n"
+code += "u32 SendFrame(const void* p,u32 size) { return Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(p,size); }\n"
+code += "namespace Libraries::Np::NpSignaling::Helpers {\n" + function(
+    "u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float heading, u32 sequence,\n"
+    "                          s32 lamp_point, const Core::Bloodborne::Chalice::Key& dungeon)", relay) + "}\n"
 code += scope_prefix + function("bool SelectBbscLootScope(u32 map)") + main
 
 with tempfile.TemporaryDirectory(prefix="bbsc-chalice-") as tmp:
