@@ -68,5 +68,24 @@ Supplemental guest-items/shared-progress не копировались: посл
 PASS: test_chalice_scope (реальные функции первичной инъекции, join readiness и
 transition hook, отсутствие записей в global при задержке, исключения owner/dead/
 home/host/invader/loading), test_follow_arrival, test_post_load_recovery,
-test_perf_policy, test_pending_work, test_matchmaking_native. Build/deploy записываются
-после выполнения. Нужен игровой контроль двух исправленных входов.
+test_perf_policy, test_pending_work, test_matchmaking_native. Нужен игровой контроль
+двух исправленных входов.
+
+## Сборка и отложенная установка
+
+Source `d194560`, build-mod-bbport exit=0. Результат сохранён отдельно в
+`BBSC/build/t21-ready/` (три файла, лог и manifest), чтобы последующая сборка
+в build/mod не подменила подготовленную версию.
+
+| Файл | SHA256 |
+|---|---|
+| bbsc.dll | `515C7E92867AA0449B3D37B145674973E8E5149314B6354753B76E1088EB272B` |
+| bbsc-launch.exe | `0670BEBE1CEB8B2E30E31545188A633F21EC2B7B1A48BAA1A0212DC54437C9EA` |
+| mod.json | `225AA89F630F694DA3CD7D9041A702A022D3E179A585AA36486A54FD34CD4909` |
+
+**Не установлена.** После готовой сборки пользователь ответил «Пока продолжаю
+играть — установить позже». Ни мод, ни порт на устройствах не заменялись;
+сейвы не откатывались. Не давать задание на T21, пока она фактически не установлена.
+При следующей просьбе об установке: проверить закрытие игр/лаунчеров, установить
+три файла в override и активный пакет ПК/ноута с бэкапами, проверить 12 SHA256,
+сделать test begin, затем один контроль: прямой призыв в чашу + вход из Сна.
