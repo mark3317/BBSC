@@ -1,6 +1,6 @@
 # HANDOFF — состояние работы и что дальше
 
-> **T11, 30 October: test regressions under repair, not deployed.**
+> **T11, 30 October: test regressions fixed in build 8373921, not deployed.**
 > Host-first wipe spectator cleanup, resolved banner draw filter, native chest
 > availability and immediate native summon loading screen. See
 > [T11-test-regressions](fixes/T11-test-regressions.md). T10 test had Research logs

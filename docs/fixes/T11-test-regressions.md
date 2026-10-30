@@ -47,7 +47,8 @@ comparison. Diagnostic captures remain available for troubleshooting.
 ## Validation
 
 `python tools/test_perf_policy.py`: PASS, includes suppression/keep policy checks.
-`git diff --check`: PASS. Build result pending.
+`git diff --check`: PASS. Mod build `8373921`: exit=0, zero warnings.
+DLL SHA256: 2497F38DEFC8C321552181343ACC5D0D29057BB58A0963558CEB20070A3964F6.
 No deployment or save modifications in this fix session. Gameplay confirmation
 pending: both wipe orders, closed/open chest and ordinary ground loot, Dream-to-
 field summon/cancellation, and connection/PvP banners without placeholders.
