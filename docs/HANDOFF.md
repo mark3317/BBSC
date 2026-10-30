@@ -1,5 +1,11 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T13, 30 October: join failed because MSI Center exhausted PC UDP ports.**
+> User-authorized MSI Center restart freed 16,308 sockets; game STUN now reaches
+> VPS as twin:3658. Retest join. Laptop crash separately confirmed nvlddmkm TDR/
+> LiveKernelEvent 141 with upscaler/FG OFF; cause unresolved. No new code deployed.
+> See [T13-connect-and-laptop-TDR](fixes/T13-connect-and-laptop-TDR.md).
+
 > **T12, 30 October: PC startup fixed in PORT f4f0028, installed/verified on PC + laptop.**
 > Signaling initialization rollback deadlocked joining a dispatch worker while
 > owning its mutex. Removed unused ioctl socket; release lock before workers.
