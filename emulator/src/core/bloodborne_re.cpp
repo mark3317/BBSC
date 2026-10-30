@@ -4926,6 +4926,7 @@ bool BbscWarpTogetherEnabled() {
 void BbscAnnounce(const char16_t* text, std::string_view what);
 // BBSC's texts in the game's language (English or Russian), see "Custom co-op messages".
 bool BbscRussian();
+bool BbscResearchEnabled();
 inline const char16_t* BbscL(const char16_t* english, const char16_t* russian) {
     return BbscRussian() ? russian : english;
 }
@@ -7670,7 +7671,6 @@ struct BbscLoadCoverState {
     std::string why;
 };
 BbscLoadCoverState bbsc_load_cover;
-s64 bbsc_join_quiet_until_ms = 0; // the join banner filter stays on until then (after a summon)
 
 bool BbscLoadCoverEnabled() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_LOAD_COVER");
@@ -7695,9 +7695,6 @@ void EndBbscLoadCover(std::string_view how) {
         return;
     }
     bbsc_load_cover.active = false;
-    if (bbsc_load_cover.why == "summon") {
-        bbsc_join_quiet_until_ms = SteadyNowMs() + 8'000; // the join banner filter (BbscJoinQuiet)
-    }
     if (bbsc_load_cover.own_screen) {
         bbsc_load_cover.own_screen = false;
         // own_screen = the screen showed: never 0 while shown (see KeepClosingBbscLoadingScreen).
@@ -10932,6 +10929,12 @@ constexpr std::array<s64, 2> BbscDreamOwnGuestEvents{12101020, 12101021};
 // 12410850 Central Yharnam (four windows), 12410750 Central Yharnam (one door, t241316). The talk
 // that follows is the guest's talk script, as with every other NPC.
 constexpr std::array<s64, 3> BbscGuestKnockEvents{12400840, 12410850, 12410750};
+
+bool IsBbscPersonalMapEvent(s64 event) {
+    return IsBbscLocalQuestEvent(event) ||
+           std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end();
+}
+
 // Events a guest's copy runs as the host's in the host's world (2026-10-27, "the guest's own
 // quests"). Of the 728 events behind "the player is the host" (4[03] x, 10000, 0) in all of the
 // game's scripts (tools: emevd scan with the game's own common.emedf names) these 128 do nothing
@@ -11090,7 +11093,7 @@ void PS4_SYSV_ABI BbscDreamTalkHook(u64 /*tag*/, const GuestRegisterSnapshot* re
         if (map_area == 21 || map_area == 29 || map_area == 10 || talk % 1000 < 100 ||
             !BbscGuestInHostWorld()) {
             static std::vector<u32> kept;
-            if (BbscGuestInHostWorld() && kept.size() < 256 &&
+            if (BbscResearchEnabled() && BbscGuestInHostWorld() && kept.size() < 256 &&
                 std::ranges::find(kept, talk) == kept.end()) {
                 kept.push_back(talk);
                 LOG_INFO(Debug, "BBSC research: talk t{} stays closed to the guest (filter)", talk);
@@ -11407,75 +11410,6 @@ void TickBbscSendBacklog() {
     }
 }
 
-
-// ---- Starter weapons in the Dream, both directions (2026-10-08) ----------------------------------
-// Test 2026-10-08 (abood host, cls_amg guest, both on mod 35): "if I take the weapons in the Dream
-// they disappear for him, and if he takes them they disappear for me". The messengers' free shop
-// (c1_84, ShopLineupParam 2000-2011) counts its sales in flags 72101000-72101002 (trick weapons)
-// and 72101010/72101011 (firearms), group 72101. BBSC no longer copies the host's group into the
-// guest (mod 35), and the flag write 0x013CFCC0 sends nothing - so the change crosses over some
-// other way (not found yet). Both players now keep group 72101 as their own while in the Dream in
-// a session: a change made while our own shop dialog runs (0x01729D40, the dialog's update that
-// writes the sales flags at 0x0172A1FB) is our purchase and kept; any other change is put back and
-// logged ("BBSC Dream shop: ... from the other player"), so the next log also shows how it came.
-// OFF since mod 38: test 2026-10-08 showed the dialog hook never runs for this shop, so the guard
-// undid the guest's OWN purchase; the weapon messengers are no longer the guest's at all.
-constexpr u64 ShopDialogUpdateOffset = 0x01729D40;
-constexpr u32 BbscStarterWeaponGroup = 72101;
-std::atomic<s64> bbsc_shop_dialog_ms{0};
-
-void PS4_SYSV_ABI BbscShopDialogHook(u64 /*tag*/, const GuestRegisterSnapshot* /*registers*/) {
-    BBSC_PERF_SCOPE("hook BbscShopDialogHook");
-    bbsc_shop_dialog_ms.store(SteadyNowMs(), std::memory_order_relaxed);
-}
-
-void TickBbscDreamShopGuard() {
-    static s64 last_ms = 0;
-    static bool have = false;
-    static std::array<u8, BbscWorldGroupBytes> kept{};
-    const s64 now = SteadyNowMs();
-    if (image_base == 0 || now - last_ms < 200) {
-        return;
-    }
-    last_ms = now;
-    const s32 state = GetSessionState();
-    const u64 global = GetGlobalState();
-    if ((state != 3 && state != 6) || !ReadablePointer(global, 0x10) ||
-        ReadValue<u8>(global, 0x08) != 0 || GetCurrentPackedMap() != BbscDreamStateMap) {
-        have = false;
-        return;
-    }
-    const u64 storage = BbscFlagGroupStorage(BbscStarterWeaponGroup);
-    if (storage == 0) {
-        have = false;
-        return;
-    }
-    auto* live = reinterpret_cast<u8*>(storage);
-    if (!have) {
-        std::memcpy(kept.data(), live, BbscWorldGroupBytes);
-        have = true;
-        return;
-    }
-    if (std::memcmp(kept.data(), live, BbscWorldGroupBytes) == 0) {
-        return;
-    }
-    const bool own = now - bbsc_shop_dialog_ms.load(std::memory_order_relaxed) < 1'500;
-    size_t bits = 0;
-    for (size_t b = 0; b < BbscWorldGroupBytes; ++b) {
-        bits += std::popcount(static_cast<u8>(kept[b] ^ live[b]));
-    }
-    if (own) {
-        std::memcpy(kept.data(), live, BbscWorldGroupBytes);
-        LOG_INFO(Debug, "BBSC Dream shop: our own purchase ({} sales flag(s) of group 72101 changed, "
-                        "session state {}) - kept",
-                 bits, state);
-    } else {
-        std::memcpy(live, kept.data(), BbscWorldGroupBytes);
-        LOG_WARNING(Debug, "BBSC Dream shop: {} sales flag(s) of group 72101 changed with our shop "
-                           "closed - from the other player, put back (session state {})",
-                    bits, state);
-    }
-}
 
 // ---- Enemy drops for the guest (2026-10-08) ------------------------------------------------------
 // Testers: "Wandering Madness [Nightmares] don't drop items for the guest". No enemy dropped anything
@@ -13916,9 +13850,8 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
         allowed = std::ranges::find(BbscDreamGuestEvents, event) != BbscDreamGuestEvents.end() ||
                   (BbscDreamOwnEnabled() && std::ranges::find(BbscDreamOwnGuestEvents, event) !=
                                                 BbscDreamOwnGuestEvents.end()) ||
-                  std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end() ||
                   std::ranges::find(BbscGuestGiftEvents, event) != BbscGuestGiftEvents.end() ||
-                  IsBbscLocalQuestEvent(event);
+                  IsBbscPersonalMapEvent(event);
         if (allowed && known == bbsc_dream_type_conditions.end()) {
             bbsc_dream_type_conditions[bbsc_dream_type_next] = condition;
             bbsc_dream_type_next = (bbsc_dream_type_next + 1) % bbsc_dream_type_conditions.size();
@@ -13930,7 +13863,7 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
         // Research 2026-10-27 (guests and NPCs / windows): which events wait on "the player is the
         // host" for the guest, once per event.
         static std::vector<s64> refused;
-        if (event > 0 && refused.size() < 512 && std::ranges::find(refused, event) == refused.end()) {
+        if (BbscResearchEnabled() && event > 0 && refused.size() < 512 && std::ranges::find(refused, event) == refused.end()) {
             refused.push_back(event);
             LOG_INFO(Debug, "BBSC research: event {} waits on the host's player type - not for the "
                             "guest (map {:#x})", event, GetCurrentPackedMap());
@@ -13940,7 +13873,7 @@ void PS4_SYSV_ABI BbscDreamTypeCheckHook(u64 /*tag*/, const GuestRegisterSnapsho
     }
     WriteValue<u8>(condition, 0x10, static_cast<u8>(ReadValue<u8>(condition, 0x10) | 1));
     bbsc_dream_type_skip = 1;
-    if (event > 0 && bbsc_dream_type_logged.size() < 4096 &&
+    if (BbscResearchEnabled() && event > 0 && bbsc_dream_type_logged.size() < 4096 &&
         std::ranges::find(bbsc_dream_type_logged, event) == bbsc_dream_type_logged.end()) {
         bbsc_dream_type_logged.push_back(event);
         LOG_INFO(Debug, "BBSC Dream: event {} runs for the guest as for the host", event);
@@ -15204,8 +15137,7 @@ void LocalizeBbscQuestEvent(u64 instance) {
             const s64 event = ReadValue<s64>(row, 0);
             if (cache.size() >= 4096) cache.clear();
             it = cache.insert_or_assign(instance, Cached{ref, first, end, row, event,
-                IsBbscLocalQuestEvent(event) ||
-                std::ranges::find(BbscGuestKnockEvents, event) != BbscGuestKnockEvents.end()}).first;
+                IsBbscPersonalMapEvent(event)}).first;
             break;
         }
     }
@@ -15215,15 +15147,14 @@ void LocalizeBbscQuestEvent(u64 instance) {
 bool BbscTalkEventIsOurs(s64 event) {
     // These events observe the shared environment but only change this player's quest state.
     // Their remote copy cannot establish ownership of our dog/door trigger or loot visibility.
-    if (IsBbscLocalQuestEvent(event)) return true;
+    if (IsBbscPersonalMapEvent(event)) return true;
     const auto first = std::ranges::lower_bound(BbscTalkEventTriggers, event, {},
                                                 &BbscTalkEventTrigger::event);
     if (first == BbscTalkEventTriggers.end() || first->event != event) {
         return true; // not a talk-driven event
     }
     // Action-button conditions run in the initiating player's game. Initial resets also run.
-    if (event == 12400840 || event == 12410750 || event == 12410850 || event == 13200055)
-        return true;
+    if (event == 13200055) return true;
     std::scoped_lock lock{bbsc_npc_own_mutex};
     bool remote = false;
     for (auto it = first; it != BbscTalkEventTriggers.end() && it->event == event; ++it) {
@@ -16423,6 +16354,15 @@ bool BbscRussian() {
     return russian;
 }
 
+constexpr char16_t BbscSilentBanner[] = u"[BBSC:silent]";
+bool BbscQuietMessage(u32 category, u32 id) {
+    if (category != 30) return false;
+    // Actual joins and departures, including invaders, remain visible.
+    if ((id >= 102000 && id < 103000) || (id >= 20000400 && id <= 20000414)) return false;
+    return (id >= 100000 && id < 110000) || (id >= 141000 && id < 143000) ||
+           id == 15000011 || id == 15000012 || id == 15000035;
+}
+
 void TickBbscMessages() {
     static s64 last_ms = 0;
     static size_t logged = 0;
@@ -16437,15 +16377,14 @@ void TickBbscMessages() {
         BbscRussian() ? std::span<const BbscMessage>{BbscMessagesRu}
                       : std::span<const BbscMessage>{BbscMessages};
     for (const auto& message : table) {
-        if (message.category == 30 && (message.id == 105199 || message.id == 105299)) {
-            continue; // the boss battle line, see TickBbscBossLine
-        }
         u64 fmg = 0;
         const u64 slot = FindBbscMessageSlot(message.category, message.id, &fmg);
         if (slot == 0) {
             continue;
         }
-        const u64 wanted = reinterpret_cast<u64>(message.text) - fmg;
+        const char16_t* text = BbscQuietMessage(message.category, message.id)
+                                   ? BbscSilentBanner : message.text;
+        const u64 wanted = reinterpret_cast<u64>(text) - fmg;
         if (ReadValue<u64>(slot, 0) == wanted) {
             ++in_place;
         } else if (WriteValue<u64>(slot, 0, wanted)) {
@@ -16467,9 +16406,7 @@ void TickBbscMessages() {
 // BbscBossNames (the Discord status table); unknown boss = "The host started a boss battle."
 // The text is looked up when the banner is drawn, so it has to be in place by then: a host packet
 // arrives within ~1 s of the bar coming up. HYPOTHESIS until a guest screenshot shows the name.
-constexpr std::array<u32, 2> BbscBossLineIds{105199, 105299};
 constexpr s64 BbscHostBossFreshMs = 10'000;
-std::array<char16_t, 160> bbsc_boss_line_text{};
 std::atomic<s32> bbsc_host_boss_id{-1};
 std::atomic<s64> bbsc_host_boss_ms{0};
 const char* BbscBossNameById(s32 id); // see "Discord status"
@@ -16506,71 +16443,17 @@ s32 BbscGaugeBossId() {
     return -1;
 }
 
-void TickBbscBossLine() {
-    static s64 last_ms = 0;
+// Boss state is gameplay data (death/wipe detection), independent of banner settings.
+void TickBbscBossBroadcast() {
     static s64 last_send_ms = 0;
-    static s32 written_for = -2;
     const s64 now = SteadyNowMs();
-    if (image_base == 0 || !BbscMessagesEnabled() || now - last_ms < 200) {
-        return;
-    }
-    last_ms = now;
-    const s32 state = GetSessionState();
+    if (image_base == 0 || now - last_send_ms < 1'000) return;
+    last_send_ms = now;
+    if (GetSessionState() != 3) return;
     const s32 own = BbscGaugeBossId();
-    if (state == 3 && now - last_send_ms >= 1'000) {
-        last_send_ms = now;
-        std::array<u8, 9> packet{'S', 'H', 'A', 'D', 0x27};
-        std::memcpy(packet.data() + 5, &own, 4);
-        Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(),
-                                                                       packet.size());
-    }
-    s32 boss = -1;
-    if (now - bbsc_host_boss_ms.load() < BbscHostBossFreshMs && bbsc_host_boss_id.load() != -1) {
-        boss = bbsc_host_boss_id.load();
-    } else if (own != -1) {
-        boss = own;
-    }
-    const bool russian = BbscRussian();
-    static bool written_russian = false;
-    if (boss != written_for || russian != written_russian) {
-        written_for = boss;
-        written_russian = russian;
-        const char* name = boss != -1 ? BbscBossNameById(boss) : nullptr;
-        const std::string text = name != nullptr
-                                     ? fmt::format("The host started the battle against\n{}.", name)
-                                     : std::string{"The host started a boss battle."};
-        bbsc_boss_line_text = {};
-        if (russian) {
-            // The game fills in the boss's own (Russian) name: the bar's name id is an NpcName id.
-            std::u16string ru = name != nullptr ? u"Хост начал битву с боссом:\n<?npcNameId@"
-                                                : u"Хост начал битву с боссом.";
-            if (name != nullptr) {
-                for (const char c : std::to_string(boss)) {
-                    ru += static_cast<char16_t>(c);
-                }
-                ru += u"?>.";
-            }
-            for (size_t i = 0; i < ru.size() && i + 1 < bbsc_boss_line_text.size(); ++i) {
-                bbsc_boss_line_text[i] = ru[i];
-            }
-        } else {
-            for (size_t i = 0; i < text.size() && i + 1 < bbsc_boss_line_text.size(); ++i) {
-                bbsc_boss_line_text[i] = static_cast<unsigned char>(text[i]);
-            }
-        }
-        if (name != nullptr) {
-            LOG_INFO(Debug, "BBSC boss line: \"{}\" (boss {})", name, boss);
-            BBSC_TIMELINE("BOSS", "boss line: \"{}\" (boss {})", name, boss);
-        }
-    }
-    for (const u32 id : BbscBossLineIds) {
-        u64 fmg = 0;
-        const u64 slot = FindBbscMessageSlot(30, id, &fmg);
-        const u64 wanted = reinterpret_cast<u64>(bbsc_boss_line_text.data()) - fmg;
-        if (slot != 0 && ReadValue<u64>(slot, 0) != wanted) {
-            WriteValue<u64>(slot, 0, wanted);
-        }
-    }
+    std::array<u8, 9> packet{'S', 'H', 'A', 'D', 0x27};
+    std::memcpy(packet.data() + 5, &own, 4);
+    Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(packet.data(), packet.size());
 }
 
 // ---- Co-op banner lines (2026-09-25) ------------------------------------------------------------
@@ -16732,6 +16615,10 @@ void TickBbscNoticeRestore() {
 
 // BBSC's own notices, for moments the game has no line for (respawning, the host falling).
 void BbscAnnounce(const char16_t* text, std::string_view what) {
+    if (what != "pvp on" && what != "pvp off" && what != "pvp alone" && what != "kept home") {
+        LOG_INFO(Debug, "BBSC notice (log only): {}", what);
+        return;
+    }
     if (image_base == 0 || !BbscMessagesEnabled()) {
         return;
     }
@@ -16775,9 +16662,9 @@ void BbscAnnounce(const char16_t* text, std::string_view what) {
 // can queue a co-op banner. Every banner producer (14 of them, 0x01382720 .. 0x0196BA20, CONFIRMED
 // statically) builds its text, stores it at [0x055813E0] and sets the byte 0x055813D8; the banner
 // menu's update 0x01BFF910 shows it when that byte is 1 (0x01BFFAC1) and clears it (0x01BFFBE7).
-// The hook on that update logs every banner's text, and while a guest is joining - from the summon
-// until 8 s after the guest is placed - clears the byte instead, so the banner never shows.
-// BBSC's own notices (BbscAnnounce) always show. HYPOTHESIS until a join log shows "hidden".
+// Quiet mod messages carry a sentinel text; clear pending before the menu draws an empty banner.
+// Real joins/leaves must stay visible even during a summon, so there is no blanket quiet timer.
+// Explicit notices are limited to PvP and connection loss by BbscAnnounce.
 constexpr u64 BannerMenuUpdateOffset = 0x01BFF910;
 constexpr u64 BannerPendingOffset = 0x055813D8; // u8: 1 = a banner is queued
 constexpr u64 BannerTextOffset = 0x055813E0;    // const char16_t*: its text
@@ -16802,15 +16689,6 @@ std::string BbscBannerText() {
     return out;
 }
 
-bool BbscJoinQuiet() {
-    const s32 state = GetSessionState();
-    if (state != 4 && state != 5 && state != 6) {
-        return false;
-    }
-    return (bbsc_load_cover.active && bbsc_load_cover.why == "summon") ||
-           SteadyNowMs() < bbsc_join_quiet_until_ms;
-}
-
 void PS4_SYSV_ABI BbscBannerMenuHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     BBSC_PERF_SCOPE("hook BbscBannerMenuHook");
     if (registers == nullptr || ReadValue<u8>(image_base + BannerPendingOffset, 0) != 1) {
@@ -16821,14 +16699,16 @@ void PS4_SYSV_ABI BbscBannerMenuHook(u64 /*tag*/, const GuestRegisterSnapshot* r
     const std::string text = BbscBannerText();
     const bool own = bbsc_banner_own_pending;
     bbsc_banner_own_pending = false;
-    const bool hide = !own && BbscJoinQuiet();
+    // Suppress the entire banner, not just its text (no empty window).
+    const bool silent = text == "[BBSC:silent]";
+    const bool hide = silent || (!own && text == "?ActionEventInfo?");
     if (hide) {
         WriteValue<u8>(image_base + BannerPendingOffset, 0, 0);
     }
     const s64 now = SteadyNowMs();
     if (text != last_text || now - last_ms > 2'000 || hide) {
         LOG_INFO(Debug, "BBSC banner: \"{}\" {} (session state {})", text,
-                 hide ? "hidden - guest joining" : (own ? "shown (BBSC's own)" : "shown"),
+                 hide ? (silent ? "hidden - quiet notifications" : "hidden - missing message") : (own ? "shown (BBSC's own)" : "shown"),
                  GetSessionState());
     }
     last_text = text;
@@ -17334,24 +17214,24 @@ u64 BbscGameParamTable(std::string_view type) {
     if (!ReadablePointer(repo, 0x158) || ReadValue<s32>(repo, 0x148) == 0) {
         return 0; // params not loaded yet
     }
-    for (u64 off = 0x08; off < 0x1000; off += 8) {
-        if (!ReadablePointer(repo + off, 8)) {
-            break;
-        }
+    thread_local std::map<std::string, u64, std::less<>> slots;
+    const auto table_at = [repo, type](u64 off) -> u64 {
+        if (!ReadablePointer(repo + off, 8)) return 0;
         const u64 holder = ReadValue<u64>(repo, off);
-        if (!ReadablePointer(holder, 0x78)) {
-            continue;
-        }
-        const u64 res = ReadValue<u64>(holder, 0x70);
-        if (!ReadablePointer(res, 0x78)) {
-            continue;
-        }
-        const u64 table = ReadValue<u64>(res, 0x70);
-        if (!ReadablePointer(table, 0x40 + 0x18)) {
-            continue;
-        }
+        const u64 res = ReadablePointer(holder, 0x78) ? ReadValue<u64>(holder, 0x70) : 0;
+        const u64 table = ReadablePointer(res, 0x78) ? ReadValue<u64>(res, 0x70) : 0;
+        if (!ReadablePointer(table, std::max<size_t>(0x58, 0x0D + type.size()))) return 0;
         const auto* name = reinterpret_cast<const char*>(table + 0x0C);
-        if (std::memcmp(name, type.data(), type.size()) == 0 && name[type.size()] == '\0') {
+        return std::memcmp(name, type.data(), type.size()) == 0 && name[type.size()] == '\0'
+                   ? table : 0;
+    };
+    if (const auto it = slots.find(type); it != slots.end()) {
+        if (const u64 table = table_at(it->second)) return table;
+        slots.erase(it);
+    }
+    for (u64 off = 0x08; off < 0x1000; off += 8) {
+        if (const u64 table = table_at(off)) {
+            slots[std::string(type)] = off;
             return table;
         }
     }
@@ -19686,6 +19566,18 @@ void TickBbscCutsceneReplay();                                                  
 void TickBbscSharedKeyItems();                                                    // below
 void TickBbscNpcOwnQuests();                                                      // see "Each player's own NPC quests"
 
+// Keep diagnostic-only hooks out of normal play entirely (including register save/restore).
+// Keep this list aligned with the functional dispatch at the start of TraceEntry.
+bool BbscFunctionalTraceSite(const TraceSite& site) {
+    return site.offset == ItemUsableResultOffset || site.offset == SummonBuildEntryOffset ||
+           site.offset == CrossMapGuestHandoffOffset ||
+           site.offset == StageWarpDescriptorFinalizeOffset || site.offset == 0x0178D9C0 ||
+           site.offset == 0x01938F65 || site.offset == 0x01332C1B ||
+           site.offset == BbscPersistNoOpOffset || site.offset == BbscGameTickOffset ||
+           site.offset == 0x0131E5C0 || site.offset == SosStatusUpdateOffset ||
+           site.offset == HealingFountainAvailabilityOffset || site.name.starts_with("BBSC.Remo.");
+}
+
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
@@ -19716,6 +19608,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         ApplySummonReloadStateAtDescriptor(*registers);
     }
     if (site.offset == 0x0178D9C0) {
+        bbsc_dream_type_conditions.fill(0);
+        bbsc_dream_type_next = 0;
+        bbsc_dream_type_logged.clear();
         BbscConnectFirstReloadFinished();
     }
     if (site.offset == 0x0178D9C0 && BbscRejoinEnabled()) {
@@ -19760,7 +19655,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         { BBSC_PERF_NESTED("tick TickBbscStuckLeaveLocks"); TickBbscStuckLeaveLocks(); }
         { BBSC_PERF_NESTED("tick TickBbscStrandedGuest"); TickBbscStrandedGuest(); }
         { BBSC_PERF_NESTED("tick TickBbscKeptHome"); TickBbscKeptHome(); }
-        { BBSC_PERF_NESTED("tick TickBbscBossLine"); TickBbscBossLine(); }
+        { BBSC_PERF_NESTED("tick TickBbscBossBroadcast"); TickBbscBossBroadcast(); }
         { BBSC_PERF_NESTED("tick TickBbscCutsceneReplay"); TickBbscCutsceneReplay(); }
         { BBSC_PERF_NESTED("tick TickBbscSharedKeyItems"); TickBbscSharedKeyItems(); }
         { BBSC_PERF_NESTED("tick TickBbscNpcOwnQuests"); TickBbscNpcOwnQuests(); }
@@ -19878,6 +19773,10 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         LOG_INFO(Debug, "BBSC {}", line);
         BBSC_TIMELINE("CUTSCENE", "{}", line);
         OnBbscCutsceneRequestHook(site.offset, *registers);
+    }
+    if (!BbscResearchEnabled() && site.kind != TraceKind::EnginePanic &&
+        site.kind != TraceKind::LuaSessionEvent && site.kind != TraceKind::MatchingLeaveDecision) {
+        return; // functional work above is complete; no routine memory dumps or file I/O
     }
     if (site.kind == TraceKind::LuaSessionEvent) {
         // Only session-relevant Lua events; the dispatcher also runs gameplay events.
@@ -21863,8 +21762,15 @@ void InstallReverseEngineeringTrace() {
     capture_file.flush();
 
     size_t hook_count = 0;
+    size_t selected_count = 0;
     for (size_t index = 0; index < Sites.size(); ++index) {
         const auto& site = Sites[index];
+        if (!BbscResearchEnabled() && !BbscFunctionalTraceSite(site) &&
+            site.kind != TraceKind::EnginePanic && site.kind != TraceKind::LuaSessionEvent &&
+            site.kind != TraceKind::MatchingLeaveDecision) {
+            continue;
+        }
+        ++selected_count;
         if ((summon_build_host_placement_hook_installed && site.offset == SummonBuildEntryOffset) ||
             (cross_map_guest_handoff_hook_installed && site.offset == CrossMapGuestHandoffOffset) ||
             (summon_reload_state_hook_installed &&
@@ -21888,10 +21794,11 @@ void InstallReverseEngineeringTrace() {
         ++hook_count;
     }
 
-    installed = hook_count == Sites.size();
-    LOG_INFO(Debug, "Bloodborne RE trace installed {}/{} hooks; capture={}", hook_count,
-             Sites.size(), Common::FS::PathToUTF8String(capture_path));
-    BBSC_TIMELINE("START", "BBSC hooks installed: {} of {}", hook_count, Sites.size());
+    installed = hook_count == selected_count;
+    LOG_INFO(Debug, "Bloodborne RE trace installed {}/{} selected hooks ({} diagnostic sites omitted); capture={}",
+             hook_count, selected_count, Sites.size() - selected_count,
+             Common::FS::PathToUTF8String(capture_path));
+    BBSC_TIMELINE("START", "BBSC hooks installed: {} of {} selected", hook_count, selected_count);
     InstallBbscSpectateHooks();
     InstallBbscWallHooks();
     InstallBbscEchoPathHooks();

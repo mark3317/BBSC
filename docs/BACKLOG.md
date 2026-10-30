@@ -1,5 +1,11 @@
 # BACKLOG — баги плейтестов и план (ведёт Claude, обновляется по ходу)
 
+> **T10, 30 October: performance/notification audit, build only (NO DEPLOY).**
+> Diagnostic-only hot hooks are opt-in; boss state transport separated from UI;
+> reload-safe param slot cache, dead shop guard removed, personal-event policy
+> unified. Keep connection/departure and PvP notices. See
+> [T10-performance](fixes/T10-performance.md). Gameplay/FPS verification pending.
+
 T9 (30 October): confirmed host-first/client-last boss wipe bypass through the 15s
 watchdog. Fix `12984a9` built and deployed to both machines; gameplay confirmation pending. See [T9](fixes/T9-boss-wipe.md).
 

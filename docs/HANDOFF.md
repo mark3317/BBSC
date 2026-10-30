@@ -1,5 +1,11 @@
 # HANDOFF — состояние работы и что дальше
 
+> **T10, 30 October: performance/notification audit, build only (NO DEPLOY).**
+> Diagnostic-only hot hooks are opt-in; boss state transport separated from UI;
+> reload-safe param slot cache, dead shop guard removed, personal-event policy
+> unified. Keep connection/departure and PvP notices. See
+> [T10-performance](fixes/T10-performance.md). Gameplay/FPS verification pending.
+
 > **T9, 30 October: boss wipe regression confirmed in logs.** Client watchdog revived
 > in place at 01:07:12, before PartyGhostDeath_2 at 01:07:13; no full client reload.
 > Unified watchdog/native death state, latched boss-at-death, actual load-generation
