@@ -1,3 +1,9 @@
+> **Ревизия 30.10.2026:** ниже исторический план от сентября, а не актуальный
+> статус реализации. Сейчас есть свой Windows-лаунчер/пакет, упакованный сервер,
+> VPS и TCP relay. Текущие задачи перед релизом — [BACKLOG](BACKLOG.md) и
+> [PHASES](PHASES.md). Цены, внешние сервисы и оценки нагрузки ниже в этой ревизии
+> не перепроверялись; не использовать их как текущую рекомендацию.
+
 # Distribution plan — deferred until open beta
 
 Parked 2026-09-22. **Not to be started before co-op is stable for two players.** Right now a guest

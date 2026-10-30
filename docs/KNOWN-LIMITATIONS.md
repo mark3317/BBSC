@@ -1,39 +1,22 @@
-# Known limitations
+# Текущие ограничения — 30.10.2026
 
-## Hard (engine/executable)
+Актуальный план — [BACKLOG](BACKLOG.md), этап чаш — [PHASES](PHASES.md).
+Ранний статический аудит сохранён в [истории](history/KNOWN-LIMITATIONS-2026-10-30-before-review.md):
+его ограничения ванильной игры не следует выдавать за отсутствие уже работающих функций BBSC.
 
-| Limitation | Detail | Status |
-| --- | --- | --- |
-| Session bound to one loaded stage | 43 Stop callers; stage transition, stage policy, stage destructor and `OnMatchingCheck` all end the session around a load | CONFIRMED static |
-| No native "follow host to new stage" | Guest only enters host world through summon insertion + `SummonedMapReload` | CONFIRMED |
-| Players on different maps simultaneously | Not supported by Bloodborne's session model (unlike Elden Ring's open world) | STRONGLY INDICATED |
-| Player count | Host + 2 cooperators (native capacity/role rules) | STRONGLY INDICATED |
-| Gameplay packet format undocumented | Blocks any approach that edits or replays game state | CONFIRMED |
-| Single executable | All offsets/signatures for CUSA03173 01.09 sha256 `d65f0b4f…` only | CONFIRMED |
+| Ограничение | Текущее состояние |
+|---|---|
+| Поддерживаемая игра | Адреса/сигнатуры целевой CUSA03173 v1.09; остальные исполняемые файлы не объявлены поддерживаемыми. |
+| Игроки на разных картах | Постоянная независимая игра в разных картах не поддерживается; гость следует за хостом загрузкой. |
+| Число игроков | Целевой предел — хост + 2 кооператора; полноценный тест трёх игроков ещё нужен. |
+| Чаши | Серверные каналы/глифы и фиксированные подземелья есть; бесшовный маршрут по слоям и идентичность dungeon не подтверждены. Чаши исключены из Shared Progress для защиты своего мира. |
+| Миграция хоста | Не реализуется; уход хоста завершает поездку гостей с возвратом домой. |
+| Перезапуск сервера | Комнаты/сессии не обещают пережить рестарт; требуется корректный выход и новый призыв. |
+| Обрыв сети | TCP EOF обрабатывается отдельно; молчаливый обрыв не равен немедленно обнаруженному выходу. Три игрока/адресная очистка требуют проверки. |
+| GPU-стабильность | TDR 141 воспроизводился Offline без BBSC и с DLSS/FG OFF. После чистой переустановки первый переход в Сон успешен; причина и устойчивое устранение не установлены. |
+| Восстановление предметов | Журналы переживают краш; часть ключевых игра откатывает, BBSC восстанавливает их. Старый повреждённый сейв без записи предмета в журнале автоматически восстановить не гарантируется. |
+| Сеть для публичного релиза | TCP relay существует; старое «relay нет, нужен только Tailscale» устарело. Изоляцию групп, доверие sender и фактическую серверную конфигурацию нужно перепроверить перед открытием сервера широкой аудитории. |
+| Покрытие | Разные NPC-стадии, все боссы/DLC, чаши, трое игроков и длительный прогон не считаются проверенными общим сообщением «всё работает». |
 
-## Foundation (shadp2p / shadNet)
-
-| Limitation | Detail | Status |
-| --- | --- | --- |
-| Cross-map seamless summon disputed | shadp2p#2 | CONFIRMED report |
-| Lamp prompt suppressed in session | second gate unknown after `+0x49` | CONFIRMED |
-| Death persistence unfinished | shadnet-p2p#3 | CONFIRMED |
-| "Failed to acquire Bloodborne Server information" for some users | shadp2p#1, cause unknown | CONFIRMED report |
-| No relay | peers need direct reachability (Tailscale) | STRONGLY INDICATED |
-| Rooms/summons in memory | server restart ends all sessions | CONFIRMED |
-| Game TCP unencrypted | private tailnet only | CONFIRMED |
-| Pre-existing crash | `GXRenderThread` access violation (author notes) | CONFIRMED report |
-
-## Open research blockers (Phase 1 gating)
-
-1. Native re-insertion of an existing room member after a load (SESSION-LIFECYCLE requirement D).
-2. Meaning/runtime value of `global+0x1592`.
-3. Second lamp prompt gate.
-4. Host migration: room ownership moves in shadNet, but Bloodborne world authority cannot move to the guest's save. Considered **not realistic**; documented, not pursued.
-
-## Environment
-
-| Item | Status |
-| --- | --- |
-| Fork build | Works: clang-cl 19.1.5 + NMake (single-threaded, full build ≈ 1 h, incremental minutes) |
-| Account registration tool | Built (`server/tools/shadnet-sample.exe`) |
+Переходы, сохранение сессии при смерти/боссах, лампы и recovery уже реализованы;
+«43 пути Stop» и ранние Phase 1 blockers — исторический материал, не текущие блокеры.
