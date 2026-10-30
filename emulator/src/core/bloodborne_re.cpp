@@ -9971,6 +9971,15 @@ void SuspendBbscPersistenceOnce(std::string_view why) {
     }
 }
 
+// The engine can enter state 7 itself (room timeout / failed join), without a BBSC
+// departure notification. Persistence must not obstruct that already-ended session.
+// Also called from the native load step: the ordinary game tick may stop during a load.
+void ReleaseBbscNativeLeavingSession() {
+    if (GetSessionState() == 7) {
+        SuspendBbscPersistenceOnce("native session entered leaving state");
+    }
+}
+
 // ---- Silencing Blank (2026-10-04) ----------------------------------------------------------------
 // Report 2026-10-04: "the Silencing Blank is weird, might break the game"; guest log 2026-10-02:
 // three uses (OnLeaveMagic at 20:07:11/17/24), nothing happened. global_event.lua, read with
@@ -11080,6 +11089,7 @@ void TickBbscPostLoadRecovery() {
 // Run engine cleanup only on the game thread, after confirmed departure / return home.
 void TickBbscSessionExit(bool peer_work) {
     const s32 state = GetSessionState();
+    ReleaseBbscNativeLeavingSession();
     const u64 global = GetGlobalState();
     if (image_base == 0 || !ReadablePointer(global, 0x1700)) {
         if (peer_work) QueueBbscWork(BbscWork::PeerLeft); // retry when global state is ready
@@ -20114,6 +20124,7 @@ bool BbscFunctionalTraceSite(const TraceSite& site) {
     return site.offset == ItemUsableResultOffset || site.offset == SummonBuildEntryOffset ||
            site.offset == CrossMapGuestHandoffOffset ||
            site.offset == StageWarpDescriptorFinalizeOffset || site.offset == 0x0178D9C0 ||
+           site.offset == 0x01941C20 ||
            site.offset == 0x01938F65 || site.offset == 0x01332C1B ||
            site.offset == BbscPersistNoOpOffset || site.offset == BbscGameTickOffset ||
            site.offset == 0x0131E5C0 || site.offset == SosStatusUpdateOffset ||
@@ -20140,6 +20151,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     BbscPerfScope perf_scope{perf_site};
 
     const auto& site = Sites[tag];
+    if (site.offset == 0x01941C20) { // OwnWorldStep still runs during the load barrier
+        ReleaseBbscNativeLeavingSession();
+    }
     if (site.offset == ItemUsableResultOffset) {
         ApplyBbscBellsAnywhere(registers);
     }
@@ -20504,6 +20518,29 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
                          << (reload_state >= 0x10000 ? ReadValue<s32>(reload_state, 0x84) : -1);
             capture_file << ",\"current_map\":";
             WriteHex(capture_file, GetCurrentPackedMap());
+            if (site.offset == 0x01941C20) {
+                capture_file << ",\"native_session_state\":" << GetSessionState();
+                const u64 global = GetGlobalState();
+                if (ReadablePointer(global, 0x15A4)) {
+                    capture_file << ",\"load_barrier\":{\"requested_map\":";
+                    WriteHex(capture_file, ReadValue<u32>(global, 0x0C));
+                    capture_file << ",\"loading\":" << static_cast<u32>(ReadValue<u8>(global, 8))
+                                 << ",\"own_world\":" << static_cast<u32>(ReadValue<u8>(global, 0x1592))
+                                 << ",\"warp_1521\":" << static_cast<u32>(ReadValue<u8>(global, 0x1521))
+                                 << ",\"ready_15a3\":" << static_cast<u32>(ReadValue<u8>(global, 0x15A3)) << '}';
+                }
+                if (ReadablePointer(object, 0x150)) {
+                    for (const size_t offset : {0x140u, 0x148u}) {
+                        const u64 task = ReadValue<u64>(object, offset);
+                        capture_file << ",\"task_" << std::hex << offset << std::dec << "\":{\"pointer\":";
+                        WriteHex(capture_file, task);
+                        if (ReadablePointer(task, 0x14)) {
+                            capture_file << ",\"state\":" << ReadValue<s32>(task, 0x0C);
+                        }
+                        capture_file << '}';
+                    }
+                }
+            }
             if (multi_play_site && object >= 0x10000 &&
                 HasMemoryAccess(object, 0x288, MemoryProt::CpuRead)) {
                 const u64 matching_controller = ReadValue<u64>(object, 0x18);
