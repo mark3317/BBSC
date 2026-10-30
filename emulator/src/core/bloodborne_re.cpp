@@ -5129,6 +5129,7 @@ void TickBbscFollowHost() {
     static u32 target_map = 0;
     static u32 attempts_map = 0;
     static int attempts = 0;
+    static s64 shared_arrival_ms = 0; // host load already reached by this guest
     if (!BbscWarpTogetherEnabled() || image_base == 0) {
         return;
     }
@@ -5141,6 +5142,7 @@ void TickBbscFollowHost() {
     const u64 global = GetGlobalState();
     if (GetSessionState() != 6 || !ReadablePointer(global, 0x1598) ||
         ReadValue<u8>(global, 0x1592) != 0 || GetLocalPlayerType() == 2) {
+        shared_arrival_ms = 0;
         warping = false;
         target_map = 0;
         return; // not a co-op guest in someone else's world (an invader does not follow)
@@ -5237,6 +5239,7 @@ void TickBbscFollowHost() {
     // went somewhere. If only the guest walked off, the host's map is still this one.
     static u32 shared_host_map = 0;
     if (!IsUsablePackedMap(here) || here == host.packed_map) {
+        if (here == host.packed_map) shared_arrival_ms = host.arrival_ms;
         mismatch_since_ms = 0;
         shared_host_map = host.packed_map;
         return; // same map as the host: nothing to follow
@@ -5245,7 +5248,8 @@ void TickBbscFollowHost() {
     // host's map is loaded in our game too and the host did not get there by a load (lamp, death
     // reload), the host walked across - so do we, no reload.
     const bool host_loaded_there = host.arrival_by_load && host.arrival_map == host.packed_map &&
-                                   now - host.arrival_ms < 90'000;
+                                   now - host.arrival_ms < 90'000 &&
+                                   host.arrival_ms > shared_arrival_ms;
     // The maps of one area (Cathedral Ward 0x18000000, Central Yharnam 0x18010000, ...) share one
     // coordinate frame and join without a load. Report 2026-09-27: border crossings near the
     // Central Yharnam lamp reloaded the guest. Report 2026-09-29: the guest walked from Cathedral
