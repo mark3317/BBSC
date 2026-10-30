@@ -292,10 +292,14 @@ void Dispatch(const std::vector<std::uint8_t>& wrapped) {
     if (type == FollowType && frame.size() >= 0x1E) {
         FollowPacket follow{};
         std::memcpy(&follow, frame.data(), std::min(frame.size(), sizeof(follow)));
+        Core::Bloodborne::Chalice::Key dungeon{};
+        if (frame.size() == sizeof(follow) + sizeof(dungeon)) {
+            std::memcpy(&dungeon, frame.data() + sizeof(follow), sizeof(dungeon));
+        }
         Core::Bloodborne::OnBbscHostFollowPacket(follow.packed_map, follow.x, follow.y, follow.z,
                                                  follow.heading, follow.sequence,
                                                  frame.size() >= sizeof(follow) ? follow.lamp_point
-                                                                                : -1);
+                                                                                : -1, dungeon);
     } else if (type == ScaleType && frame.size() >= 15) {
         std::uint16_t percent[5]{};
         std::memcpy(percent, frame.data() + 5, sizeof(percent));

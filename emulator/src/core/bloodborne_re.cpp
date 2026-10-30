@@ -42,6 +42,7 @@
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/bbsc_memscan.h"
+#include "core/bbsc_chalice.h"
 #include "core/bbsc_persistence.h"
 #include "core/bbsc_quest_event_rules.h"
 #include "core/bbsc_cinematic.h"
@@ -4743,7 +4744,13 @@ bool BbscWarpJoinEnabled() {
 // home map. That was wrong: they are the forced placement the game spawns a summoned player from,
 // and without them the reload used the map's default spawn - the guest appeared in Iosefka's
 // Clinic for a moment before the join teleport moved her (Eryk, 2026-09-23, build 732ABF1E).
+bool BbscChaliceLoadReady(u32 map);
+
 bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std::string_view why) {
+    if (Chalice::IsMap(to.packed_region) && !BbscChaliceLoadReady(to.packed_region)) {
+        LOG_WARNING(Debug, "BBSC chalice ({}): dungeon identity/host flags not ready; load deferred", why);
+        return false;
+    }
     if (!ReadablePointer(global, 0x1598) || !IsUsablePackedMap(to.packed_region)) {
         return false;
     }
@@ -4950,6 +4957,7 @@ struct BbscFollowMessage {
     float arrival_heading{};
     s64 arrival_ms{};
     bool arrival_by_load{}; // the host was silent (loading) before it: a lamp, a reload
+    Chalice::Key dungeon{};
 };
 
 std::mutex bbsc_follow_mutex;
@@ -5006,6 +5014,45 @@ bool BbscOwnOpeningDone() {
     return !BbscOpeningGuardEnabled() || BbscEventFlag(6603) || BbscEventFlag(9401);
 }
 
+// Native CUSA03173 1.09: SprjHolygrail singleton 0553E9E8, seven altar objects.
+// 01AC3E70 selects an altar using flags 9020..9026; altar+108 is its ritual helper,
+// helper+D0 is the cached FrpgNet channel item (01AA53AB). 01E67200 establishes
+// item+10 channel; 01E67C20 owns item+58 decoded FormData / +60 byte count.
+// The JSON parser 01E89F64..71 accepts FormDataVersion 0 only; cached item has no
+// version field. Do not confuse it with the transient JSON entry (different layout).
+// Game thread only. Unknown layout/version or ambiguous selection is not guessed.
+Chalice::Key ReadBbscChaliceKey() {
+    Chalice::Key key{};
+    if (image_base == 0) return key;
+    int selected = -1;
+    for (int i = 0; i < 7; ++i) {
+        if (BbscEventFlag(9020 + i)) {
+            if (selected != -1) return {};
+            selected = i;
+        }
+    }
+    if (selected < 0) return key;
+    const u64 man = ReadValue<u64>(image_base + 0x0553E9E8, 0);
+    if (!ReadablePointer(man, 0x10) || ReadValue<u32>(man, 0) != 7) return key;
+    const u64 slots = ReadValue<u64>(man, 8);
+    if (!ReadablePointer(slots, 7 * sizeof(u64))) return key;
+    const u64 altar = ReadValue<u64>(slots, selected * sizeof(u64));
+    if (!ReadablePointer(altar, 0x1E0)) return key;
+    const u64 entry = ReadValue<u64>(altar, 0x1D8);
+    if (!ReadablePointer(entry, 0x68)) return key;
+    key.channel = ReadValue<u64>(entry, 0x10);
+    key.form_version = 0; // the game's cached decoder accepts only this format
+    const u64 size = ReadValue<u64>(entry, 0x60);
+    if (size < 16 || size > 1024) return {};
+    key.form_size = static_cast<u32>(size);
+    key.form_hash = 1; // validate size before following the native buffer
+    if (!Chalice::Valid(key)) return {};
+    const u64 form = ReadValue<u64>(entry, 0x58);
+    if (!ReadablePointer(form, key.form_size)) return {};
+    key.form_hash = Chalice::HashForm({reinterpret_cast<const u8*>(form), key.form_size});
+    return Chalice::Valid(key) ? key : Chalice::Key{};
+}
+
 // Host side: say where we are, so a guest that is somewhere else can come to us.
 void TickBbscFollowBroadcast() {
     static s64 last_ms = 0;
@@ -5042,7 +5089,7 @@ void TickBbscFollowBroadcast() {
     const s32 lamp_point = ReadablePointer(global, 0x1530) ? ReadValue<s32>(global, 0x1528) : -1;
     const u32 peers = Libraries::Np::NpSignaling::Helpers::SendBbscFollowToPeers(
         map, here->position[0], here->position[1], here->position[2], here->rotation[1], sequence,
-        lamp_point);
+        lamp_point, Chalice::IsMap(map) ? ReadBbscChaliceKey() : Chalice::Key{});
     if (map != announced_map) {
         const bool moved = announced_map != 0; // not the first report of this session
         announced_map = map;
@@ -5252,6 +5299,15 @@ void TickBbscFollowHost() {
         return; // the initial join still owns the guest
     }
     const u32 here = GetCurrentPackedMap();
+    if (Chalice::IsMap(host.packed_map) && !BbscChaliceLoadReady(host.packed_map)) {
+        static s64 told_ms = 0;
+        if (now - told_ms >= 15'000) {
+            told_ms = now;
+            LOG_WARNING(Debug, "BBSC chalice: waiting for matching native dungeon and scoped host flags; host map {:#x}", host.packed_map);
+            BBSC_TIMELINE("CHALICE", "follow deferred: dungeon identity/flags unavailable for {:#x}", host.packed_map);
+        }
+        return;
+    }
     static s64 mismatch_since_ms = 0;
     // The host's map when both were last in the same one: a different map later means the HOST
     // went somewhere. If only the guest walked off, the host's map is still this one.
@@ -5840,6 +5896,7 @@ struct BbscWorldSnapshot {
     u32 chunks = 0;  // bit per received chunk
     std::array<std::array<u8, BbscWorldGroupBytes>, BbscSnapshotMaxGroups> groups{};
     s64 complete_ms = 0; // 0 while chunks are missing
+    Chalice::Key dungeon{}; // v3 only; empty for ordinary maps/Dream
 };
 
 std::mutex bbsc_world_mutex;
@@ -5890,8 +5947,17 @@ u32 SendBbscFlagSnapshot(u8 version, u32 map, u32 snapshot, size_t count,
             packet.present = static_cast<u8>(packet.present | (1u << i));
             present |= u64{1} << (first + i);
         }
-        sent = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet,
-                                                                              sizeof(packet));
+        if (Chalice::IsMap(map)) {
+            const auto key = ReadBbscChaliceKey();
+            if (!Chalice::Valid(key)) return 0;
+            packet.version = 3;
+            std::array<u8, sizeof(packet) + sizeof(key)> scoped{};
+            std::memcpy(scoped.data(), &packet, sizeof(packet));
+            std::memcpy(scoped.data() + sizeof(packet), &key, sizeof(key));
+            sent = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(scoped.data(), scoped.size());
+        } else {
+            sent = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(&packet, sizeof(packet));
+        }
     }
     return sent;
 }
@@ -5923,6 +5989,19 @@ void TickBbscWorldFlagsBroadcast() {
     if (!IsUsablePackedMap(map) || BbscWorldGroupKey(map, 0) == 0) {
         return;
     }
+    if (Chalice::IsMap(map)) {
+        static u32 previous_map = 0;
+        static Chalice::Key previous_key{};
+        const auto key = ReadBbscChaliceKey();
+        if (previous_map != map || previous_key != key) {
+            previous_map = map;
+            previous_key = key;
+            LOG_INFO(Debug, "BBSC chalice: map {:#x}, native channel {}, form {:016x}/{} bytes, identity {}",
+                     map, key.channel, key.form_hash, key.form_size, Chalice::Valid(key) ? "ready" : "unavailable");
+            BBSC_TIMELINE("CHALICE", "map {:#x} channel {} form {:016x}/{} bytes identity {}",
+                          map, key.channel, key.form_hash, key.form_size, Chalice::Valid(key) ? "ready" : "unavailable");
+        }
+    }
     // The other blocks (ones that exist in our flag table) in turn, so the guest has them all before
     // it loads in or walks across: this area's first, then (2026-10-18, "Every area") all the
     // others but the Chalice Dungeons. Without WORLD_SYNC_ALL: this area only, every other second.
@@ -5947,7 +6026,7 @@ void TickBbscWorldFlagsBroadcast() {
                 }
             }
         };
-        add_area(BbscMapArea(map));
+        if (!Chalice::IsMap(map)) add_area(BbscMapArea(map));
         if (all_areas) {
             for (u32 area = 20; area <= 40; ++area) {
                 if (area != BbscMapArea(map) && area != BbscChaliceArea) {
@@ -6027,6 +6106,23 @@ bool BbscHostBlockSnapshot(u32 packed_map, BbscWorldSnapshot& out) {
     return true;
 }
 
+bool BbscChaliceLoadReady(u32 map) {
+    if (!Chalice::IsMap(map)) return true;
+    if (!BbscWorldSyncEnabled() || !Chalice::IsMap(GetCurrentPackedMap())) return false;
+    // Matching altar data alone does not prove its layout is mounted. Native entry comes first.
+    BbscFollowMessage follow;
+    {
+        std::scoped_lock lock{bbsc_follow_mutex};
+        follow = bbsc_follow_latest;
+    }
+    const auto local = ReadBbscChaliceKey();
+    if (follow.packed_map != map ||
+        !Chalice::CanUse(local, follow.dungeon, SteadyNowMs() - follow.received_ms)) return false;
+    BbscWorldSnapshot host;
+    return BbscHostBlockSnapshot(map, host) && host.dungeon == follow.dungeon &&
+           Chalice::CanUse(local, host.dungeon, SteadyNowMs() - host.complete_ms);
+}
+
 // Guest side: puts the host's flags for that map into our live table. Game thread.
 bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
     if (!BbscWorldSyncEnabled() || image_base == 0) {
@@ -6036,6 +6132,9 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
     if (!BbscHostBlockSnapshot(packed_map, host)) {
         LOG_WARNING(Debug, "BBSC world state ({}): no host flags for map {:#x}", why, packed_map);
         BBSC_TIMELINE("WORLD", "world state ({}): no host flags for map {:#x}", why, packed_map);
+        return false;
+    }
+    if (Chalice::IsMap(packed_map) && !BbscChaliceLoadReady(packed_map)) {
         return false;
     }
     // The Dream's messengers (2026-10-08, 3-player test in kalee's Dream: "the guest cannot take
@@ -6061,6 +6160,9 @@ bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why) {
     };
     const auto write_block = [&](const BbscWorldSnapshot& snap, size_t& changed, size_t& missing) {
         size_t written = 0;
+        if (Chalice::IsMap(snap.map) &&
+            (snap.map != packed_map || !Chalice::CanUse(ReadBbscChaliceKey(), snap.dungeon,
+                                                       SteadyNowMs() - snap.complete_ms))) return written;
         if (snap.map == BbscDreamStateMap && BbscDreamOwnEnabled()) {
             return written; // our own Hunter's Dream: its map flags stay ours
         }
@@ -6837,7 +6939,7 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
             continue;
         }
         auto* live = reinterpret_cast<u8*>(storage);
-        if (key / 10'000 == 5) {
+        if (key / 10'000 == 5 && !Chalice::IsLootGroup(key)) {
             // Item pickups (kind 5) only ever get taken: never clear one. The live table holds
             // our own pickups plus those made in hosts' worlds (the guest loot view writes no
             // host bits), and a copy kept at the wrong moment (2026-10-12: an empty one, kept
@@ -7038,10 +7140,11 @@ std::optional<BbscSaveSlot> bbsc_loot_slot; // the character the file belongs to
 bool bbsc_loot_loaded = false;               // the file was looked for in this session
 bool bbsc_loot_dirty = false;                // taken bits not written yet
 u32 bbsc_loot_area = 0;                      // area of the last view applied (0 = none yet)
+std::string bbsc_loot_dungeon; // empty: ordinary world; otherwise immutable dungeon identity
 
 std::filesystem::path BbscLootFilePath(const BbscSaveSlot& slot) {
     return Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
-           "guest-items" / fmt::format("taken-{}-{}.bin", slot.user, slot.slot);
+           "guest-items" / fmt::format("taken-{}-{}{}.bin", slot.user, slot.slot, bbsc_loot_dungeon);
 }
 
 // Once per session, at the first view: which character this is and what it took before.
@@ -7075,6 +7178,7 @@ void LoadBbscGuestLootFile() {
         if (!get32(key) || !file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
             break;
         }
+        if (Chalice::IsLootGroup(key) != !bbsc_loot_dungeon.empty()) continue;
         bbsc_loot_saved[key] = bytes;
         for (const u8 b : bytes) {
             items += std::popcount(b);
@@ -7089,7 +7193,6 @@ void WriteBbscGuestLootFile() {
     if (!bbsc_loot_dirty || !bbsc_loot_slot.has_value()) {
         return;
     }
-    bbsc_loot_dirty = false;
     for (const auto& [key, group] : bbsc_loot_groups) {
         auto& saved = bbsc_loot_saved[key];
         for (size_t b = 0; b < BbscWorldGroupBytes; ++b) {
@@ -7121,6 +7224,7 @@ void WriteBbscGuestLootFile() {
         }
     }
     std::filesystem::rename(temp, path, ec);
+    if (!ec) bbsc_loot_dirty = false;
 }
 
 bool BbscGuestLootActive() {
@@ -7134,10 +7238,34 @@ bool BbscGuestLootActive() {
 // an item the guest takes in a host's world is gone in the guest's OWN world too. The bit goes into
 // the own world journal, which is what is put back at home (RestoreBbscOwnWorld).
 void MarkBbscTakenInOwnWorld(u32 key, size_t byte, u8 bits) {
+    if (Chalice::IsLootGroup(key)) return; // foreign dungeon pickups never mark our own dungeon
     if (const auto it = bbsc_own_world.find(key); it != bbsc_own_world.end() && byte < BbscWorldGroupBytes) {
         it->second[byte] |= bits;
         bbsc_own_world_dirty = true;
     }
+}
+
+// Flush before switching dungeon/ordinary-world namespace. Unknown identity cannot create
+// a shared m29 journal. Different altars holding the same channel/form share one namespace.
+bool SelectBbscLootScope(u32 map) {
+    std::string scope;
+    if (Chalice::IsMap(map)) {
+        if (!BbscChaliceLoadReady(map)) return false;
+        const auto key = ReadBbscChaliceKey();
+        scope = fmt::format("-chalice-{:016x}-{:016x}-{}-{}-{:08x}", key.channel, key.form_hash,
+                            key.form_version, key.form_size, map);
+    }
+    if (scope == bbsc_loot_dungeon) return true;
+    WriteBbscGuestLootFile();
+    if (bbsc_loot_dirty) return false;
+    bbsc_loot_groups.clear();
+    bbsc_loot_saved.clear();
+    bbsc_loot_slot.reset();
+    bbsc_loot_loaded = false;
+    bbsc_loot_dirty = false;
+    bbsc_loot_area = 0;
+    bbsc_loot_dungeon = std::move(scope);
+    return true;
 }
 
 void ApplyBbscGuestLootView(u32 packed_map, std::string_view why) {
@@ -7146,7 +7274,7 @@ void ApplyBbscGuestLootView(u32 packed_map, std::string_view why) {
         return;
     }
     const u32 area = (packed_map >> 24) & 0xFF;
-    if (area == 0 || area > 99) {
+    if (area == 0 || area > 99 || !SelectBbscLootScope(packed_map)) {
         return;
     }
     LoadBbscGuestLootFile();
@@ -7163,7 +7291,8 @@ void ApplyBbscGuestLootView(u32 packed_map, std::string_view why) {
             auto* live = reinterpret_cast<u8*>(storage);
             KeepBbscOwnWorldGroup(key, live);
             std::array<u8, BbscWorldGroupBytes> own{}; // taken in our own world
-            if (const auto mine = bbsc_own_world.find(key); mine != bbsc_own_world.end()) {
+            if (const auto mine = bbsc_own_world.find(key);
+                !Chalice::IsMap(packed_map) && mine != bbsc_own_world.end()) {
                 own = mine->second;
             }
             const auto [it, first] = bbsc_loot_groups.try_emplace(key);
@@ -7225,6 +7354,13 @@ void CaptureBbscGuestLoot() {
         ((ReadValue<u32>(global, 0x14C4) >> 24) & 0xFF) != bbsc_loot_area) {
         return;
     }
+    // Native loads can change the selected dungeon before the next view callback.
+    if (Chalice::IsMap(GetCurrentPackedMap())) {
+        const auto identity = ReadBbscChaliceKey();
+        if (!Chalice::Valid(identity) || bbsc_loot_dungeon !=
+            fmt::format("-chalice-{:016x}-{:016x}-{}-{}-{:08x}", identity.channel, identity.form_hash,
+                        identity.form_version, identity.form_size, GetCurrentPackedMap())) return;
+    } else if (!bbsc_loot_dungeon.empty()) return;
     size_t picked_total = 0;
     for (auto& [key, group] : bbsc_loot_groups) {
         if ((key / 100) % 100 != bbsc_loot_area) {
@@ -7305,6 +7441,7 @@ void TickBbscGuestLootReset() {
     last_ms = now;
     if (!BbscGuestLootActive()) {
         WriteBbscGuestLootFile();
+        if (bbsc_loot_dirty) return; // retain failed writes with their original scope
         LOG_INFO(Debug, "BBSC guest items: session over, {} tracked groups put away (kept in the "
                         "file)",
                  bbsc_loot_groups.size());
@@ -7312,6 +7449,7 @@ void TickBbscGuestLootReset() {
         bbsc_loot_loaded = false;
         bbsc_loot_area = 0;
         bbsc_loot_slot.reset();
+        bbsc_loot_dungeon.clear();
     }
 }
 
@@ -20929,32 +21067,44 @@ void OnBbscPvpPacket(std::uint8_t kind, std::uint8_t on) {
 // message and TickBbscFollowHost decides, on the game thread, whether to act on it.
 void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
     using Libraries::Np::NpSignaling::SignalingBbscWorldFlags;
-    if (!BbscWorldSyncEnabled() || data == nullptr || size != sizeof(SignalingBbscWorldFlags)) {
+    if (!BbscWorldSyncEnabled() || data == nullptr || size < sizeof(SignalingBbscWorldFlags)) {
         return;
     }
     SignalingBbscWorldFlags packet;
     std::memcpy(&packet, data, sizeof(packet));
-    // Version 1: the map block's groups; version 2: the host's Hunter's Dream state.
+    Chalice::Key dungeon{};
+    const bool chalice = packet.version == 3;
+    if (chalice) {
+        if (size != sizeof(packet) + sizeof(dungeon) || !Chalice::IsMap(packet.packed_map)) return;
+        std::memcpy(&dungeon, static_cast<const u8*>(data) + sizeof(packet), sizeof(dungeon));
+        if (!Chalice::Valid(dungeon)) return;
+    } else if (size != sizeof(packet) || Chalice::IsMap(packet.packed_map)) {
+        return; // legacy dungeon flags have no identity
+    }
+    // v1: ordinary maps; v2: Dream; v3: dungeon map plus immutable channel/FormData key.
     const bool dream = packet.version == 2;
     const size_t group_total = dream ? BbscDreamGroupCount : BbscWorldGroupCount;
     const size_t chunk_total = dream ? BbscDreamChunkCount : BbscWorldChunkCount;
-    if ((packet.version != 1 && !dream) || packet.chunk_count != chunk_total ||
+    if ((packet.version != 1 && !dream && !chalice) || packet.chunk_count != chunk_total ||
         packet.chunk >= chunk_total || !IsUsablePackedMap(packet.packed_map)) {
         return;
     }
     const size_t first = packet.chunk * BbscWorldChunkGroups;
-    const size_t count = std::min<size_t>(
-        packet.group_count, std::min(BbscWorldChunkGroups, group_total - first));
+    const size_t count = std::min(BbscWorldChunkGroups, group_total - first);
+    if (std::memcmp(packet.magic, "SHAD", 4) != 0 ||
+        packet.type != Libraries::Np::NpSignaling::kSignalingBbscWorldFlagsType ||
+        packet.group_count != count || (packet.present >> count) != 0) return;
     bool first_for_map = false;
     u32 map = 0;
     {
         std::scoped_lock lock{bbsc_world_mutex};
         BbscWorldSnapshot& snap = dream ? bbsc_dream_assembling : bbsc_world_assembling;
         BbscWorldSnapshot& ready = dream ? bbsc_dream_ready : bbsc_world_ready;
-        if (snap.map != packet.packed_map || snap.snapshot != packet.snapshot) {
+        if (snap.map != packet.packed_map || snap.snapshot != packet.snapshot || snap.dungeon != dungeon) {
             snap = BbscWorldSnapshot{};
             snap.map = packet.packed_map;
             snap.snapshot = packet.snapshot;
+            snap.dungeon = dungeon;
         }
         for (size_t i = 0; i < count; ++i) {
             if ((packet.present & (1u << i)) != 0) {
@@ -20982,7 +21132,8 @@ void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
 }
 
 void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z, float heading,
-                            std::uint32_t sequence, std::int32_t lamp_point) {
+                            std::uint32_t sequence, std::int32_t lamp_point,
+                            const Chalice::Key& dungeon) {
     if (!BbscWarpTogetherEnabled()) {
         return;
     }
@@ -21014,6 +21165,7 @@ void OnBbscHostFollowPacket(std::uint32_t packed_map, float x, float y, float z,
                          (packed_map == previous.packed_map &&
                           dx * dx + dy * dy + dz * dz > 30.0f * 30.0f);
     bbsc_follow_latest = {packed_map, x, y, z, heading, sequence, lamp_point, now};
+    bbsc_follow_latest.dungeon = dungeon;
     if (arrived) {
         bbsc_follow_latest.arrival_ms = now;
         bbsc_follow_latest.arrival_by_load = silence;

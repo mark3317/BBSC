@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <vector>
@@ -188,7 +189,7 @@ u32 SendBbscWorldFlagsToPeers(const void* packet, u32 size) {
 }
 
 u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float heading, u32 sequence,
-                          s32 lamp_point) {
+                          s32 lamp_point, const Core::Bloodborne::Chalice::Key& dungeon) {
     const std::vector<BbscPeer> peers = EstablishedBbscPeers();
     SignalingBbscFollow packet{};
     packet.packed_map = packed_map;
@@ -198,14 +199,22 @@ u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float headi
     packet.heading = heading;
     packet.sequence = sequence;
     packet.lamp_point = lamp_point;
+    std::array<u8, sizeof(packet) + sizeof(dungeon)> scoped{};
+    const void* data = &packet;
+    u32 size = sizeof(packet);
+    if (Core::Bloodborne::Chalice::IsMap(packed_map)) {
+        std::memcpy(scoped.data(), &packet, sizeof(packet));
+        std::memcpy(scoped.data() + sizeof(packet), &dungeon, sizeof(dungeon));
+        data = scoped.data(); size = scoped.size();
+    }
     u32 sent = 0;
     for (const BbscPeer& peer : peers) {
-        if (Stubs::SignalingSendTo(&packet, sizeof(packet), peer.addr, peer.port) > 0) {
+        if (Stubs::SignalingSendTo(data, size, peer.addr, peer.port) > 0) {
             ++sent;
         }
     }
     // BBSC (2026-10-19): the relay too - a mod guest finds its host there by this position.
-    Core::Bbsc::RelaySendPacket(&packet, sizeof(packet));
+    Core::Bbsc::RelaySendPacket(data, size);
     return sent;
 }
 
@@ -375,17 +384,23 @@ static void ReceiveThreadMain() {
             Stubs::SignalingSendTo(&pong, sizeof(pong), from_addr, from_port);
             continue;
         }
-        if ((nbytes == sizeof(SignalingBbscFollow) || nbytes == kSignalingBbscFollowV1Size) &&
+        if ((nbytes == sizeof(SignalingBbscFollow) || nbytes == kSignalingBbscFollowV1Size ||
+             nbytes == sizeof(SignalingBbscFollow) + sizeof(Core::Bloodborne::Chalice::Key)) &&
             type == static_cast<u8>(SignalingPacketType::BbscFollow)) {
             SignalingBbscFollow follow{}; // lamp_point stays -1 for an older build's packet
-            std::memcpy(&follow, buf, static_cast<size_t>(nbytes));
+            std::memcpy(&follow, buf, std::min(nbytes, sizeof(follow)));
+            Core::Bloodborne::Chalice::Key dungeon{};
+            if (nbytes == sizeof(follow) + sizeof(dungeon)) {
+                std::memcpy(&dungeon, buf + sizeof(follow), sizeof(dungeon));
+            }
             Core::Bbsc::NoteSignalingBbscPacket();
             Core::Bloodborne::OnBbscHostFollowPacket(follow.packed_map, follow.x, follow.y,
                                                      follow.z, follow.heading, follow.sequence,
-                                                     follow.lamp_point);
+                                                     follow.lamp_point, dungeon);
             continue;
         }
-        if (nbytes == sizeof(SignalingBbscWorldFlags) &&
+        if ((nbytes == sizeof(SignalingBbscWorldFlags) ||
+             nbytes == sizeof(SignalingBbscWorldFlags) + sizeof(Core::Bloodborne::Chalice::Key)) &&
             type == static_cast<u8>(SignalingPacketType::BbscWorldFlags)) {
             Core::Bbsc::NoteSignalingBbscPacket();
             Core::Bloodborne::OnBbscWorldFlagsPacket(buf, static_cast<u32>(nbytes));

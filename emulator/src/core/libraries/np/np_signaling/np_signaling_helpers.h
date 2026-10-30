@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include "core/bbsc_chalice.h"
 
 #include "common/types.h"
 
@@ -29,7 +30,7 @@ void ShutdownRuntime();
 // from the game thread; takes the signaling mutex only long enough to copy the peer addresses.
 // Returns how many peers it went to.
 u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float heading, u32 sequence,
-                          s32 lamp_point);
+                          s32 lamp_point, const Core::Bloodborne::Chalice::Key& dungeon = {});
 // BBSC: send one world-flag chunk (SignalingBbscWorldFlags, filled in by the caller) to every
 // established signaling peer. Same threading as SendBbscFollowToPeers.
 u32 SendBbscWorldFlagsToPeers(const void* packet, u32 size);

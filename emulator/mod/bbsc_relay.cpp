@@ -307,9 +307,13 @@ void Dispatch(const std::vector<u8>& wrapped, bool from_server = false) {
                                                 follow.z);
         }
         if (from_our_host()) {
+            Core::Bloodborne::Chalice::Key dungeon{};
+            if (frame.size() == sizeof(follow) + sizeof(dungeon)) {
+                std::memcpy(&dungeon, frame.data() + sizeof(follow), sizeof(dungeon));
+            }
             Core::Bloodborne::OnBbscHostFollowPacket(
                 follow.packed_map, follow.x, follow.y, follow.z, follow.heading, follow.sequence,
-                frame.size() >= sizeof(follow) ? follow.lamp_point : -1);
+                frame.size() >= sizeof(follow) ? follow.lamp_point : -1, dungeon);
         }
     } else if (frame[4] == LifeType && frame.size() >= 14) {
         // Only the players of our own session (same host).
@@ -534,7 +538,7 @@ void StartRelay() {
 namespace Libraries::Np::NpSignaling::Helpers {
 
 u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float heading, u32 sequence,
-                          s32 lamp_point) {
+                          s32 lamp_point, const Core::Bloodborne::Chalice::Key& dungeon) {
     FollowPacket packet{};
     packet.packed_map = packed_map;
     packet.x = x;
@@ -543,6 +547,12 @@ u32 SendBbscFollowToPeers(u32 packed_map, float x, float y, float z, float headi
     packet.heading = heading;
     packet.sequence = sequence;
     packet.lamp_point = lamp_point;
+    if (Core::Bloodborne::Chalice::IsMap(packed_map)) {
+        std::array<u8, sizeof(packet) + sizeof(dungeon)> scoped{};
+        std::memcpy(scoped.data(), &packet, sizeof(packet));
+        std::memcpy(scoped.data() + sizeof(packet), &dungeon, sizeof(dungeon));
+        return SendFrame(scoped.data(), scoped.size());
+    }
     return SendFrame(&packet, sizeof(packet));
 }
 
