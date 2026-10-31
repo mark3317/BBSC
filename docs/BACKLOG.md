@@ -85,3 +85,9 @@ perf policy PASS. [Разбор и игровой контроль](fixes/T24-wi
 2. Фиксированная Птумеру от ритуала до следующего слоя; затем идентичность и изоляция двух разных подземелий, корневые чаши и возврат после обрыва.
 3. Один объединённый прогон трёх игроков, личных NPC-наград, Сна/DLC и длительного прохождения; закрывать пункты по конкретным результатам.
 4. Чистый релизный пакет своей сборки, совместимость версий, бэкапы/восстановление, инструкция с оставшимися ограничениями.
+
+## Startup TXT gate removed (31.10.2026)
+
+`f9447b4`: removed the blocking LICENSE.txt / NOTICE.txt / SUPPORTERS.txt
+content check from the DLL. Missing or modified companion notices no longer
+disable BBSC or show a startup error. Packaging license files are unchanged.
