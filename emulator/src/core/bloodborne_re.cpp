@@ -21184,6 +21184,9 @@ void TickBbscSharedKeyItems() {
     const s32 state = GetSessionState();
     static s64 last_sent_ms = 0;
     static u32 last_applied = 0;
+    static u32 applied_generation = 0;
+    static s64 guest_check_ms = 0;
+    static s64 guest_ready_ms = 0;
     if (state == 3) {
         last_applied = 0;
         // Research 2026-10-27 (Iosefka's vial reached the host when the guest talked): the gift
@@ -21223,8 +21226,29 @@ void TickBbscSharedKeyItems() {
     }
     if (state != 6) {
         last_applied = 0;
+        guest_ready_ms = 0;
+        guest_check_ms = 0;
         return;
     }
+    // Native guest loads replace the inventory even when the session stays in state 6.
+    // A previous successful grant says nothing about the newly loaded inventory.
+    const u32 generation = bbsc_load_generation.load();
+    if (generation != applied_generation) {
+        applied_generation = generation;
+        last_applied = 0;
+        guest_ready_ms = 0;
+    }
+    const s64 now = SteadyNowMs();
+    const u64 global = GetGlobalState();
+    if (!ReadablePointer(global, 0x1700) || ReadValue<u8>(global, 0x08) != 0 ||
+        !IsSprjLuaEventManReady()) {
+        guest_ready_ms = 0;
+        return;
+    }
+    if (guest_ready_ms == 0) guest_ready_ms = now;
+    // Do not award into the temporary bag during loading; bound failed-grant retries.
+    if (now - guest_ready_ms < 3'000 || now - guest_check_ms < 1'000) return;
+    guest_check_ms = now;
     const u32 items = bbsc_host_key_items.load();
     if (items == 0 || (items & ~last_applied) == 0) {
         return;
@@ -21252,6 +21276,7 @@ void TickBbscSharedKeyItems() {
                      now_owned ? "in the inventory" : "AddItem did not take it");
             BBSC_TIMELINE("KEYS", "the host's key item {} given to us ({})", id,
                           now_owned ? "ok" : "not taken");
+            if (!now_owned) continue; // retry: a failed AddItem is not a completed grant
         }
         last_applied |= bit;
     }
