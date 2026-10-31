@@ -306,26 +306,6 @@ int SyncSites() {
 
 // ---- Start-up ------------------------------------------------------------------------------------
 
-// LICENSE.txt (the GPL) and NOTICE.txt (copyright + source link) ship in the mod folder so a copy
-// passed on keeps them. Missing or emptied -> BBSC stays off and says why.
-bool NoticesPresent() {
-    auto holds = [](const wchar_t* name, const char* text) {
-        FILE* file = _wfopen((mod_dir / name).c_str(), L"rb");
-        if (file == nullptr) {
-            return false;
-        }
-        std::string content(64 * 1024, '\0');
-        content.resize(fread(content.data(), 1, content.size(), file));
-        fclose(file);
-        return content.find(text) != std::string::npos;
-    };
-    // SUPPORTERS.txt (2026-10-11, the user): the supporters list travels with BBSC like the
-    // license; its names change freely, only the file and its header are required.
-    return holds(L"LICENSE.txt", "GNU GENERAL PUBLIC LICENSE") &&
-           holds(L"NOTICE.txt", "github.com/Classmg22/BBSC") &&
-           holds(L"SUPPORTERS.txt", "BBSC SUPPORTERS");
-}
-
 DWORD WINAPI Worker(void*) {
     OpenLog();
     wchar_t exe[MAX_PATH]{};
@@ -333,21 +313,6 @@ DWORD WINAPI Worker(void*) {
     // The build time tells two DLLs of one version apart in a tester's log (2026-10-18 triage: no
     // log said which 0.0.1 DLL a report came from).
     BbscMod::LogPlain("BBSC mod loaded - version " BBSC_VERSION " (built " __DATE__ " " __TIME__ ")");
-    if (!NoticesPresent()) {
-        LOG_ERROR(Mod, "LICENSE.txt / NOTICE.txt / SUPPORTERS.txt missing or changed in {} - BBSC "
-                       "is off",
-                  Common::FS::PathToUTF8String(mod_dir));
-        BBSC_TIMELINE("START", "LICENSE.txt / NOTICE.txt / SUPPORTERS.txt missing or changed in {} - BBSC "
-                       "is off",
-                  Common::FS::PathToUTF8String(mod_dir));
-        MessageBoxW(nullptr,
-                    L"LICENSE.txt, NOTICE.txt or SUPPORTERS.txt is missing from the BBSC mod "
-                    L"folder (or was changed), so BBSC is off.\n\nThese files have to travel with "
-                    L"BBSC.\nDownload the full package again "
-                    L"from:\nhttps://github.com/Classmg22/BBSC",
-                    L"BBSC", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-        return 0;
-    }
     LOG_INFO(Mod, "BBSC mod in pid {} ({})", GetCurrentProcessId(),
              Common::FS::PathToUTF8String(std::filesystem::path{exe}));
     // Public servers (2026-10-11, shadNet's author: The Hunter's Dream is exact to the official
